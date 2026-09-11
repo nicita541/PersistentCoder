@@ -12,7 +12,12 @@ from app.policy.guard import (
     is_policy_disclosure_request,
     policy_refusal,
 )
-from app.policy.loader import load_system_prompt
+from app.policy.loader import (
+    load_system_prompt,
+)
+from app.policy.output_guard import (
+    filter_model_output,
+)
 
 
 console = Console()
@@ -20,6 +25,7 @@ console = Console()
 
 def show_commands() -> None:
     console.print()
+
     console.print(
         "[dim]Команды:[/dim]"
     )
@@ -52,7 +58,7 @@ def show_commands() -> None:
 def main() -> None:
     console.print(
         "[bold cyan]"
-        "PersistentCoder v0.4"
+        "PersistentCoder v0.5"
         "[/bold cyan]"
     )
 
@@ -67,7 +73,9 @@ def main() -> None:
     # ==========================================
 
     try:
-        system_prompt = load_system_prompt()
+        system_prompt = (
+            load_system_prompt()
+        )
 
     except Exception as exc:
         console.print(
@@ -75,6 +83,7 @@ def main() -> None:
             f"Ошибка System Policy: {exc}"
             "[/bold red]"
         )
+
         return
 
     console.print(
@@ -102,6 +111,7 @@ def main() -> None:
             f"Ошибка загрузки модели: {exc}"
             "[/bold red]"
         )
+
         return
 
     # ==========================================
@@ -110,13 +120,14 @@ def main() -> None:
 
     memory_store = MemoryStore()
 
-    # Это только временная история.
-    # После закрытия приложения исчезает.
+    # Временный Working Context.
+    # Он существует только пока работает программа.
     conversation_history: list[
         dict[str, str]
     ] = []
 
     console.print()
+
     console.print(
         "[green]"
         "PersistentCoder готов."
@@ -156,6 +167,7 @@ def main() -> None:
                 "PersistentCoder остановлен."
                 "[/yellow]"
             )
+
             break
 
         # ======================================
@@ -189,9 +201,11 @@ def main() -> None:
                     "Пользовательская память пуста."
                     "[/yellow]"
                 )
+
                 continue
 
             console.print()
+
             console.print(
                 "[bold cyan]"
                 "User Persistent Memory:"
@@ -204,7 +218,8 @@ def main() -> None:
                     f"{memory['type']} | "
                     f"{memory['content']} "
                     f"| source={memory['source']} "
-                    f"| importance={memory['importance']}"
+                    f"| importance="
+                    f"{memory['importance']}"
                 )
 
             continue
@@ -227,6 +242,7 @@ def main() -> None:
                     "нужно написать правило."
                     "[/yellow]"
                 )
+
                 continue
 
             memory_id = (
@@ -248,15 +264,14 @@ def main() -> None:
             continue
 
         # ======================================
-        # POLICY DISCLOSURE GUARD
+        # INPUT POLICY GUARD
         # ======================================
 
         if is_policy_disclosure_request(
             user_input
         ):
-            refusal = policy_refusal()
-
             console.print()
+
             console.print(
                 "[bold cyan]"
                 "PersistentCoder:"
@@ -264,10 +279,11 @@ def main() -> None:
             )
 
             console.print(
-                refusal
+                policy_refusal()
             )
 
-            # Запрос вообще не отправляется Qwen.
+            # Этот пользовательский запрос
+            # вообще НЕ передаётся модели.
             continue
 
         # ======================================
@@ -279,7 +295,7 @@ def main() -> None:
         )
 
         # ======================================
-        # BUILD CURRENT USER CONTEXT
+        # BUILD USER CONTEXT
         # ======================================
 
         current_user_message = (
@@ -298,12 +314,12 @@ def main() -> None:
             }
         ]
 
-        # Временная история разговора.
+        # Временная история.
         model_messages.extend(
             conversation_history
         )
 
-        # User Memory + текущий запрос.
+        # User Memory + текущая задача.
         model_messages.append(
             {
                 "role": "user",
@@ -312,11 +328,11 @@ def main() -> None:
         )
 
         # ======================================
-        # CALL QWEN
+        # QWEN
         # ======================================
 
         try:
-            answer = client.chat(
+            raw_answer = client.chat(
                 model_messages
             )
 
@@ -326,14 +342,22 @@ def main() -> None:
                 f"Ошибка модели: {exc}"
                 "[/bold red]"
             )
+
             continue
+
+        # ======================================
+        # OUTPUT POLICY GUARD
+        # ======================================
+
+        answer = filter_model_output(
+            answer=raw_answer,
+            system_prompt=system_prompt,
+        )
 
         # ======================================
         # UPDATE WORKING CONTEXT
         # ======================================
 
-        # В историю сохраняем настоящий текст
-        # пользователя, а не служебный блок памяти.
         conversation_history.append(
             {
                 "role": "user",
@@ -353,6 +377,7 @@ def main() -> None:
         # ======================================
 
         console.print()
+
         console.print(
             "[bold cyan]"
             "PersistentCoder:"
