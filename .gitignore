@@ -11,3 +11,6 @@ data/*.sqlite3
 
 .vscode/
 .idea/
+
+# Local AI models
+models/
