@@ -7,6 +7,17 @@ from app.context.builder import (
     build_current_user_message,
 )
 from app.llm.client import QwenClient
+from app.memory.conflicts import (
+    find_memories_to_supersede,
+)
+from app.memory.manager import (
+    MemoryCandidate,
+    extract_memory_candidate,
+    is_duplicate_memory,
+)
+from app.memory.merge import (
+    find_decisions_to_merge,
+)
 from app.memory.store import MemoryStore
 from app.policy.guard import (
     is_policy_disclosure_request,
@@ -32,33 +43,126 @@ def show_commands() -> None:
 
     console.print(
         "[dim]"
-        "/remember текст — сохранить пользовательское правило"
+        "/remember текст — сохранить правило вручную"
         "[/dim]"
     )
 
     console.print(
         "[dim]"
-        "/memories      — показать пользовательскую память"
+        "/memories — показать активную память"
         "[/dim]"
     )
 
     console.print(
         "[dim]"
-        "/clear         — очистить временный контекст"
+        "/clear — очистить временный контекст"
         "[/dim]"
     )
 
     console.print(
         "[dim]"
-        "/exit          — выход"
+        "/exit — выход"
         "[/dim]"
     )
+
+
+def show_memory(
+    memories: list[dict[str, object]],
+) -> None:
+    if not memories:
+        console.print(
+            "[yellow]"
+            "Постоянная память пуста."
+            "[/yellow]"
+        )
+
+        return
+
+    console.print()
+
+    console.print(
+        "[bold cyan]"
+        "Persistent Memory:"
+        "[/bold cyan]"
+    )
+
+    for memory in memories:
+        line = (
+            f"[{memory['id']}] "
+            f"{memory['type']} | "
+            f"{memory['content']}"
+        )
+
+        why = memory.get(
+            "why"
+        )
+
+        if why:
+            line += (
+                f" | WHY: {why}"
+            )
+
+        console.print(
+            line
+        )
+
+
+def save_candidate(
+    *,
+    candidate: MemoryCandidate,
+    memory_store: MemoryStore,
+    existing_memories: list[
+        dict[str, object]
+    ],
+) -> int | None:
+    if is_duplicate_memory(
+        candidate,
+        existing_memories,
+    ):
+        console.print(
+            "[dim]"
+            "Memory: запись уже существует."
+            "[/dim]"
+        )
+
+        return None
+
+    memory_id = (
+        memory_store.add_memory(
+            memory_type=(
+                candidate.memory_type
+            ),
+            content=(
+                candidate.content
+            ),
+            why=(
+                candidate.why
+            ),
+            source="USER",
+            importance=(
+                candidate.importance
+            ),
+            confidence=(
+                candidate.confidence
+            ),
+        )
+    )
+
+    console.print(
+        "[green]"
+        "Memory: автоматически сохранено "
+        f"{candidate.memory_type} "
+        f"#{memory_id}"
+        "[/green]"
+    )
+
+    return memory_id
 
 
 def main() -> None:
     console.print(
         "[bold cyan]"
-        "PersistentCoder v0.5"
+        "PersistentCoder v0.9"
         "[/bold cyan]"
     )
 
@@ -120,8 +224,6 @@ def main() -> None:
 
     memory_store = MemoryStore()
 
-    # Временный Working Context.
-    # Он существует только пока работает программа.
     conversation_history: list[
         dict[str, str]
     ] = []
@@ -150,7 +252,9 @@ def main() -> None:
         if not user_input:
             continue
 
-        normalized = user_input.casefold()
+        normalized = (
+            user_input.casefold()
+        )
 
         # ======================================
         # EXIT
@@ -171,7 +275,7 @@ def main() -> None:
             break
 
         # ======================================
-        # CLEAR WORKING CONTEXT
+        # CLEAR
         # ======================================
 
         if normalized == "/clear":
@@ -187,45 +291,19 @@ def main() -> None:
             continue
 
         # ======================================
-        # SHOW USER MEMORY
+        # SHOW MEMORY
         # ======================================
 
         if normalized == "/memories":
-            memories = (
-                memory_store.get_active_memories()
+            show_memory(
+                memory_store
+                .get_active_memories()
             )
-
-            if not memories:
-                console.print(
-                    "[yellow]"
-                    "Пользовательская память пуста."
-                    "[/yellow]"
-                )
-
-                continue
-
-            console.print()
-
-            console.print(
-                "[bold cyan]"
-                "User Persistent Memory:"
-                "[/bold cyan]"
-            )
-
-            for memory in memories:
-                console.print(
-                    f"[{memory['id']}] "
-                    f"{memory['type']} | "
-                    f"{memory['content']} "
-                    f"| source={memory['source']} "
-                    f"| importance="
-                    f"{memory['importance']}"
-                )
 
             continue
 
         # ======================================
-        # MANUAL MEMORY WRITE
+        # MANUAL MEMORY
         # ======================================
 
         if normalized.startswith(
@@ -245,26 +323,28 @@ def main() -> None:
 
                 continue
 
-            memory_id = (
-                memory_store.add_memory(
-                    memory_type="USER_RULE",
-                    content=content,
-                    source="USER",
-                    importance=95,
-                )
+            candidate = MemoryCandidate(
+                memory_type="USER_RULE",
+                content=content,
+                why=None,
+                importance=95,
+                confidence=1.0,
+                replaces=None,
             )
 
-            console.print(
-                "[green]"
-                f"Память сохранена. "
-                f"ID={memory_id}"
-                "[/green]"
+            save_candidate(
+                candidate=candidate,
+                memory_store=memory_store,
+                existing_memories=(
+                    memory_store
+                    .get_active_memories()
+                ),
             )
 
             continue
 
         # ======================================
-        # INPUT POLICY GUARD
+        # INPUT POLICY
         # ======================================
 
         if is_policy_disclosure_request(
@@ -282,20 +362,110 @@ def main() -> None:
                 policy_refusal()
             )
 
-            # Этот пользовательский запрос
-            # вообще НЕ передаётся модели.
             continue
 
         # ======================================
-        # LOAD USER MEMORY
+        # MEMORY MANAGER
+        # ======================================
+
+        existing_memories = (
+            memory_store
+            .get_active_memories()
+        )
+
+        candidate = (
+            extract_memory_candidate(
+                user_input
+            )
+        )
+
+        if candidate is not None:
+            # ----------------------------------
+            # EXPLICIT CONFLICT RESOLVER
+            # ----------------------------------
+
+            conflict_ids = (
+                find_memories_to_supersede(
+                    candidate,
+                    existing_memories,
+                )
+            )
+
+            # ----------------------------------
+            # DECISION MERGE RESOLVER
+            # ----------------------------------
+
+            merge_ids = (
+                find_decisions_to_merge(
+                    candidate,
+                    existing_memories,
+                )
+            )
+
+            # Один ID может случайно попасть
+            # сразу в обе категории.
+            # Убираем дубли.
+            memories_to_supersede = sorted(
+                set(
+                    conflict_ids
+                    + merge_ids
+                )
+            )
+
+            # ----------------------------------
+            # SAVE NEW MEMORY
+            # ----------------------------------
+
+            new_memory_id = (
+                save_candidate(
+                    candidate=candidate,
+                    memory_store=memory_store,
+                    existing_memories=(
+                        existing_memories
+                    ),
+                )
+            )
+
+            # ----------------------------------
+            # SUPERSEDE OLD MEMORIES
+            # ----------------------------------
+
+            if (
+                new_memory_id is not None
+                and memories_to_supersede
+            ):
+                memory_store.supersede_memories(
+                    memory_ids=(
+                        memories_to_supersede
+                    ),
+                    superseded_by=(
+                        new_memory_id
+                    ),
+                )
+
+                for old_id in (
+                    memories_to_supersede
+                ):
+                    console.print(
+                        "[yellow]"
+                        f"Memory: #{old_id} "
+                        "помечена SUPERSEDED "
+                        f"новой записью "
+                        f"#{new_memory_id}"
+                        "[/yellow]"
+                    )
+
+        # ======================================
+        # RELOAD ACTIVE MEMORY
         # ======================================
 
         memories = (
-            memory_store.get_active_memories()
+            memory_store
+            .get_active_memories()
         )
 
         # ======================================
-        # BUILD USER CONTEXT
+        # CONTEXT
         # ======================================
 
         current_user_message = (
@@ -314,26 +484,28 @@ def main() -> None:
             }
         ]
 
-        # Временная история.
         model_messages.extend(
             conversation_history
         )
 
-        # User Memory + текущая задача.
         model_messages.append(
             {
                 "role": "user",
-                "content": current_user_message,
+                "content": (
+                    current_user_message
+                ),
             }
         )
 
         # ======================================
-        # QWEN
+        # MODEL
         # ======================================
 
         try:
-            raw_answer = client.chat(
-                model_messages
+            raw_answer = (
+                client.chat(
+                    model_messages
+                )
             )
 
         except Exception as exc:
@@ -346,16 +518,18 @@ def main() -> None:
             continue
 
         # ======================================
-        # OUTPUT POLICY GUARD
+        # OUTPUT POLICY
         # ======================================
 
-        answer = filter_model_output(
-            answer=raw_answer,
-            system_prompt=system_prompt,
+        answer = (
+            filter_model_output(
+                answer=raw_answer,
+                system_prompt=system_prompt,
+            )
         )
 
         # ======================================
-        # UPDATE WORKING CONTEXT
+        # WORKING CONTEXT
         # ======================================
 
         conversation_history.append(

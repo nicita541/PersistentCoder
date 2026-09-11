@@ -7,33 +7,96 @@ def build_user_memory_context(
     if not memories:
         return (
             "USER MEMORY:\n"
-            "Сохранённых пользовательских правил нет."
+            "Постоянная память пуста."
         )
 
-    lines = [
-        "USER MEMORY:",
-        "",
-        "Ниже находятся сохранённые сведения "
-        "и правила пользователя.",
+    rules: list[str] = []
+    facts: list[str] = []
+    decisions: list[str] = []
+
+    for memory in memories:
+        memory_type = str(
+            memory.get(
+                "type",
+                "",
+            )
+        )
+
+        content = str(
+            memory.get(
+                "content",
+                "",
+            )
+        )
+
+        why = memory.get(
+            "why"
+        )
+
+        if memory_type == "USER_RULE":
+            rules.append(
+                f"- {content}"
+            )
+
+        elif memory_type == "FACT":
+            facts.append(
+                f"- {content}"
+            )
+
+        elif memory_type == "DECISION":
+            decision_text = (
+                f"- WHAT: {content}"
+            )
+
+            if why:
+                decision_text += (
+                    f"\n  WHY: {why}"
+                )
+
+            decisions.append(
+                decision_text
+            )
+
+    sections = [
+        "USER MEMORY",
         "",
     ]
 
-    for memory in memories:
-        memory_type = memory.get(
-            "type",
-            "UNKNOWN",
-        )
+    sections.append(
+        "ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА:"
+    )
 
-        content = memory.get(
-            "content",
-            "",
-        )
+    sections.extend(
+        rules
+        if rules
+        else ["- Нет."]
+    )
 
-        lines.append(
-            f"- [{memory_type}] {content}"
-        )
+    sections.append("")
+    sections.append(
+        "ФАКТЫ О ПРОЕКТЕ:"
+    )
 
-    return "\n".join(lines)
+    sections.extend(
+        facts
+        if facts
+        else ["- Нет."]
+    )
+
+    sections.append("")
+    sections.append(
+        "ПРИНЯТЫЕ РЕШЕНИЯ:"
+    )
+
+    sections.extend(
+        decisions
+        if decisions
+        else ["- Нет."]
+    )
+
+    return "\n".join(
+        sections
+    )
 
 
 def build_current_user_message(
@@ -41,8 +104,10 @@ def build_current_user_message(
     user_input: str,
     memories: list[dict[str, object]],
 ) -> str:
-    memory_context = build_user_memory_context(
-        memories
+    memory_context = (
+        build_user_memory_context(
+            memories
+        )
     )
 
     return (
