@@ -69,9 +69,6 @@ class ControlledToolPlanner:
         max_same_action: int = 2,
         max_tool_steps: int | None = None,
         trace_path: str | Path | None = None,
-        max_format_retries: int = 1,
-        max_duplicate_rejections: int = 2,
-        strict_plan_quality: bool = False,
     ) -> None:
         # Backward compatibility with the previous runtime/tests:
         # max_tool_steps now acts as a coarse upper bound only.
@@ -109,27 +106,6 @@ class ControlledToolPlanner:
                 "must be at least 1"
             )
 
-        if max_format_retries < 0:
-            raise ValueError(
-                "max_format_retries "
-                "cannot be negative"
-            )
-
-        if max_duplicate_rejections < 1:
-            raise ValueError(
-                "max_duplicate_rejections "
-                "must be at least 1"
-            )
-
-        if not isinstance(
-            strict_plan_quality,
-            bool,
-        ):
-            raise ValueError(
-                "strict_plan_quality "
-                "must be a bool"
-            )
-
         self.llm = llm
         self.max_task_actions = (
             max_task_actions
@@ -142,16 +118,6 @@ class ControlledToolPlanner:
         )
         self.max_same_action = (
             max_same_action
-        )
-
-        self.max_format_retries = (
-            max_format_retries
-        )
-        self.max_duplicate_rejections = (
-            max_duplicate_rejections
-        )
-        self.strict_plan_quality = (
-            strict_plan_quality
         )
 
         self._same_action_signature: (
@@ -228,41 +194,11 @@ class ControlledToolPlanner:
             )
 
             if validation.get("ok"):
-                quality = (
-                    workspace.validate_plan_quality(
-                        strict=(
-                            self.strict_plan_quality
-                        )
-                    )
-                )
-
-                self._trace(
-                    "quality_gate",
-                    result=quality,
-                )
-
-                if not quality.get("ok"):
-                    raise ToolPlannerError(
-                        "plan quality gate failed: "
-                        + "; ".join(
-                            quality.get(
-                                "errors",
-                                [],
-                            )
-                        )
-                    )
-
                 plan = workspace.to_plan_draft()
 
                 self._trace(
                     "plan_success",
                     task_count=len(plan.tasks),
-                    quality_warnings=(
-                        quality.get(
-                            "warnings",
-                            [],
-                        )
-                    ),
                 )
 
                 return plan
@@ -308,8 +244,6 @@ class ControlledToolPlanner:
         self,
         workspace: PlannerWorkspace,
     ) -> None:
-        duplicate_rejections = 0
-
         for action_number in range(
             1,
             self.max_task_actions + 1,
@@ -408,45 +342,9 @@ class ControlledToolPlanner:
             )
 
             if not result["ok"]:
-                error_text = str(
+                self._remember_tool_error(
                     result["error"]
                 )
-
-                self._remember_tool_error(
-                    error_text
-                )
-
-                duplicate_error = (
-                    "duplicates existing task"
-                    in error_text
-                    or "task already exists:"
-                    in error_text
-                )
-
-                if duplicate_error:
-                    duplicate_rejections += 1
-
-                    if (
-                        duplicate_rejections
-                        >= self.max_duplicate_rejections
-                        and workspace._tasks
-                    ):
-                        self._trace(
-                            "task_creation_auto_finish",
-                            reason=(
-                                "repeated_duplicate_rejections"
-                            ),
-                            duplicate_rejections=(
-                                duplicate_rejections
-                            ),
-                        )
-                        return
-                else:
-                    duplicate_rejections = 0
-
-                continue
-
-            duplicate_rejections = 0
 
         if not workspace._tasks:
             raise ToolPlannerError(
@@ -648,25 +546,18 @@ class ControlledToolPlanner:
                 phase="REPAIR:MISSING_PRODUCER",
                 system_prompt=(
                     "You are in TARGETED REPAIR phase. "
-                    "There is exactly one missing-producer "
-                    "validation error. "
-                    "Choose exactly ONE repair action. "
-                    "If the missing resource is a "
-                    "third-party library, framework, "
-                    "package, SDK, service, or external "
-                    "software, use "
-                    "move_requirement_to_external. "
-                    "If the missing resource is an internal "
-                    "artifact that this project must build, "
-                    "use create_task to add exactly one "
-                    "producer task. "
-                    "Do not rebuild the whole contract when "
-                    "a small mutation tool can fix it. "
+                    "There is exactly one validation error. "
+                    "You may do exactly one of two things: "
+                    "1) create_task if the missing internal "
+                    "resource really needs another "
+                    "implementation task; "
+                    "2) set_task_contract for the failing "
+                    "task if that requirement was wrong or "
+                    "should not be internal. "
                     "Do not delete tasks. "
                     "Do not finish the plan. "
                     "Do not repeat an action that already "
-                    "failed. "
-                    "Return exactly one JSON tool action."
+                    "failed."
                 ),
                 user_prompt=(
                     "USER REQUEST:\n"
@@ -684,79 +575,10 @@ class ControlledToolPlanner:
                         indent=2,
                     )
                     + "\n\n"
-                    "Return exactly one JSON object.\n"
-                    "For an external dependency, return:\n"
-                    "{"
-                    "\"tool\":"
-                    "\"move_requirement_to_external\","
-                    "\"arguments\":{"
-                    f"\"task_key\":\"{target_task}\","
-                    f"\"resource\":\"{resource}\""
-                    "}}\n"
-                    "For an internal resource, return one "
-                    "create_task action for a task that will "
-                    "produce that resource."
+                    "Return exactly one action: "
+                    "create_task OR set_task_contract."
                 ),
             )
-
-            if (
-                action["tool"]
-                == "move_requirement_to_external"
-            ):
-                arguments = action[
-                    "arguments"
-                ]
-
-                if (
-                    arguments.get(
-                        "task_key"
-                    )
-                    != target_task
-                ):
-                    self._remember_tool_error(
-                        "external repair must target "
-                        f"'{target_task}'"
-                    )
-                    continue
-
-                requested_resource = str(
-                    arguments.get(
-                        "resource",
-                        "",
-                    )
-                )
-
-                if (
-                    PlannerWorkspace
-                    ._normalize_resource(
-                        requested_resource
-                    )
-                    != PlannerWorkspace
-                    ._normalize_resource(
-                        resource
-                    )
-                ):
-                    self._remember_tool_error(
-                        "external repair resource "
-                        f"must be exactly '{resource}'"
-                    )
-                    continue
-
-                result = (
-                    self
-                    ._execute_move_requirement_to_external(
-                        workspace,
-                        arguments,
-                    )
-                )
-
-                if result["ok"]:
-                    return
-
-                self._remember_tool_error(
-                    result["error"]
-                )
-                continue
 
             if (
                 action["tool"]
@@ -822,9 +644,7 @@ class ControlledToolPlanner:
 
             self._remember_tool_error(
                 "repair phase allows only "
-                "move_requirement_to_external, "
-                "create_task, or legacy "
-                "set_task_contract"
+                "create_task or set_task_contract"
             )
 
         raise ToolPlannerError(
@@ -939,23 +759,6 @@ class ControlledToolPlanner:
             arguments,
             allowed=allowed,
             required=required,
-        )
-
-    def _execute_move_requirement_to_external(
-        self,
-        workspace: PlannerWorkspace,
-        arguments: dict[str, Any],
-    ) -> dict[str, Any]:
-        allowed = {
-            "task_key",
-            "resource",
-        }
-
-        return self._execute_checked(
-            workspace.move_requirement_to_external,
-            arguments,
-            allowed=allowed,
-            required=allowed,
         )
 
     def _execute_contract(
@@ -1117,89 +920,41 @@ class ControlledToolPlanner:
 
             self._last_tool_error = None
 
-        action: dict[str, Any] | None = None
-        parse_error: str | None = None
+        self._trace(
+            "llm_call",
+            phase=phase,
+            user_prompt=user_prompt,
+        )
 
-        for format_attempt in range(
-            self.max_format_retries + 1
-        ):
-            effective_prompt = user_prompt
+        response = self.llm.chat(
+            [
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt,
+                },
+            ],
+            max_new_tokens=384,
+        )
 
-            if parse_error is not None:
-                effective_prompt += (
-                    "\n\nFORMAT ERROR:\n"
-                    f"{parse_error}\n"
-                    "Return exactly one JSON object "
-                    "with keys 'tool' and 'arguments'. "
-                    "Do not return only a tool name. "
-                    "Do not use Markdown."
-                )
+        self._trace(
+            "llm_response",
+            phase=phase,
+            raw_response=response,
+        )
 
-            self._trace(
-                "llm_call",
-                phase=phase,
-                format_attempt=format_attempt,
-                user_prompt=effective_prompt,
-            )
+        action = self._parse_action(
+            response
+        )
 
-            response = self.llm.chat(
-                [
-                    {
-                        "role": "system",
-                        "content": system_prompt,
-                    },
-                    {
-                        "role": "user",
-                        "content": effective_prompt,
-                    },
-                ],
-                max_new_tokens=384,
-            )
-
-            self._trace(
-                "llm_response",
-                phase=phase,
-                format_attempt=format_attempt,
-                raw_response=response,
-            )
-
-            try:
-                action = self._parse_action(
-                    response
-                )
-
-            except ToolPlannerError as error:
-                parse_error = str(error)
-
-                self._trace(
-                    "parse_error",
-                    phase=phase,
-                    format_attempt=format_attempt,
-                    error=parse_error,
-                )
-
-                if (
-                    format_attempt
-                    >= self.max_format_retries
-                ):
-                    raise
-
-                continue
-
-            self._trace(
-                "parsed_action",
-                phase=phase,
-                format_attempt=format_attempt,
-                action=action,
-            )
-
-            break
-
-        if action is None:
-            raise ToolPlannerError(
-                "model did not return "
-                "a valid tool action"
-            )
+        self._trace(
+            "parsed_action",
+            phase=phase,
+            action=action,
+        )
 
         signature = (
             phase
@@ -1308,25 +1063,6 @@ class ControlledToolPlanner:
         cls,
         data: dict[str, Any],
     ) -> dict[str, Any]:
-        if (
-            not isinstance(
-                data.get("tool"),
-                str,
-            )
-            and isinstance(
-                data.get("action"),
-                str,
-            )
-            and isinstance(
-                data.get("arguments"),
-                dict,
-            )
-        ):
-            data = {
-                **data,
-                "tool": data["action"],
-            }
-
         if (
             isinstance(
                 data.get("tool"),

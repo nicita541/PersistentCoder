@@ -1,8 +1,7 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import re
 from copy import deepcopy
-from difflib import SequenceMatcher
 from dataclasses import asdict
 from typing import Any
 
@@ -94,59 +93,6 @@ class PlannerWorkspace:
             value.casefold().split()
         )
 
-    @staticmethod
-    def _normalize_task_text(
-        value: str,
-    ) -> str:
-        tokens = re.findall(
-            r"\w+",
-            value.casefold(),
-            flags=re.UNICODE,
-        )
-
-        return " ".join(tokens)
-
-    @classmethod
-    def _task_similarity(
-        cls,
-        left: TaskDraft,
-        *,
-        title: str,
-        description: str,
-    ) -> float:
-        left_text = cls._normalize_task_text(
-            f"{left.title} {left.description}"
-        )
-
-        right_text = cls._normalize_task_text(
-            f"{title} {description}"
-        )
-
-        if not left_text or not right_text:
-            return 0.0
-
-        sequence_score = SequenceMatcher(
-            None,
-            left_text,
-            right_text,
-        ).ratio()
-
-        left_tokens = set(left_text.split())
-        right_tokens = set(right_text.split())
-        union = left_tokens | right_tokens
-
-        jaccard_score = (
-            len(left_tokens & right_tokens)
-            / len(union)
-            if union
-            else 0.0
-        )
-
-        return max(
-            sequence_score,
-            jaccard_score,
-        )
-
     def create_task(
         self,
         *,
@@ -198,57 +144,6 @@ class PlannerWorkspace:
             raise PlannerToolError(
                 "success_criteria cannot be empty"
             )
-
-        candidate_title = self._clean_string(
-            title,
-            field_name="title",
-        )
-
-        candidate_description = self._clean_string(
-            description,
-            field_name="description",
-        )
-
-        candidate_title_key = (
-            self._normalize_task_text(
-                candidate_title
-            )
-        )
-
-        for existing in self._tasks.values():
-            existing_title_key = (
-                self._normalize_task_text(
-                    existing.title
-                )
-            )
-
-            if (
-                candidate_title_key
-                and candidate_title_key
-                == existing_title_key
-            ):
-                raise PlannerToolError(
-                    f"task '{key}' duplicates "
-                    f"existing task '{existing.key}' "
-                    "(exact normalized title). "
-                    "Create a distinct implementation "
-                    "task or finish task creation."
-                )
-
-            score = self._task_similarity(
-                existing,
-                title=candidate_title,
-                description=candidate_description,
-            )
-
-            if score >= 0.82:
-                raise PlannerToolError(
-                    f"task '{key}' duplicates "
-                    f"existing task '{existing.key}' "
-                    f"(similarity={score:.2f}). "
-                    "Create a distinct implementation "
-                    "task or finish task creation."
-                )
 
         task = TaskDraft(
             key=key,
@@ -381,71 +276,6 @@ class PlannerWorkspace:
             "task_key": task.key,
         }
 
-    def move_requirement_to_external(
-        self,
-        *,
-        task_key: str,
-        resource: str,
-    ) -> dict[str, Any]:
-        task = self._get_task(
-            task_key
-        )
-
-        resource = self._clean_string(
-            resource,
-            field_name="resource",
-        )
-
-        normalized = self._normalize_resource(
-            resource
-        )
-
-        matched: str | None = None
-        remaining: list[str] = []
-
-        for item in task.requires:
-            if (
-                matched is None
-                and self._normalize_resource(
-                    item
-                )
-                == normalized
-            ):
-                matched = item
-                continue
-
-            remaining.append(item)
-
-        if matched is None:
-            raise PlannerToolError(
-                f"task '{task.key}' does not "
-                f"require resource '{resource}'"
-            )
-
-        task.requires = remaining
-
-        external_keys = {
-            self._normalize_resource(item)
-            for item
-            in task.external_dependencies
-        }
-
-        if normalized not in external_keys:
-            task.external_dependencies.append(
-                matched
-            )
-
-        task.depends_on = []
-
-        return {
-            "ok": True,
-            "task_key": task.key,
-            "resource": matched,
-            "moved_to": (
-                "external_dependencies"
-            ),
-        }
-
     def remove_task(
         self,
         *,
@@ -479,100 +309,6 @@ class PlannerWorkspace:
                 for task
                 in self._tasks.values()
             ],
-        }
-
-    def validate_plan_quality(
-        self,
-        *,
-        strict: bool = False,
-    ) -> dict[str, Any]:
-        errors: list[str] = []
-        warnings: list[str] = []
-
-        seen_titles: dict[str, str] = {}
-        output_owners: dict[
-            str,
-            list[str],
-        ] = {}
-
-        for task in self._tasks.values():
-            assert task.key is not None
-
-            title_key = (
-                self._normalize_task_text(
-                    task.title
-                )
-            )
-
-            previous_key = (
-                seen_titles.get(title_key)
-            )
-
-            if (
-                title_key
-                and previous_key is not None
-            ):
-                message = (
-                    f"tasks '{previous_key}' and "
-                    f"'{task.key}' have duplicate titles"
-                )
-
-                if strict:
-                    errors.append(message)
-                else:
-                    warnings.append(message)
-
-            elif title_key:
-                seen_titles[title_key] = (
-                    task.key
-                )
-
-            if not task.produces:
-                message = (
-                    f"task '{task.key}' has no "
-                    "declared produced resource"
-                )
-
-                if strict:
-                    errors.append(message)
-                else:
-                    warnings.append(message)
-
-            for resource in task.produces:
-                normalized = (
-                    self._normalize_resource(
-                        resource
-                    )
-                )
-
-                output_owners.setdefault(
-                    normalized,
-                    [],
-                ).append(
-                    task.key
-                )
-
-        for normalized, owners in (
-            output_owners.items()
-        ):
-            if len(owners) <= 1:
-                continue
-
-            message = (
-                f"resource '{normalized}' is "
-                "produced by multiple tasks: "
-                + ", ".join(owners)
-            )
-
-            if strict:
-                errors.append(message)
-            else:
-                warnings.append(message)
-
-        return {
-            "ok": not errors,
-            "errors": errors,
-            "warnings": warnings,
         }
 
     def validate_plan(

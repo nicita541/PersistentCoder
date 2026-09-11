@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 
@@ -28,7 +28,6 @@ class PlannerRuntime:
             self.llm,
             max_tool_steps=24,
             trace_path=PLANNER_TRACE_PATH,
-            strict_plan_quality=True,
         )
 
         self.store = PlanStore()

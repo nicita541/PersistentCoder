@@ -70,8 +70,6 @@ class ControlledToolPlanner:
         max_tool_steps: int | None = None,
         trace_path: str | Path | None = None,
         max_format_retries: int = 1,
-        max_duplicate_rejections: int = 2,
-        strict_plan_quality: bool = False,
     ) -> None:
         # Backward compatibility with the previous runtime/tests:
         # max_tool_steps now acts as a coarse upper bound only.
@@ -115,21 +113,6 @@ class ControlledToolPlanner:
                 "cannot be negative"
             )
 
-        if max_duplicate_rejections < 1:
-            raise ValueError(
-                "max_duplicate_rejections "
-                "must be at least 1"
-            )
-
-        if not isinstance(
-            strict_plan_quality,
-            bool,
-        ):
-            raise ValueError(
-                "strict_plan_quality "
-                "must be a bool"
-            )
-
         self.llm = llm
         self.max_task_actions = (
             max_task_actions
@@ -146,12 +129,6 @@ class ControlledToolPlanner:
 
         self.max_format_retries = (
             max_format_retries
-        )
-        self.max_duplicate_rejections = (
-            max_duplicate_rejections
-        )
-        self.strict_plan_quality = (
-            strict_plan_quality
         )
 
         self._same_action_signature: (
@@ -228,41 +205,11 @@ class ControlledToolPlanner:
             )
 
             if validation.get("ok"):
-                quality = (
-                    workspace.validate_plan_quality(
-                        strict=(
-                            self.strict_plan_quality
-                        )
-                    )
-                )
-
-                self._trace(
-                    "quality_gate",
-                    result=quality,
-                )
-
-                if not quality.get("ok"):
-                    raise ToolPlannerError(
-                        "plan quality gate failed: "
-                        + "; ".join(
-                            quality.get(
-                                "errors",
-                                [],
-                            )
-                        )
-                    )
-
                 plan = workspace.to_plan_draft()
 
                 self._trace(
                     "plan_success",
                     task_count=len(plan.tasks),
-                    quality_warnings=(
-                        quality.get(
-                            "warnings",
-                            [],
-                        )
-                    ),
                 )
 
                 return plan
@@ -308,8 +255,6 @@ class ControlledToolPlanner:
         self,
         workspace: PlannerWorkspace,
     ) -> None:
-        duplicate_rejections = 0
-
         for action_number in range(
             1,
             self.max_task_actions + 1,
@@ -408,45 +353,9 @@ class ControlledToolPlanner:
             )
 
             if not result["ok"]:
-                error_text = str(
+                self._remember_tool_error(
                     result["error"]
                 )
-
-                self._remember_tool_error(
-                    error_text
-                )
-
-                duplicate_error = (
-                    "duplicates existing task"
-                    in error_text
-                    or "task already exists:"
-                    in error_text
-                )
-
-                if duplicate_error:
-                    duplicate_rejections += 1
-
-                    if (
-                        duplicate_rejections
-                        >= self.max_duplicate_rejections
-                        and workspace._tasks
-                    ):
-                        self._trace(
-                            "task_creation_auto_finish",
-                            reason=(
-                                "repeated_duplicate_rejections"
-                            ),
-                            duplicate_rejections=(
-                                duplicate_rejections
-                            ),
-                        )
-                        return
-                else:
-                    duplicate_rejections = 0
-
-                continue
-
-            duplicate_rejections = 0
 
         if not workspace._tasks:
             raise ToolPlannerError(
@@ -654,14 +563,14 @@ class ControlledToolPlanner:
                     "If the missing resource is a "
                     "third-party library, framework, "
                     "package, SDK, service, or external "
-                    "software, use "
-                    "move_requirement_to_external. "
+                    "software, use set_task_contract for "
+                    "the failing task: remove that resource "
+                    "from requires and put it in "
+                    "external_dependencies. "
                     "If the missing resource is an internal "
                     "artifact that this project must build, "
                     "use create_task to add exactly one "
                     "producer task. "
-                    "Do not rebuild the whole contract when "
-                    "a small mutation tool can fix it. "
                     "Do not delete tasks. "
                     "Do not finish the plan. "
                     "Do not repeat an action that already "
@@ -684,79 +593,14 @@ class ControlledToolPlanner:
                         indent=2,
                     )
                     + "\n\n"
-                    "Return exactly one JSON object.\n"
-                    "For an external dependency, return:\n"
-                    "{"
-                    "\"tool\":"
-                    "\"move_requirement_to_external\","
-                    "\"arguments\":{"
-                    f"\"task_key\":\"{target_task}\","
-                    f"\"resource\":\"{resource}\""
-                    "}}\n"
-                    "For an internal resource, return one "
-                    "create_task action for a task that will "
-                    "produce that resource."
+                    "Return exactly one JSON object. "
+                    "Use set_task_contract when the "
+                    "resource belongs in "
+                    "external_dependencies, or use "
+                    "create_task when the project needs "
+                    "a new internal producer task."
                 ),
             )
-
-            if (
-                action["tool"]
-                == "move_requirement_to_external"
-            ):
-                arguments = action[
-                    "arguments"
-                ]
-
-                if (
-                    arguments.get(
-                        "task_key"
-                    )
-                    != target_task
-                ):
-                    self._remember_tool_error(
-                        "external repair must target "
-                        f"'{target_task}'"
-                    )
-                    continue
-
-                requested_resource = str(
-                    arguments.get(
-                        "resource",
-                        "",
-                    )
-                )
-
-                if (
-                    PlannerWorkspace
-                    ._normalize_resource(
-                        requested_resource
-                    )
-                    != PlannerWorkspace
-                    ._normalize_resource(
-                        resource
-                    )
-                ):
-                    self._remember_tool_error(
-                        "external repair resource "
-                        f"must be exactly '{resource}'"
-                    )
-                    continue
-
-                result = (
-                    self
-                    ._execute_move_requirement_to_external(
-                        workspace,
-                        arguments,
-                    )
-                )
-
-                if result["ok"]:
-                    return
-
-                self._remember_tool_error(
-                    result["error"]
-                )
-                continue
 
             if (
                 action["tool"]
@@ -822,9 +666,7 @@ class ControlledToolPlanner:
 
             self._remember_tool_error(
                 "repair phase allows only "
-                "move_requirement_to_external, "
-                "create_task, or legacy "
-                "set_task_contract"
+                "create_task or set_task_contract"
             )
 
         raise ToolPlannerError(
@@ -939,23 +781,6 @@ class ControlledToolPlanner:
             arguments,
             allowed=allowed,
             required=required,
-        )
-
-    def _execute_move_requirement_to_external(
-        self,
-        workspace: PlannerWorkspace,
-        arguments: dict[str, Any],
-    ) -> dict[str, Any]:
-        allowed = {
-            "task_key",
-            "resource",
-        }
-
-        return self._execute_checked(
-            workspace.move_requirement_to_external,
-            arguments,
-            allowed=allowed,
-            required=allowed,
         )
 
     def _execute_contract(
@@ -1308,25 +1133,6 @@ class ControlledToolPlanner:
         cls,
         data: dict[str, Any],
     ) -> dict[str, Any]:
-        if (
-            not isinstance(
-                data.get("tool"),
-                str,
-            )
-            and isinstance(
-                data.get("action"),
-                str,
-            )
-            and isinstance(
-                data.get("arguments"),
-                dict,
-            )
-        ):
-            data = {
-                **data,
-                "tool": data["action"],
-            }
-
         if (
             isinstance(
                 data.get("tool"),

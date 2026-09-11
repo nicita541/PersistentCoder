@@ -10,7 +10,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 MODEL_CACHE = PROJECT_ROOT / "models" / "huggingface"
 
-MODEL_NAME = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
+MODEL_NAME = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
 
 
 class QwenClient:
