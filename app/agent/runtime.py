@@ -37,6 +37,9 @@ from app.tasks.verifier import Verifier
 from app.tools.file_tools import FileTools
 from app.tools.project_tools import ProjectTools
 from app.tools.terminal_tools import TerminalTools
+from app.sandbox.paths import ensure_layout
+from app.sandbox.runner import SandboxCommandRunner
+from app.sandbox.workspace import SandboxWorkspace
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -80,9 +83,26 @@ class AgentRuntime:
         use_llm_dependencies: bool = True,
         planner_repair_attempts: int = 1,
     ) -> None:
-        self.workspace_root = Path(
-            workspace_root or PROJECT_ROOT
-        ).resolve()
+        ensure_layout()
+
+        if workspace_root is None:
+            # Production: agents edit a sandbox snapshot,
+            # never the host project directly.
+            self.sandbox_workspace = (
+                SandboxWorkspace.create(
+                    project_root=PROJECT_ROOT,
+                )
+            )
+            self.workspace_root = (
+                self.sandbox_workspace.workspace_root
+            )
+
+        else:
+            # Explicit root (tests / framework tooling).
+            self.sandbox_workspace = None
+            self.workspace_root = Path(
+                workspace_root
+            ).resolve()
 
         self.database_path = (
             Path(database_path)
@@ -230,11 +250,16 @@ class AgentRuntime:
             terminal=self.terminal,
         )
 
+        self.command_runner = SandboxCommandRunner(
+            sandbox_root=self.workspace_root,
+        )
+
         self.executor = CodeExecutor(
             workspace=self.workspace,
             llm=self.llm,
             context=self.context,
             system_prompt=self.system_prompt,
+            command_runner=self.command_runner,
         )
 
         self.coder = CodingAgent(self.executor)
@@ -294,4 +319,8 @@ class AgentRuntime:
         return AgentLoop(self.controller).run(
             request
         )
+
+    def sandbox_status(self) -> str:
+        return self.command_runner.status()
+
 

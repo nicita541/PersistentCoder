@@ -14,11 +14,9 @@ typing-inspection==0.4.4
 typing_extensions==4.16.0
 
 # ------------------------------------------------------------------
-# Runtime ML dependencies.
-#
+# Runtime ML dependencies (used by app/llm/client.py).
 # torch is intentionally unpinned and WITHOUT a CUDA index URL so this
 # requirements file stays portable between CPU-only and CUDA machines.
-# Install the build that matches your hardware, e.g.:
 #   CPU:   pip install torch
 #   CUDA:  pip install torch --index-url https://download.pytorch.org/whl/cu128
 # ------------------------------------------------------------------
@@ -27,4 +25,3 @@ transformers
 accelerate
 huggingface_hub
 safetensors
-

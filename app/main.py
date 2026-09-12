@@ -9,6 +9,7 @@ from app.policy.guard import (
     is_policy_disclosure_request,
     policy_refusal,
 )
+from app.sandbox.paths import configure_project_env
 
 
 console = Console()
@@ -109,6 +110,12 @@ def main() -> None:
     )
 
     # ==========================================
+    # PROJECT-LOCAL STORAGE (no external writes)
+    # ==========================================
+
+    configure_project_env()
+
+    # ==========================================
     # SINGLE DEPENDENCY GRAPH
     # ==========================================
 
@@ -128,6 +135,11 @@ def main() -> None:
     )
     console.print(
         "[green]PersistentCoder готов.[/green]"
+    )
+
+    console.print(
+        "[dim]Sandbox: "
+        f"{runtime.sandbox_status()}[/dim]"
     )
 
     show_commands()

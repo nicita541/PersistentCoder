@@ -2,9 +2,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from app.sandbox.policy import (
+    PathPolicy,
+    PolicyViolation,
+)
 
-class FileToolsError(RuntimeError):
-    pass
+
+class FileToolsError(PolicyViolation):
+    """
+    Refused operation: absolute host path or escape from workspace.
+    """
+
 
 
 class FileTools:
@@ -20,28 +28,20 @@ class FileTools:
         root: str | Path,
     ) -> None:
         self.root = Path(root).resolve()
+        self.policy = PathPolicy(self.root)
 
     def _resolve(
         self,
         path: str | Path,
     ) -> Path:
-        raw = Path(path)
+        try:
+            return self.policy.resolve(path)
 
-        candidate = (
-            raw.resolve()
-            if raw.is_absolute()
-            else (self.root / raw).resolve()
-        )
-
-        if (
-            candidate != self.root
-            and self.root not in candidate.parents
-        ):
+        except PolicyViolation as error:
             raise FileToolsError(
-                f"path escapes workspace: {path}"
-            )
+                str(error)
+            ) from error
 
-        return candidate
 
     def exists(
         self,
@@ -132,10 +132,22 @@ class FileTools:
         self,
         path: str | Path,
     ) -> str:
-        try:
-            return self._resolve(
-                path
-            ).relative_to(self.root).as_posix()
+        candidate = Path(path)
 
-        except ValueError:
-            return str(path)
+        if not candidate.is_absolute():
+            candidate = self.root / candidate
+
+        candidate = candidate.resolve()
+
+        if (
+            candidate != self.root
+            and self.root not in candidate.parents
+        ):
+            raise FileToolsError(
+                f"path escapes workspace: {path}"
+            )
+
+        return candidate.relative_to(
+            self.root
+        ).as_posix()
+

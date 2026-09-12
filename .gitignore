@@ -3,9 +3,18 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
+# Local database / runtime data
 data/*.db
 data/*.sqlite
 data/*.sqlite3
+data/tmp/
+data/logs/
+
+# Host-side sandbox metadata (sessions, snapshots, patches, logs)
+.sandbox/
+
+# Project-local pip cache
+.pip-cache/
 
 .env
 

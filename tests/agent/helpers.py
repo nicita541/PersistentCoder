@@ -264,3 +264,44 @@ def coder_envelope(
         commands=commands,
     )
 
+
+class RecordingCommandRunner:
+    """
+    Test double for the sandbox command runner.
+
+    It never touches the host: it only records commands and
+    returns a canned CommandResult.
+    """
+
+    def __init__(
+        self,
+        *,
+        returncode: int = 0,
+        stdout: str = "",
+        stderr: str = "",
+    ) -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.commands: list[str] = []
+
+    def run(
+        self,
+        command: str,
+        *,
+        cwd=None,
+    ):
+        from app.tools.terminal_tools import (
+            CommandResult,
+        )
+
+        self.commands.append(command)
+
+        return CommandResult(
+            command=command,
+            returncode=self.returncode,
+            stdout=self.stdout,
+            stderr=self.stderr,
+        )
+
+

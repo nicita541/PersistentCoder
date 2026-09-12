@@ -5,6 +5,11 @@ from app.agent.state import (
     ExecutionResult,
     extract_json_object,
 )
+from app.sandbox.policy import (
+    PolicyViolation,
+    is_absolute_path,
+)
+
 
 
 class CodeExecutorError(RuntimeError):
@@ -37,6 +42,7 @@ class CodeExecutor:
         system_prompt: str | None = None,
         max_new_tokens: int = 1024,
         run_commands: bool = True,
+        command_runner=None,
     ) -> None:
         self.workspace = workspace
         self.llm = llm
@@ -44,6 +50,7 @@ class CodeExecutor:
         self.system_prompt = system_prompt
         self.max_new_tokens = max_new_tokens
         self.run_commands = run_commands
+        self.command_runner = command_runner
 
     def _build_messages(
         self,
@@ -257,10 +264,42 @@ class CodeExecutor:
                         ],
                     )
 
-                written = self.workspace.write(
-                    path.strip(),
-                    content,
-                )
+                raw_path = path.strip()
+
+                if is_absolute_path(raw_path):
+                    return ExecutionResult(
+                        ok=False,
+                        summary=(
+                            "absolute workspace paths "
+                            "are forbidden"
+                        ),
+                        failure_reason=(
+                            "absolute path in action "
+                            "envelope"
+                        ),
+                        evidence=[
+                            f"blocked_path:{raw_path}"
+                        ],
+                    )
+
+                try:
+                    written = self.workspace.write(
+                        raw_path,
+                        content,
+                    )
+
+                except PolicyViolation as error:
+                    return ExecutionResult(
+                        ok=False,
+                        summary=(
+                            "path rejected by sandbox "
+                            "policy"
+                        ),
+                        failure_reason=str(error),
+                        evidence=[
+                            f"blocked_path:{raw_path}"
+                        ],
+                    )
 
                 relative = self.workspace.relative(
                     written
@@ -270,6 +309,7 @@ class CodeExecutor:
                 evidence.append(
                     f"wrote {relative}"
                 )
+
 
         # --------------------------------------
         # COMMANDS
@@ -306,11 +346,41 @@ class CodeExecutor:
                             ],
                         )
 
-                    result = (
-                        self.workspace.terminal.run(
-                            command
+                    if self.command_runner is None:
+                        return ExecutionResult(
+                            ok=False,
+                            summary=(
+                                "commands are disabled"
+                            ),
+                            failure_reason=(
+                                "no sandbox command "
+                                "runner; refusing to "
+                                "execute on host"
+                            ),
+                            evidence=[
+                                f"blocked_command:{command}"
+                            ],
                         )
-                    )
+
+                    try:
+                        result = (
+                            self.command_runner.run(
+                                command
+                            )
+                        )
+
+                    except PolicyViolation as error:
+                        return ExecutionResult(
+                            ok=False,
+                            summary=(
+                                "command rejected by "
+                                "policy"
+                            ),
+                            failure_reason=str(error),
+                            evidence=[
+                                f"blocked_command:{command}"
+                            ],
+                        )
 
                     execution = CommandExecution(
                         command=command,
