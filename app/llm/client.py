@@ -13,7 +13,6 @@ MODEL_CACHE = PROJECT_ROOT / "models" / "huggingface"
 MODEL_NAME = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
 
 
-
 class QwenClient:
     def __init__(self) -> None:
         MODEL_CACHE.mkdir(
