@@ -258,3 +258,175 @@ def test_task_builder_requires_success_criteria():
                 }
             ]
         )
+
+
+# ==========================================
+# PLAN-LEVEL BOUNDED REPAIR
+# ==========================================
+
+
+def _duplicate_producer_tasks() -> str:
+    """Two tasks produce the same file path -> multiple producers."""
+
+    return json.dumps(
+        {
+            "tasks": [
+                {
+                    "key": "api",
+                    "title": "Calculator API",
+                    "description": "Build the API.",
+                    "priority": 80,
+                    "requires": [],
+                    "produces": [
+                        "sandbox_agent_test/calculator.py"
+                    ],
+                    "success_criteria": ["api works"],
+                },
+                {
+                    "key": "cli",
+                    "title": "Calculator CLI",
+                    "description": "Build the CLI.",
+                    "priority": 70,
+                    "requires": [],
+                    "produces": [
+                        "sandbox_agent_test/calculator.py"
+                    ],
+                    "success_criteria": ["cli works"],
+                },
+                {
+                    "key": "tests",
+                    "title": "Calculator tests",
+                    "description": "Write tests.",
+                    "priority": 60,
+                    "requires": [
+                        "sandbox_agent_test/calculator.py"
+                    ],
+                    "produces": ["calculator test report"],
+                    "success_criteria": ["tests pass"],
+                },
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+
+def _repaired_tasks() -> str:
+    """One file path -> one implementation task owner."""
+
+    return json.dumps(
+        {
+            "tasks": [
+                {
+                    "key": "calculator",
+                    "title": "Calculator implementation",
+                    "description": (
+                        "Implement "
+                        "sandbox_agent_test/calculator.py."
+                    ),
+                    "priority": 80,
+                    "requires": [],
+                    "produces": [
+                        "sandbox_agent_test/calculator.py"
+                    ],
+                    "success_criteria": [
+                        "calculator.py exists"
+                    ],
+                },
+                {
+                    "key": "tests",
+                    "title": "Calculator tests",
+                    "description": (
+                        "Test the calculator module."
+                    ),
+                    "priority": 70,
+                    "requires": [
+                        "sandbox_agent_test/calculator.py"
+                    ],
+                    "produces": ["calculator test report"],
+                    "success_criteria": ["tests pass"],
+                },
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+
+def _repaired_dependencies() -> str:
+    return json.dumps(
+        {
+            "dependencies": {
+                "calculator": [],
+                "tests": ["calculator"],
+            }
+        }
+    )
+
+
+def test_plan_level_repair_fixes_multiple_producers(
+    tmp_path,
+):
+    stores = make_stores(tmp_path)
+
+    llm = FakeLLM(
+        [
+            goal_response(),
+            _duplicate_producer_tasks(),
+            _repaired_tasks(),
+            _repaired_dependencies(),
+        ]
+    )
+
+    planner = PlannerAgent(
+        llm,
+        stores.plan_store,
+        step_store=stores.step_store,
+        max_plan_repairs=2,
+    )
+
+    result = planner.plan(
+        "Напиши calculator с тестами."
+    )
+
+    keys = [
+        task.key
+        for task in result.draft.tasks
+    ]
+
+    assert keys == ["calculator", "tests"]
+
+    assert result.draft.tasks[1].depends_on == [
+        "calculator"
+    ]
+
+    # goal + rejected decomposition + repaired decomposition + deps
+    assert len(llm.calls) == 4
+
+
+def test_plan_level_repair_is_bounded(tmp_path):
+    stores = make_stores(tmp_path)
+
+    llm = FakeLLM(
+        [
+            goal_response(),
+            _duplicate_producer_tasks(),
+            _duplicate_producer_tasks(),
+            _duplicate_producer_tasks(),
+        ]
+    )
+
+    planner = PlannerAgent(
+        llm,
+        stores.plan_store,
+        step_store=stores.step_store,
+        max_plan_repairs=1,
+    )
+
+    with pytest.raises(
+        PlannerError,
+        match="plan repair failed",
+    ):
+        planner.plan("Напиши calculator.")
+
+    # goal + two decomposition attempts, then bounded stop
+    assert len(llm.calls) == 3
+

@@ -34,9 +34,9 @@ from app.tasks.verification_store import (
     VerificationStore,
 )
 from app.tasks.verifier import Verifier
+from app.agent.state import AgentPhase
 from app.tools.file_tools import FileTools
 from app.tools.project_tools import ProjectTools
-from app.tools.terminal_tools import TerminalTools
 from app.sandbox.paths import ensure_layout
 from app.sandbox.runner import SandboxCommandRunner
 from app.sandbox.workspace import SandboxWorkspace
@@ -82,6 +82,7 @@ class AgentRuntime:
         max_task_attempts: int = 3,
         use_llm_dependencies: bool = True,
         planner_repair_attempts: int = 1,
+        planner_plan_repairs: int = 2,
     ) -> None:
         ensure_layout()
 
@@ -111,6 +112,7 @@ class AgentRuntime:
         )
 
         self.events = EventBus()
+        self.last_patch_path: str | None = None
 
         # ==================================
         # SINGLE LLM INSTANCE
@@ -158,9 +160,8 @@ class AgentRuntime:
             files=self.file_tools,
         )
 
-        self.terminal = TerminalTools(
-            cwd=self.workspace_root
-        )
+        # NOTE: production has NO host TerminalTools / host subprocess
+        # runner. Every model command goes through SandboxCommandRunner.
 
         # ==================================
         # TASK OS (single)
@@ -238,6 +239,9 @@ class AgentRuntime:
             max_repair_attempts=(
                 planner_repair_attempts
             ),
+            max_plan_repairs=(
+                planner_plan_repairs
+            ),
             use_llm_dependencies=(
                 use_llm_dependencies
             ),
@@ -247,7 +251,6 @@ class AgentRuntime:
             self.workspace_root,
             file_tools=self.file_tools,
             project_tools=self.project_tools,
-            terminal=self.terminal,
         )
 
         self.command_runner = SandboxCommandRunner(
@@ -316,9 +319,25 @@ class AgentRuntime:
         )
 
     def run(self, request: str):
-        return AgentLoop(self.controller).run(
+        state = AgentLoop(self.controller).run(
             request
         )
+
+        self.last_patch_path = None
+
+        if (
+            state.phase is AgentPhase.DONE
+            and self.sandbox_workspace is not None
+        ):
+            patch = (
+                self.sandbox_workspace.write_patch()
+            )
+
+            if patch is not None:
+                self.last_patch_path = str(patch)
+                state.patch_path = str(patch)
+
+        return state
 
     def sandbox_status(self) -> str:
         return self.command_runner.status()

@@ -25,7 +25,7 @@ class CodeExecutor:
         Task/Step
           -> ContextBuilder
           -> LLM (один общий client)
-          -> FileTools / TerminalTools
+          -> FileTools (sandbox workspace) + SandboxCommandRunner (Docker)
           -> ExecutionResult с реальными evidence
 
     Запрещено возвращать успех без реальной работы:

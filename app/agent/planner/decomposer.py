@@ -383,7 +383,12 @@ class TaskDecomposer:
         "SDKs belong in external_dependencies\n"
         "- Flask, FastAPI, pytest and similar software "
         "must NOT be put in requires\n"
-        "- requires and produces names must match exactly"
+        "- requires and produces names must match exactly\n"
+        "- ONE FILE PATH = ONE IMPLEMENTATION TASK OWNER: "
+        "a concrete file path (for example "
+        "src/calculator.py) may be produced by EXACTLY ONE "
+        "task; never let two tasks produce the same file "
+        "path and never split a single file across tasks"
     )
 
     def __init__(
@@ -408,12 +413,39 @@ class TaskDecomposer:
         *,
         user_request: str,
         goal: dict[str, object],
+        repair_instruction: str | None = None,
+        previous_components: (
+            list[dict[str, object]] | None
+        ) = None,
     ) -> list[dict[str, object]]:
         goal_json = json.dumps(
             goal,
             ensure_ascii=False,
             indent=2,
         )
+
+        repair_block = ""
+
+        if repair_instruction:
+            previous_json = ""
+
+            if previous_components:
+                previous_json = json.dumps(
+                    previous_components,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+
+            repair_block = (
+                "REPAIR INSTRUCTION:\n"
+                "The previous decomposition was rejected "
+                "by the contract validator:\n"
+                f"{repair_instruction}\n\n"
+                "PREVIOUS (REJECTED) TASKS:\n"
+                f"{previous_json}\n\n"
+                "Rebuild the FULL task list so that the "
+                "rejected contract error cannot occur.\n\n"
+            )
 
         messages = [
             {
@@ -433,8 +465,28 @@ class TaskDecomposer:
                     f"{user_request}\n\n"
                     "GOAL ANALYSIS:\n"
                     f"{goal_json}\n\n"
+                    f"{repair_block}"
                     "AUTHORITATIVE RULES:\n"
                     f"{self.DECOMPOSER_RULES}\n\n"
+                    "VALID EXAMPLE (copy this structure and the "
+                    "resource names):\n"
+                    '{"tasks": ['
+                    '{"key": "impl", "title": "Implement calculator", '
+                    '"description": "Implement the module.", '
+                    '"priority": 80, "requires": [], '
+                    '"produces": ["sandbox_agent_test/calculator.py"], '
+                    '"external_dependencies": [], '
+                    '"success_criteria": ["calculator.py exists"]}, '
+                    '{"key": "tests", "title": "Test calculator", '
+                    '"description": "Write pytest tests.", '
+                    '"priority": 70, '
+                    '"requires": ["sandbox_agent_test/calculator.py"], '
+                    '"produces": ["sandbox_agent_test/test_calculator.py"], '
+                    '"external_dependencies": ["pytest"], '
+                    '"success_criteria": ["tests pass"]}]}\n\n'
+                    "IMPORTANT: every value in requires MUST appear "
+                    "verbatim in some task's produces. Never put a "
+                    "task key or a title into requires.\n\n"
                     "Return exactly this JSON shape:\n"
                     "{\n"
                     '  "tasks": [\n'

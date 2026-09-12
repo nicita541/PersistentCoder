@@ -51,6 +51,7 @@ class PlannerAgent:
         *,
         step_store=None,
         max_repair_attempts: int = 0,
+        max_plan_repairs: int = 0,
         use_llm_dependencies: bool = True,
         goal_analyzer=None,
         decomposer=None,
@@ -64,9 +65,16 @@ class PlannerAgent:
                 "cannot be negative"
             )
 
+        if max_plan_repairs < 0:
+            raise ValueError(
+                "max_plan_repairs "
+                "cannot be negative"
+            )
+
         self.llm = llm
         self.task_store = task_store
         self.step_store = step_store
+        self.max_plan_repairs = max_plan_repairs
         self.use_llm_dependencies = (
             use_llm_dependencies
         )
@@ -124,31 +132,81 @@ class PlannerAgent:
             request
         )
 
-        components = self.decomposer.decompose(
-            user_request=request,
-            goal=goal,
-        )
+        # --------------------------------------
+        # PLAN-LEVEL BOUNDED REPAIR
+        #
+        # GoalAnalyzer -> TaskDecomposer -> TaskBuilder
+        # -> ContractBuilder -> DependencyBuilder
+        #
+        # If the contract is invalid (for example two tasks
+        # produce the same file path), the decomposition is
+        # repaired and validation is repeated.
+        # ContractBuilder itself is NOT weakened.
+        # --------------------------------------
 
-        tasks = self.task_builder.build(
-            components
-        )
+        repair_instruction: str | None = None
 
-        self.contract_builder.validate_contracts(
-            tasks
-        )
+        previous_components: (
+            list[dict[str, object]] | None
+        ) = None
 
-        if self.use_llm_dependencies:
-            tasks = self.dependency_builder.build(
+        tasks = None
+
+        for attempt in range(
+            self.max_plan_repairs + 1
+        ):
+            components = self.decomposer.decompose(
                 user_request=request,
                 goal=goal,
-                tasks=tasks,
+                repair_instruction=(
+                    repair_instruction
+                ),
+                previous_components=(
+                    previous_components
+                ),
             )
 
-        else:
-            tasks = (
-                self.dependency_builder
-                .infer_from_contracts(tasks)
-            )
+            try:
+                tasks = self.task_builder.build(
+                    components
+                )
+
+                self.contract_builder.validate_contracts(
+                    tasks
+                )
+
+                if self.use_llm_dependencies:
+                    tasks = (
+                        self.dependency_builder
+                        .build(
+                            user_request=request,
+                            goal=goal,
+                            tasks=tasks,
+                        )
+                    )
+
+                else:
+                    tasks = (
+                        self.dependency_builder
+                        .infer_from_contracts(tasks)
+                    )
+
+            except PlannerError as error:
+                if attempt >= self.max_plan_repairs:
+                    if self.max_plan_repairs == 0:
+                        raise
+
+                    raise PlannerError(
+                        "plan repair failed after "
+                        f"{self.max_plan_repairs} "
+                        f"attempts: {error}"
+                    ) from error
+
+                repair_instruction = str(error)
+                previous_components = components
+                continue
+
+            break
 
         return PlanDraft(
             user_request=request,

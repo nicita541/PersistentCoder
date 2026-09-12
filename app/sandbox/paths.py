@@ -34,6 +34,17 @@ SANDBOX_PATCHES = SANDBOX_ROOT / "patches"
 SANDBOX_LOGS = SANDBOX_ROOT / "logs"
 SANDBOX_TMP = SANDBOX_ROOT / "tmp"
 
+# ------------------------------------------------------------------
+# SANDBOX DOCKER IMAGE (Dockerfile + all related files stay in-project)
+# ------------------------------------------------------------------
+
+SANDBOX_DOCKERFILE_DIR = PROJECT_ROOT / "sandbox"
+SANDBOX_DOCKERFILE = SANDBOX_DOCKERFILE_DIR / "Dockerfile"
+SANDBOX_IMAGE = "persistentcoder-sandbox:py312"
+
+# Container user (non-root).
+SANDBOX_CONTAINER_USER = "1000:1000"
+
 
 PROJECT_DIRECTORIES = (
     DATA_ROOT,

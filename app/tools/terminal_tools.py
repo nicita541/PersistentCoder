@@ -19,7 +19,12 @@ class CommandResult:
 
 class TerminalTools:
     """
-    Единственный низкоуровневый слой запуска команд.
+    Host shell runner.
+
+    FRAMEWORK-ONLY. Never wire this into the CodingAgent or any other
+    agent path: model-generated commands MUST run exclusively through
+    app.sandbox.runner.SandboxCommandRunner inside Docker. There is no
+    host subprocess fallback in production.
     """
 
     def __init__(

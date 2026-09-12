@@ -169,6 +169,9 @@ class AgentState:
 
     completion: str | None = None
 
+    # Path to the sandbox patch produced on DONE (never auto-applied).
+    patch_path: str | None = None
+
     history: list[str] = field(
         default_factory=list
     )

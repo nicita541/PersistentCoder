@@ -4,15 +4,15 @@ from pathlib import Path
 
 from app.tools.file_tools import FileTools
 from app.tools.project_tools import ProjectTools
-from app.tools.terminal_tools import TerminalTools
 
 
 class Workspace:
     """
-    Рабочее пространство CodingAgent.
+    Production workspace for CodingAgent.
 
-    Не содержит собственной файловой логики —
-    делегирует единому Tools Layer.
+    Contains NO host command runner. All model-provided commands are
+    executed exclusively by app.sandbox.runner.SandboxCommandRunner
+    inside the Docker sandbox. There is no host subprocess fallback.
     """
 
     def __init__(
@@ -21,7 +21,6 @@ class Workspace:
         *,
         file_tools: FileTools | None = None,
         project_tools: ProjectTools | None = None,
-        terminal: TerminalTools | None = None,
     ) -> None:
         self.root = Path(root).resolve()
         self.files = file_tools or FileTools(
@@ -34,10 +33,7 @@ class Workspace:
                 files=self.files,
             )
         )
-        self.terminal = (
-            terminal
-            or TerminalTools(cwd=self.root)
-        )
+
 
     def exists(
         self,

@@ -89,6 +89,12 @@ def render_state(state) -> str:
             f"{state.repair.reason}"
         )
 
+    if state.patch_path:
+        lines.append(
+            f"**Patch:** {state.patch_path} "
+            "(not applied)"
+        )
+
     lines.append(
         f"**Результат:** "
         f"{state.completion or state.phase.value}"

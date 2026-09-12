@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+from pathlib import Path
 
 from app.agent.runtime import AgentRuntime
+from app.sandbox.paths import (
+    PROJECT_ROOT,
+    SANDBOX_PATCHES,
+)
+from app.sandbox.runner import SandboxCommandRunner
 
 from helpers import (
     FakeLLM,
@@ -95,3 +101,66 @@ def test_runtime_run_completes_plan(tmp_path):
     assert state.phase.value == "DONE"
     assert state.completion == "DONE"
     assert (tmp_path / "artifact.txt").exists()
+
+
+def test_production_workspace_has_no_host_command_runner(
+    tmp_path,
+):
+    runtime = AgentRuntime(
+        database_path=tmp_path / "pc.db",
+        llm=FakeLLM(),
+        load_policy=False,
+    )
+
+    # No host subprocess runner on the production workspace.
+    assert not hasattr(runtime.workspace, "terminal")
+
+    # Commands go exclusively through the Docker sandbox runner.
+    assert isinstance(
+        runtime.command_runner,
+        SandboxCommandRunner,
+    )
+    assert (
+        runtime.executor.command_runner
+        is runtime.command_runner
+    )
+
+
+def test_done_writes_patch_into_sandbox_patches(
+    tmp_path,
+):
+    llm = FakeLLM(
+        [
+            goal_response(),
+            tasks_response(),
+            dependencies_response(),
+        ],
+        default=coder_envelope(),
+    )
+
+    runtime = AgentRuntime(
+        database_path=tmp_path / "pc.db",
+        llm=llm,
+        load_policy=False,
+    )
+
+    state = runtime.run("Сделай API.")
+
+    assert state.phase.value == "DONE"
+    assert state.patch_path is not None
+
+    patch = Path(state.patch_path)
+
+    assert patch.exists()
+    assert patch.parent == SANDBOX_PATCHES
+    assert PROJECT_ROOT in patch.parents
+
+    contents = patch.read_text(encoding="utf-8")
+
+    assert "artifact.txt" in contents
+
+    # The host project must NOT be touched automatically.
+    assert not (
+        PROJECT_ROOT / "artifact.txt"
+    ).exists()
+
