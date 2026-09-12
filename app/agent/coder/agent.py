@@ -1,7 +1,30 @@
+from __future__ import annotations
+
+from app.agent.state import ExecutionResult
+
 
 class CodingAgent:
-    def __init__(self, executor):
-        self.executor=executor
+    """
+    Управляющий агент выполнения.
 
-    def execute(self, plan):
-        return self.executor.execute(plan)
+    Не содержит копий LLM/Context/Tools —
+    только использует их через CodeExecutor.
+    """
+
+    def __init__(self, executor) -> None:
+        self.executor = executor
+
+    def execute(
+        self,
+        task,
+        *,
+        step=None,
+        plan_id: int | None = None,
+        feedback: str | None = None,
+    ) -> ExecutionResult:
+        return self.executor.execute(
+            task,
+            step=step,
+            feedback=feedback,
+        )
+

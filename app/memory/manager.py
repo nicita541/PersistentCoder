@@ -522,3 +522,123 @@ def is_duplicate_rule(
         candidate,
         memories,
     )
+
+
+class MemoryManager:
+    """
+    Единая точка работы с долговременной памятью.
+
+    AgentController получает MemoryManager через DI
+    и НЕ создаёт собственную память.
+    """
+
+    def __init__(
+        self,
+        store,
+    ) -> None:
+        self.store = store
+
+    def get_active_memories(
+        self,
+    ) -> list[dict[str, object]]:
+        return self.store.get_active_memories()
+
+    def save_candidate(
+        self,
+        candidate: MemoryCandidate,
+        *,
+        source: str = "USER",
+    ) -> int | None:
+        from app.memory.conflicts import (
+            find_memories_to_supersede,
+        )
+        from app.memory.merge import (
+            find_decisions_to_merge,
+        )
+
+        memories = self.store.get_active_memories()
+
+        if is_duplicate_memory(
+            candidate,
+            memories,
+        ):
+            return None
+
+        memory_id = self.store.add_memory(
+            memory_type=candidate.memory_type,
+            content=candidate.content,
+            why=candidate.why,
+            source=source,
+            importance=candidate.importance,
+            confidence=candidate.confidence,
+        )
+
+        to_supersede = set(
+            find_memories_to_supersede(
+                candidate,
+                memories,
+            )
+        )
+
+        to_supersede.update(
+            find_decisions_to_merge(
+                candidate,
+                memories,
+            )
+        )
+
+        if to_supersede:
+            self.store.supersede_memories(
+                memory_ids=sorted(to_supersede),
+                superseded_by=memory_id,
+            )
+
+        return memory_id
+
+    def remember(
+        self,
+        text: str,
+        *,
+        source: str = "USER",
+    ) -> int | None:
+        """
+        Извлекает MemoryCandidate из текста и сохраняет её.
+        """
+
+        candidate = extract_memory_candidate(text)
+
+        if candidate is None:
+            return None
+
+        return self.save_candidate(
+            candidate,
+            source=source,
+        )
+
+    def record_experience(
+        self,
+        *,
+        request: str,
+        plan_id: int | None,
+        outcome: str,
+        source: str = "AGENT",
+    ) -> int:
+        """
+        Долговременный факт о завершённом плане.
+
+        Это важный исторический контекст проекта,
+        а не временное AgentState.
+        """
+
+        content = (
+            f"Запрос '{request}' "
+            f"(план #{plan_id}) завершён: {outcome}."
+        )
+
+        return self.store.add_memory(
+            memory_type="FACT",
+            content=content,
+            source=source,
+            importance=40,
+            confidence=1.0,
+        )

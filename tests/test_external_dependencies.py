@@ -1,6 +1,6 @@
 ﻿from __future__ import annotations
 
-from app.tasks.ai_planner import AIPlanner
+from app.agent.planner.agent import PlannerAgent
 from app.tasks.models import PlanDraft, TaskDraft
 from app.tasks.store import PlanStore
 
@@ -19,7 +19,9 @@ class FakeLLM:
         return self.responses.pop(0)
 
 
-def test_external_dependency_does_not_need_task_producer():
+def test_external_dependency_does_not_need_task_producer(
+    tmp_path,
+):
     llm = FakeLLM(
         [
             """
@@ -56,12 +58,15 @@ def test_external_dependency_does_not_need_task_producer():
         ]
     )
 
-    planner = AIPlanner(
+    planner = PlannerAgent(
         llm,
+        PlanStore(
+            database_path=tmp_path / "planner.db"
+        ),
         max_repair_attempts=2,
     )
 
-    plan = planner.plan("Create notes REST API.")
+    plan = planner.build_draft("Create notes REST API.")
 
     assert len(plan.tasks) == 1
     task = plan.tasks[0]
