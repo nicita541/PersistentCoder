@@ -14,6 +14,11 @@ from app.sandbox.paths import (
     SANDBOX_SNAPSHOTS,
 )
 
+from app.sandbox.limits import (
+    DEFAULT_LIMITS,
+    LimitExceeded,
+)
+
 
 IGNORED_DIRECTORIES = frozenset(
     {
@@ -33,6 +38,42 @@ IGNORED_DIRECTORIES = frozenset(
 )
 
 IGNORED_SUFFIXES = (".pyc", ".pyo")
+
+# Patch safety: never emit these into a patch file.
+PATCH_DENIED_PARTS = frozenset(
+    {
+        ".git",
+        ".venv",
+        "venv",
+        "models",
+        "data",
+        ".sandbox",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        "node_modules",
+        ".idea",
+        ".vscode",
+    }
+)
+
+PATCH_DENIED_SUFFIXES = (
+    ".pyc",
+    ".pyo",
+    ".pem",
+    ".key",
+    ".p12",
+    ".pfx",
+)
+
+PATCH_DENIED_NAME_MARKERS = (
+    ".env",
+    "credentials",
+    "secret",
+    "id_rsa",
+    "id_ed25519",
+)
+
 
 
 def _project_files(root: Path):
@@ -65,6 +106,17 @@ def _hash_file(path: Path) -> str:
             digest.update(chunk)
 
     return digest.hexdigest()
+
+
+def _safe_label(label: str) -> str:
+    cleaned = "".join(
+        ch if (ch.isalnum() or ch in "-_.") else "_"
+        for ch in str(label)
+    )
+
+    cleaned = cleaned.strip("._")
+
+    return (cleaned or "checkpoint")[:64]
 
 
 def _copy_tree(
@@ -104,6 +156,8 @@ class SandboxWorkspace:
         workspace_root: Path,
         baseline_root: Path,
         patch_root: Path,
+        checkpoints_root: Path | None = None,
+        limits=DEFAULT_LIMITS,
     ) -> None:
         self.session_id = session_id
         self.workspace_root = (
@@ -115,6 +169,16 @@ class SandboxWorkspace:
         self.patch_root = (
             Path(patch_root).resolve()
         )
+        self.checkpoints_root = (
+            Path(checkpoints_root).resolve()
+            if checkpoints_root is not None
+            else (
+                self.baseline_root.parent
+                / f"{session_id}__checkpoints"
+            )
+        )
+        self.limits = limits
+        self._active_checkpoint: str | None = None
 
     @classmethod
     def create(
@@ -123,6 +187,7 @@ class SandboxWorkspace:
         project_root: str | Path | None = None,
         session_id: str | None = None,
         sandbox_root: str | Path | None = None,
+        limits=DEFAULT_LIMITS,
     ) -> "SandboxWorkspace":
         project_root = Path(
             project_root or PROJECT_ROOT
@@ -173,7 +238,163 @@ class SandboxWorkspace:
             workspace_root=workspace_root,
             baseline_root=baseline_root,
             patch_root=patches,
+            checkpoints_root=(
+                snapshots
+                / f"{session_id}__checkpoints"
+            ),
+            limits=limits,
         )
+
+    # ==================================
+    # TRANSACTIONAL CHECKPOINTS
+    # ==================================
+
+    def checkpoint(
+        self,
+        label: str,
+    ) -> Path:
+        """
+        Snapshot the current workspace state.
+
+        Returns the checkpoint directory. Overwrites any previous
+        checkpoint with the same label.
+        """
+
+        if not label or not label.strip():
+            raise ValueError("label is required")
+
+        target = (
+            self.checkpoints_root
+            / _safe_label(label)
+        )
+
+        if target.exists():
+            shutil.rmtree(target)
+
+        _copy_tree(self.workspace_root, target)
+
+        self._active_checkpoint = label
+
+        return target
+
+    def rollback(
+        self,
+        label: str | None = None,
+    ) -> bool:
+        """
+        Restore the workspace to a checkpoint.
+
+        Everything written since the checkpoint is discarded. Fail
+        closed: if the checkpoint does not exist, nothing changes.
+        """
+
+        label = label or self._active_checkpoint
+
+        if not label:
+            return False
+
+        source = (
+            self.checkpoints_root
+            / _safe_label(label)
+        )
+
+        if not source.exists():
+            return False
+
+        # Wipe current workspace, then restore the checkpoint.
+        for child in list(
+            self.workspace_root.iterdir()
+        ):
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+
+        _copy_tree(source, self.workspace_root)
+
+        return True
+
+    def commit(
+        self,
+        label: str | None = None,
+    ) -> None:
+        """Drop a checkpoint (the attempt is accepted)."""
+
+        label = label or self._active_checkpoint
+
+        if not label:
+            return
+
+        target = (
+            self.checkpoints_root
+            / _safe_label(label)
+        )
+
+        if target.exists():
+            shutil.rmtree(target)
+
+        if label == self._active_checkpoint:
+            self._active_checkpoint = None
+
+    def has_checkpoint(
+        self,
+        label: str,
+    ) -> bool:
+        return (
+            self.checkpoints_root
+            / _safe_label(label)
+        ).exists()
+
+    # ==================================
+    # PATCH SAFETY
+    # ==================================
+
+    @staticmethod
+    def is_patch_safe(relative: str) -> bool:
+        """
+        A changed file may enter a patch only if it is a normal,
+        relative project source/artifact path.
+        """
+
+        if not relative or not relative.strip():
+            return False
+
+        text = relative.replace("\\", "/")
+
+        if text.startswith("/") or ":" in text:
+            return False
+
+        parts = [
+            part
+            for part in text.split("/")
+            if part
+        ]
+
+        if not parts:
+            return False
+
+        if any(part == ".." for part in parts):
+            return False
+
+        if any(
+            part in PATCH_DENIED_PARTS
+            for part in parts
+        ):
+            return False
+
+        name = parts[-1].casefold()
+
+        if name.endswith(PATCH_DENIED_SUFFIXES):
+            return False
+
+        if any(
+            marker in name
+            for marker in PATCH_DENIED_NAME_MARKERS
+        ):
+            return False
+
+        return True
+
 
     # ==================================
     # DIFF / PATCH / APPLY
@@ -213,7 +434,11 @@ class SandboxWorkspace:
     def write_patch(
         self,
     ) -> Path | None:
-        changed = self.changed_files()
+        changed = [
+            relative
+            for relative in self.changed_files()
+            if self.is_patch_safe(relative)
+        ]
 
         if not changed:
             return None
@@ -270,12 +495,24 @@ class SandboxWorkspace:
             / f"{self.session_id}.patch"
         )
 
+        text = "".join(lines)
+
+        encoded = text.encode("utf-8")
+
+        if len(encoded) > self.limits.max_patch_bytes:
+            raise LimitExceeded(
+                "patch exceeds max_patch_bytes "
+                f"({len(encoded)} > "
+                f"{self.limits.max_patch_bytes})"
+            )
+
         patch_path.write_text(
-            "".join(lines),
+            text,
             encoding="utf-8",
         )
 
         return patch_path
+
 
     def apply_to_project(
         self,

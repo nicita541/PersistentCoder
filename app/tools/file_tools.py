@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from app.sandbox.limits import (
+    DEFAULT_LIMITS,
+    LimitExceeded,
+)
 from app.sandbox.policy import (
     PathPolicy,
     PolicyViolation,
@@ -20,15 +24,18 @@ class FileTools:
     Единственный низкоуровневый файловый слой.
 
     Все агенты читают и изменяют файлы только через него.
-    Доступ ограничен корнем workspace.
+    Доступ ограничен корнем workspace и framework resource limits.
     """
 
     def __init__(
         self,
         root: str | Path,
+        *,
+        limits=DEFAULT_LIMITS,
     ) -> None:
         self.root = Path(root).resolve()
         self.policy = PathPolicy(self.root)
+        self.limits = limits
 
     def _resolve(
         self,
@@ -41,6 +48,19 @@ class FileTools:
             raise FileToolsError(
                 str(error)
             ) from error
+
+    def _workspace_bytes(self) -> int:
+        total = 0
+
+        for candidate in self.root.rglob("*"):
+            try:
+                if candidate.is_file():
+                    total += candidate.stat().st_size
+
+            except OSError:
+                continue
+
+        return total
 
 
     def exists(
@@ -60,6 +80,15 @@ class FileTools:
                 f"file does not exist: {path}"
             )
 
+        size = target.stat().st_size
+
+        if size > self.limits.max_read_bytes:
+            raise LimitExceeded(
+                "file too large to read: "
+                f"{path} ({size} > "
+                f"{self.limits.max_read_bytes})"
+            )
+
         return target.read_text(
             encoding="utf-8"
         )
@@ -70,6 +99,34 @@ class FileTools:
         content: str,
     ) -> Path:
         target = self._resolve(path)
+
+        encoded = content.encode("utf-8")
+
+        if len(encoded) > self.limits.max_file_bytes:
+            raise LimitExceeded(
+                "file write exceeds max_file_bytes: "
+                f"{path} ({len(encoded)} > "
+                f"{self.limits.max_file_bytes})"
+            )
+
+        existing = 0
+
+        if target.exists():
+            existing = target.stat().st_size
+
+        projected = (
+            self._workspace_bytes()
+            - existing
+            + len(encoded)
+        )
+
+        if projected > self.limits.max_workspace_bytes:
+            raise LimitExceeded(
+                "workspace growth exceeds "
+                "max_workspace_bytes "
+                f"({projected} > "
+                f"{self.limits.max_workspace_bytes})"
+            )
 
         target.parent.mkdir(
             parents=True,

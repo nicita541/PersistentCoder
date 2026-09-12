@@ -34,6 +34,12 @@ from app.tasks.verification_store import (
     VerificationStore,
 )
 from app.tasks.verifier import Verifier
+from app.tasks.runtime_store import (
+    DONE as RUN_DONE,
+    FAILED as RUN_FAILED,
+    INTERRUPTED as RUN_INTERRUPTED,
+    RuntimeStore,
+)
 from app.agent.state import AgentPhase
 from app.tools.file_tools import FileTools
 from app.tools.project_tools import ProjectTools
@@ -73,6 +79,7 @@ class AgentRuntime:
         self,
         *,
         workspace_root: str | Path | None = None,
+        project_root: str | Path | None = None,
         database_path: str | Path | None = None,
         llm=None,
         llm_factory=None,
@@ -91,7 +98,9 @@ class AgentRuntime:
             # never the host project directly.
             self.sandbox_workspace = (
                 SandboxWorkspace.create(
-                    project_root=PROJECT_ROOT,
+                    project_root=(
+                        project_root or PROJECT_ROOT
+                    ),
                 )
             )
             self.workspace_root = (
@@ -113,6 +122,22 @@ class AgentRuntime:
 
         self.events = EventBus()
         self.last_patch_path: str | None = None
+
+        # Durable execution state + event log (project-local SQLite).
+        self.runtime_store = RuntimeStore(
+            self.database_path
+        )
+
+        # Fail closed on restart: any run left RUNNING by a crash is
+        # marked INTERRUPTED and never silently treated as DONE.
+        self.interrupted_runs = (
+            self.runtime_store.recover_interrupted()
+        )
+
+        self.current_run_id: int | None = None
+        self.last_run_id: int | None = None
+
+        self.events.subscribe(self._persist_event)
 
         # ==================================
         # SINGLE LLM INSTANCE
@@ -257,12 +282,16 @@ class AgentRuntime:
             sandbox_root=self.workspace_root,
         )
 
+        # Session-wide set of files the agent itself created.
+        self.known_files: set[str] = set()
+
         self.executor = CodeExecutor(
             workspace=self.workspace,
             llm=self.llm,
             context=self.context,
             system_prompt=self.system_prompt,
             command_runner=self.command_runner,
+            known_files=self.known_files,
         )
 
         self.coder = CodingAgent(self.executor)
@@ -281,6 +310,8 @@ class AgentRuntime:
                 evidence_collector=(
                     EvidenceCollector()
                 ),
+                workspace=self.workspace,
+                command_runner=self.command_runner,
             )
         )
 
@@ -298,6 +329,7 @@ class AgentRuntime:
             attempt_store=self.attempt_store,
             replan_store=self.replan_store,
             llm=self.llm,
+            system_prompt=self.system_prompt,
         )
 
         # ==================================
@@ -314,14 +346,38 @@ class AgentRuntime:
             step_store=self.step_store,
             memory=self.memory,
             events=self.events,
+            sandbox_workspace=self.sandbox_workspace,
+            attempt_store=self.attempt_store,
             max_step_attempts=max_step_attempts,
             max_task_attempts=max_task_attempts,
         )
 
     def run(self, request: str):
-        state = AgentLoop(self.controller).run(
-            request
-        )
+        run_id = self.runtime_store.start_run(request)
+        self.current_run_id = run_id
+        self.last_run_id = run_id
+
+        if self.sandbox_workspace is not None:
+            self.runtime_store.update_run(
+                run_id,
+                sandbox_session_id=(
+                    self.sandbox_workspace.session_id
+                ),
+            )
+
+        try:
+            state = AgentLoop(self.controller).run(
+                request
+            )
+
+        except Exception:
+            # Crash/interrupt during the run: never DONE.
+            self.runtime_store.finish_run(
+                run_id,
+                RUN_INTERRUPTED,
+            )
+            self.current_run_id = None
+            raise
 
         self.last_patch_path = None
 
@@ -337,7 +393,66 @@ class AgentRuntime:
                 self.last_patch_path = str(patch)
                 state.patch_path = str(patch)
 
+        status = (
+            RUN_DONE
+            if state.phase is AgentPhase.DONE
+            else RUN_FAILED
+        )
+
+        self.runtime_store.finish_run(run_id, status)
+        self.current_run_id = None
+
         return state
+
+    def _persist_event(self, event) -> None:
+        """
+        Persist a compact event record (no prompts / file contents).
+
+        Durable logging must never break the agent loop.
+        """
+
+        run_id = self.current_run_id
+
+        if run_id is None:
+            return
+
+        payload = event.payload or {}
+
+        try:
+            self.runtime_store.update_run(
+                run_id,
+                plan_id=payload.get("plan_id"),
+                task_id=payload.get("task_id"),
+                step_id=payload.get("step_id"),
+                attempt_id=payload.get("attempt_id"),
+                checkpoint_id=payload.get(
+                    "checkpoint"
+                ),
+                phase=(
+                    event.name.upper()
+                    if event.name
+                    in (
+                        "plan",
+                        "execute",
+                        "verify",
+                        "repair",
+                    )
+                    else None
+                ),
+            )
+
+            self.runtime_store.log_event(
+                run_id,
+                event.name,
+                plan_id=payload.get("plan_id"),
+                task_id=payload.get("task_id"),
+                step_id=payload.get("step_id"),
+                attempt_id=payload.get("attempt_id"),
+                payload=payload,
+            )
+
+        except Exception:
+            pass
 
     def sandbox_status(self) -> str:
         return self.command_runner.status()

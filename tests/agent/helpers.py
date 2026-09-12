@@ -83,7 +83,7 @@ def seed_plan(
     with_step: bool = True,
 ):
     criteria = list(
-        criteria or ["task completed"]
+        criteria or ["a.txt exists"]
     )
 
     draft = PlanDraft(
@@ -171,7 +171,7 @@ def tasks_response() -> str:
                         "database connection"
                     ],
                     "success_criteria": [
-                        "Подключение к БД работает"
+                        "artifact.txt exists"
                     ],
                 },
                 {
@@ -187,7 +187,7 @@ def tasks_response() -> str:
                         "Note model",
                     ],
                     "success_criteria": [
-                        "Модели доступны приложению"
+                        "artifact.txt exists"
                     ],
                 },
                 {
@@ -200,7 +200,7 @@ def tasks_response() -> str:
                         "authentication service"
                     ],
                     "success_criteria": [
-                        "Пользователь может войти"
+                        "artifact.txt exists"
                     ],
                 },
                 {
@@ -214,8 +214,7 @@ def tasks_response() -> str:
                     ],
                     "produces": ["notes API"],
                     "success_criteria": [
-                        "Авторизованный пользователь "
-                        "может создавать заметки"
+                        "artifact.txt exists"
                     ],
                 },
             ]

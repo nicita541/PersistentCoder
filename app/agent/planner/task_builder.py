@@ -6,7 +6,7 @@ from app.agent.planner.decomposer import (
     require_string,
     require_string_list,
 )
-from app.tasks.models import TaskDraft
+from app.tasks.models import StepDraft, TaskDraft
 
 
 class TaskBuilder:
@@ -138,4 +138,82 @@ class TaskBuilder:
             )
 
         return result
+
+    def build_steps(
+        self,
+        components: list[dict[str, object]],
+    ) -> dict[str, list[StepDraft]]:
+        """
+        Build per-task Steps from the semantic components.
+
+        A component may declare its own ordered `steps`. Simple tasks
+        may omit them (a single default Step is then used).
+        """
+
+        steps_by_key: dict[str, list[StepDraft]] = {}
+
+        for raw_task in components:
+            if not isinstance(raw_task, dict):
+                raise PlannerError(
+                    "each task must be a JSON object"
+                )
+
+            key = require_string(raw_task, "key")
+
+            raw_steps = raw_task.get("steps", [])
+
+            if raw_steps is None:
+                raw_steps = []
+
+            if not isinstance(raw_steps, list):
+                raise PlannerError(
+                    f"steps for '{key}' must be a list"
+                )
+
+            steps: list[StepDraft] = []
+
+            for raw_step in raw_steps:
+                if not isinstance(raw_step, dict):
+                    raise PlannerError(
+                        "each step must be a JSON object"
+                    )
+
+                title = require_string(
+                    raw_step,
+                    "title",
+                )
+
+                description = require_string(
+                    raw_step,
+                    "description",
+                )
+
+                criteria = optional_string_list(
+                    raw_step,
+                    "success_criteria",
+                )
+
+                if not criteria:
+                    criteria = [title]
+
+                steps.append(
+                    StepDraft(
+                        title=title,
+                        description=description,
+                        requires=optional_string_list(
+                            raw_step,
+                            "requires",
+                        ),
+                        produces=optional_string_list(
+                            raw_step,
+                            "produces",
+                        ),
+                        success_criteria=criteria,
+                    )
+                )
+
+            steps_by_key[key] = steps
+
+        return steps_by_key
+
 

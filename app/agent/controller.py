@@ -4,9 +4,11 @@ from app.agent.repair.strategies import GIVE_UP
 from app.agent.state import (
     AgentPhase,
     AgentState,
+    ExecutionResult,
     RepairState,
 )
 from app.tasks.models import (
+    AttemptStatus,
     StepStatus,
     TaskStatus,
 )
@@ -41,6 +43,8 @@ class AgentController:
         step_store=None,
         memory=None,
         events=None,
+        sandbox_workspace=None,
+        attempt_store=None,
         max_step_attempts: int = 2,
         max_task_attempts: int = 3,
     ) -> None:
@@ -53,6 +57,9 @@ class AgentController:
         self.step_store = step_store
         self.memory = memory
         self.events = events
+        self.sandbox_workspace = sandbox_workspace
+        self.attempt_store = attempt_store
+        self._attempt_seq = 0
         self.max_step_attempts = (
             max_step_attempts
         )
@@ -205,18 +212,31 @@ class AgentController:
         task = self._require_task(state)
         step = self._active_step(state)
 
+        self._begin_attempt(state, task, step)
+
         feedback = (
             state.repair.reason
             if state.repair.required
             else None
         )
 
-        result = self.coder.execute(
-            task,
-            step=step,
-            plan_id=state.plan_id,
-            feedback=feedback,
-        )
+        try:
+            result = self.coder.execute(
+                task,
+                step=step,
+                plan_id=state.plan_id,
+                feedback=feedback,
+            )
+
+        except Exception as error:
+            result = ExecutionResult(
+                ok=False,
+                summary="executor error",
+                failure_reason=str(error),
+                evidence=[
+                    f"executor_error:{type(error).__name__}"
+                ],
+            )
 
         state.execution = result
         state.phase = AgentPhase.VERIFYING
@@ -257,6 +277,13 @@ class AgentController:
             )
 
         state.verification = result
+
+        self._finalize_attempt(
+            state,
+            ok=result.ok,
+            status=result.status,
+            reason=result.reason,
+        )
 
         if not result.ok:
             state.phase = AgentPhase.REPAIRING
@@ -343,34 +370,71 @@ class AgentController:
         step = self._active_step(state)
 
         task_key = f"task:{task.id}"
-        state.attempts[task_key] = (
-            state.attempts.get(task_key, 0) + 1
-        )
-
         step_key = (
             f"step:{step.id}"
             if step is not None
             else None
         )
 
+        # Monotonic fallback cache: guarantees bounded escalation even
+        # if an AttemptStore call fails.
+        state.attempts[task_key] = (
+            state.attempts.get(task_key, 0) + 1
+        )
+        task_cache = state.attempts[task_key]
+
+        step_cache = 0
+
         if step_key is not None:
             state.attempts[step_key] = (
-                state.attempts.get(step_key, 0)
-                + 1
+                state.attempts.get(step_key, 0) + 1
+            )
+            step_cache = state.attempts[step_key]
+
+        # AttemptStore is the authoritative source of attempt history.
+        task_attempts = task_cache
+        step_attempts = step_cache
+
+        if self.attempt_store is not None:
+            stored_task = len(
+                self.attempt_store.get_task_attempts(
+                    task.id
+                )
+            )
+
+            if self.step_store is not None:
+                for sibling in (
+                    self.step_store.get_steps(task.id)
+                ):
+                    stored_task += len(
+                        self.attempt_store
+                        .get_step_attempts(sibling.id)
+                    )
+
+            stored_step = (
+                len(
+                    self.attempt_store
+                    .get_step_attempts(step.id)
+                )
+                if step is not None
+                else 0
+            )
+
+            task_attempts = max(
+                task_attempts,
+                stored_task,
+            )
+            step_attempts = max(
+                step_attempts,
+                stored_step,
             )
 
         outcome = self.repair_agent.repair(
             task=task,
             verification=state.verification,
             step=step,
-            step_attempt_number=(
-                state.attempts.get(step_key, 1)
-                if step_key is not None
-                else 1
-            ),
-            task_attempt_number=(
-                state.attempts[task_key]
-            ),
+            step_attempt_number=max(step_attempts, 1),
+            task_attempt_number=max(task_attempts, 1),
         )
 
         state.repair = RepairState(
@@ -379,6 +443,11 @@ class AgentController:
             scope=outcome.scope,
             strategy=outcome.strategy,
             reason=outcome.reason,
+            approach=(
+                outcome.approach.new_approach
+                if outcome.approach is not None
+                else outcome.strategy
+            ),
         )
 
         self._emit(
@@ -448,6 +517,162 @@ class AgentController:
         )
 
         return state
+
+    # ======================================
+    # TRANSACTIONAL ATTEMPTS
+    # ======================================
+
+    def _begin_attempt(
+        self,
+        state: AgentState,
+        task,
+        step,
+    ) -> None:
+        """
+        Checkpoint the sandbox and open a durable attempt record.
+
+        The AttemptStore is the source of truth for attempt history.
+        """
+
+        self._attempt_seq += 1
+
+        label = f"attempt-{self._attempt_seq}"
+
+        state.attempt_id = None
+        state.checkpoint_id = None
+
+        if self.sandbox_workspace is not None:
+            try:
+                self.sandbox_workspace.checkpoint(label)
+                state.checkpoint_id = label
+
+            except Exception as error:
+                self._emit(
+                    "checkpoint_failed",
+                    {"error": str(error)},
+                )
+
+        if self.attempt_store is not None:
+            approach = (
+                state.repair.approach
+                or state.repair.strategy
+                or None
+            )
+
+            try:
+                if step is not None:
+                    record = (
+                        self.attempt_store
+                        .start_step_attempt(
+                            step.id,
+                            approach=approach,
+                        )
+                    )
+
+                else:
+                    record = (
+                        self.attempt_store
+                        .start_task_attempt(
+                            task.id,
+                            approach=approach,
+                        )
+                    )
+
+                state.attempt_id = record.id
+
+            except Exception as error:
+                self._emit(
+                    "attempt_start_failed",
+                    {"error": str(error)},
+                )
+
+        self._emit(
+            "attempt_start",
+            {
+                "attempt_id": state.attempt_id,
+                "checkpoint": state.checkpoint_id,
+            },
+        )
+
+    def _finalize_attempt(
+        self,
+        state: AgentState,
+        *,
+        ok: bool,
+        status: str,
+        reason: str = "",
+    ) -> None:
+        """
+        Commit (PASS) or roll back (FAIL/BLOCKED) the attempt.
+
+        A failed attempt must never leave half-written files.
+        """
+
+        label = state.checkpoint_id
+        attempt_id = state.attempt_id
+
+        if ok:
+            if (
+                self.sandbox_workspace is not None
+                and label
+            ):
+                try:
+                    self.sandbox_workspace.commit(label)
+
+                except Exception:
+                    pass
+
+            attempt_status = AttemptStatus.PASS
+
+        else:
+            if (
+                self.sandbox_workspace is not None
+                and label
+            ):
+                try:
+                    self.sandbox_workspace.rollback(
+                        label
+                    )
+                    self.sandbox_workspace.commit(
+                        label
+                    )
+
+                except Exception:
+                    pass
+
+            attempt_status = (
+                AttemptStatus.BLOCKED
+                if status == "BLOCKED"
+                else AttemptStatus.FAILED
+            )
+
+        if (
+            self.attempt_store is not None
+            and attempt_id is not None
+        ):
+            try:
+                self.attempt_store.finish_attempt(
+                    attempt_id,
+                    status=attempt_status,
+                    failure_reason=(
+                        None if ok else reason
+                    ),
+                )
+
+            except Exception:
+                pass
+
+        self._emit(
+            "attempt_finish",
+            {
+                "attempt_id": attempt_id,
+                "status": attempt_status.value,
+                "reason": reason,
+            },
+        )
+
+        state.attempt_id = None
+        state.checkpoint_id = None
 
     # ======================================
     # HELPERS

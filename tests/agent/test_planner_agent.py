@@ -430,3 +430,101 @@ def test_plan_level_repair_is_bounded(tmp_path):
     # goal + two decomposition attempts, then bounded stop
     assert len(llm.calls) == 3
 
+
+# ==========================================
+# REAL TASK -> STEP DECOMPOSITION
+# ==========================================
+
+
+def test_planner_builds_real_steps_per_task(tmp_path):
+    stores = make_stores(tmp_path)
+
+    tasks = json.dumps(
+        {
+            "tasks": [
+                {
+                    "key": "calculator",
+                    "title": "Calculator module",
+                    "description": (
+                        "Create the calculator module."
+                    ),
+                    "priority": 80,
+                    "requires": [],
+                    "produces": [
+                        "sandbox_agent_test/calculator.py"
+                    ],
+                    "external_dependencies": [],
+                    "success_criteria": [
+                        "sandbox_agent_test/"
+                        "calculator.py exists"
+                    ],
+                    "steps": [
+                        {
+                            "title": "Inspect or create module",
+                            "description": "Look at or create the file.",
+                            "requires": [],
+                            "produces": [],
+                            "success_criteria": [
+                                "module considered"
+                            ],
+                        },
+                        {
+                            "title": "Implement behavior",
+                            "description": "Write add and subtract.",
+                            "requires": [],
+                            "produces": [
+                                "sandbox_agent_test/"
+                                "calculator.py"
+                            ],
+                            "success_criteria": [
+                                "functions implemented"
+                            ],
+                        },
+                        {
+                            "title": "Validate module",
+                            "description": "Check it imports.",
+                            "requires": [
+                                "sandbox_agent_test/"
+                                "calculator.py"
+                            ],
+                            "produces": [],
+                            "success_criteria": [
+                                "module imports"
+                            ],
+                        },
+                    ],
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+    dependencies = json.dumps(
+        {"dependencies": {"calculator": []}}
+    )
+
+    planner = PlannerAgent(
+        FakeLLM([goal_response(), tasks, dependencies]),
+        stores.plan_store,
+        step_store=stores.step_store,
+        max_plan_repairs=2,
+    )
+
+    result = planner.plan("Сделай calculator.")
+
+    task = stores.plan_store.get_tasks(
+        result.plan_id
+    )[0]
+
+    steps = stores.step_store.get_steps(task.id)
+
+    assert len(steps) == 3
+    assert steps[0].title == "Inspect or create module"
+    assert steps[1].produces == [
+        "sandbox_agent_test/calculator.py"
+    ]
+    assert steps[2].requires == [
+        "sandbox_agent_test/calculator.py"
+    ]
+
+

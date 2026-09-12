@@ -116,6 +116,12 @@ class ExecutionResult:
     )
     failure_reason: str | None = None
 
+    # Files the agent actually observed (read/listed) during this
+    # attempt. Used to enforce observe-before-edit.
+    read_files: list[str] = field(
+        default_factory=list
+    )
+
     def all_commands_ok(self) -> bool:
         return all(
             command.ok
@@ -124,11 +130,32 @@ class ExecutionResult:
 
 
 @dataclass
+class CriterionResult:
+    """
+    Deterministic result for ONE success criterion.
+
+    A criterion is never its own evidence: each one is tied to a real
+    check (filesystem, py_compile, import, pytest) or marked BLOCKED.
+    """
+
+    criterion: str
+    status: str = "BLOCKED"
+    check: str = ""
+    reason: str = ""
+    evidence: list[str] = field(
+        default_factory=list
+    )
+
+
+@dataclass
 class VerificationResult:
     ok: bool
     status: str = "FAIL"
     reason: str = ""
     evidence: list[str] = field(
+        default_factory=list
+    )
+    criterion_results: list[CriterionResult] = field(
         default_factory=list
     )
 
@@ -140,6 +167,7 @@ class RepairState:
     scope: str | None = None
     strategy: str | None = None
     reason: str | None = None
+    approach: str | None = None
 
 
 @dataclass
@@ -156,6 +184,10 @@ class AgentState:
     plan_id: int | None = None
     active_task_id: int | None = None
     active_step_id: int | None = None
+
+    # Authoritative ids for the current transactional attempt.
+    attempt_id: int | None = None
+    checkpoint_id: str | None = None
 
     attempts: dict[str, int] = field(
         default_factory=dict

@@ -388,7 +388,11 @@ class TaskDecomposer:
         "a concrete file path (for example "
         "src/calculator.py) may be produced by EXACTLY ONE "
         "task; never let two tasks produce the same file "
-        "path and never split a single file across tasks"
+        "path and never split a single file across tasks\n"
+        "- each task may include an ordered \"steps\" array "
+        "(title, description, requires, produces, "
+        "success_criteria); steps are meaningful "
+        "sub-actions, not copies of the task title"
     )
 
     def __init__(

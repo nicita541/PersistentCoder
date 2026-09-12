@@ -10,6 +10,7 @@ from app.agent.repair.strategies import (
 )
 from app.agent.state import VerificationResult
 from app.tasks.models import (
+    AttemptStatus,
     ReplanTargetType,
     TaskStatus,
 )
@@ -160,3 +161,63 @@ def test_analyzer_prefers_task_scope_on_blocked(
     )
 
     assert analysis.scope == "TASK"
+
+
+# ==========================================
+# STRUCTURED APPROACH / NO REPEAT
+# ==========================================
+
+
+def test_repair_returns_structured_approach(tmp_path):
+    stores, task_id, step_id = _prepare(tmp_path)
+
+    agent = _agent(stores)
+
+    outcome = agent.repair(
+        task=stores.plan_store.get_task(task_id),
+        verification=_failure(),
+        step=stores.step_store.get_step(step_id),
+        step_attempt_number=1,
+        task_attempt_number=1,
+    )
+
+    plan = outcome.approach
+
+    assert plan is not None
+    assert plan.scope in ("STEP", "TASK")
+    assert plan.failure_class
+    assert plan.root_cause
+    assert plan.new_approach
+    assert isinstance(plan.files_to_inspect, list)
+    assert isinstance(plan.verification_plan, list)
+
+
+def test_no_repeating_failed_approach(tmp_path):
+    stores, task_id, step_id = _prepare(tmp_path)
+
+    # A previous attempt already FAILED with exactly this approach.
+    record = stores.attempt_store.start_step_attempt(
+        step_id,
+        approach="VERIFICATION_FAIL::pytest failed",
+    )
+    stores.attempt_store.finish_attempt(
+        record.id,
+        status=AttemptStatus.FAILED,
+        failure_reason="pytest failed",
+    )
+
+    agent = _agent(stores)
+
+    outcome = agent.repair(
+        task=stores.plan_store.get_task(task_id),
+        verification=_failure(),
+        step=stores.step_store.get_step(step_id),
+        step_attempt_number=1,
+        task_attempt_number=1,
+    )
+
+    # The same approach must not be retried: escalate.
+    assert outcome.action == REPLAN_TASK
+    assert outcome.approach is not None
+    assert outcome.approach.root_cause == "pytest failed"
+

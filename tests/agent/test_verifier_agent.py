@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+from app.agent.coder.workspace import Workspace
 from app.agent.state import (
     CommandExecution,
     ExecutionResult,
@@ -14,7 +17,11 @@ from app.agent.verifier.quality_gate import QualityGate
 from app.tasks.models import StepStatus, TaskStatus
 from app.tasks.verifier import Verifier
 
-from helpers import make_stores, seed_plan
+from helpers import (
+    RecordingCommandRunner,
+    make_stores,
+    seed_plan,
+)
 
 
 def _agent(stores):
@@ -26,6 +33,15 @@ def _agent(stores):
         ),
     )
 
+    # Real sandbox workspace: criteria are checked against real
+    # files, not against the criterion string itself.
+    root = Path(stores.database_path).parent
+
+    (root / "a.txt").write_text(
+        "artifact",
+        encoding="utf-8",
+    )
+
     return VerificationAgent(
         quality_gate=QualityGate(),
         verifier=verifier,
@@ -35,7 +51,12 @@ def _agent(stores):
             stores.verification_store
         ),
         evidence_collector=EvidenceCollector(),
+        workspace=Workspace(root),
+        command_runner=RecordingCommandRunner(
+            stdout="1 passed"
+        ),
     )
+
 
 
 def _ok_execution() -> ExecutionResult:

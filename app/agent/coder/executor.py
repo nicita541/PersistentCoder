@@ -5,7 +5,12 @@ from app.agent.state import (
     ExecutionResult,
     extract_json_object,
 )
+from app.sandbox.limits import (
+    DEFAULT_LIMITS,
+    LimitExceeded,
+)
 from app.sandbox.policy import (
+    CommandPolicy,
     PolicyViolation,
     is_absolute_path,
 )
@@ -43,6 +48,8 @@ class CodeExecutor:
         max_new_tokens: int = 1024,
         run_commands: bool = True,
         command_runner=None,
+        limits=DEFAULT_LIMITS,
+        known_files=None,
     ) -> None:
         self.workspace = workspace
         self.llm = llm
@@ -51,6 +58,16 @@ class CodeExecutor:
         self.max_new_tokens = max_new_tokens
         self.run_commands = run_commands
         self.command_runner = command_runner
+        self.limits = limits
+
+        # Paths the agent itself created during this session. These
+        # are already "known" and do not require an explicit read
+        # before a later attempt may rewrite them.
+        self.known_files = (
+            known_files
+            if known_files is not None
+            else set()
+        )
 
     def _build_messages(
         self,
@@ -130,57 +147,349 @@ class CodeExecutor:
         step=None,
         feedback: str | None = None,
     ) -> ExecutionResult:
-        messages = self._build_messages(
-            task,
-            step,
-            feedback,
+        observed: dict[str, str] = {}
+        transcript: list[str] = []
+
+        for _ in range(self.limits.max_tool_iterations):
+            messages = self._build_messages(
+                task,
+                step,
+                feedback,
+            )
+
+            if transcript:
+                messages = messages + [
+                    {
+                        "role": "user",
+                        "content": (
+                            "OBSERVATIONS:\n"
+                            + "\n\n".join(transcript)
+                        ),
+                    }
+                ]
+
+            try:
+                raw_answer = self.llm.chat(
+                    messages,
+                    max_new_tokens=self.max_new_tokens,
+                )
+
+            except Exception as exc:
+                return self._fail(
+                    "LLM call failed",
+                    str(exc),
+                    [f"llm_error:{type(exc).__name__}"],
+                    observed,
+                )
+
+            answer = self._apply_output_policy(
+                raw_answer,
+                self.system_prompt,
+            )
+
+            try:
+                proposal = extract_json_object(answer)
+
+            except ValueError:
+                return self._fail(
+                    "model did not return a valid action envelope",
+                    "invalid model response",
+                    ["model_response:" + answer[:200]],
+                    observed,
+                )
+
+            action = self._action_of(proposal)
+
+            if action in ("list", "read", "search"):
+                _ok, text = self._observe(
+                    proposal,
+                    observed,
+                )
+
+                transcript.append(text)
+
+                continue
+
+            if action == "edit":
+                error = self._validate_envelope(
+                    proposal,
+                    observed,
+                )
+
+                if error is not None:
+                    return self._fail(
+                        "action envelope rejected",
+                        error,
+                        [f"rejected:{error}"],
+                        observed,
+                    )
+
+                return self._apply_proposal(
+                    proposal,
+                    read_files=sorted(observed),
+                )
+
+            return self._fail(
+                "unknown action",
+                f"unknown action: {action!r}",
+                ["unknown_action"],
+                observed,
+            )
+
+        return self._fail(
+            "tool loop budget exceeded",
+            "max tool iterations exceeded",
+            ["tool_loop_budget"],
+            observed,
         )
 
-        try:
-            raw_answer = self.llm.chat(
-                messages,
-                max_new_tokens=self.max_new_tokens,
-            )
-
-        except Exception as exc:
-            return ExecutionResult(
-                ok=False,
-                summary="LLM call failed",
-                failure_reason=str(exc),
-                evidence=[
-                    f"llm_error:{type(exc).__name__}"
-                ],
-            )
-
-        answer = self._apply_output_policy(
-            raw_answer,
-            self.system_prompt,
+    @staticmethod
+    def _fail(
+        summary: str,
+        reason: str,
+        evidence: list[str],
+        observed: dict[str, str],
+    ) -> ExecutionResult:
+        return ExecutionResult(
+            ok=False,
+            summary=summary,
+            failure_reason=reason,
+            evidence=evidence,
+            read_files=sorted(observed),
         )
 
-        try:
-            proposal = extract_json_object(answer)
 
-        except ValueError:
-            return ExecutionResult(
-                ok=False,
-                summary=(
-                    "model did not return "
-                    "a valid action envelope"
-                ),
-                failure_reason=(
-                    "invalid model response"
-                ),
-                evidence=[
-                    "model_response:"
-                    + answer[:200]
-                ],
+    @staticmethod
+    def _action_of(
+        proposal: dict[str, object],
+    ) -> str | None:
+        raw = proposal.get("action")
+
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip().casefold()
+
+        if (
+            "files" in proposal
+            or "commands" in proposal
+        ):
+            return "edit"
+
+        return None
+
+    def _normalize(
+        self,
+        path: str,
+    ) -> str:
+        return (
+            path.replace("\\", "/")
+            .strip()
+            .lstrip("./")
+        )
+
+    def _observe(
+        self,
+        proposal: dict[str, object],
+        observed: dict[str, str],
+    ) -> tuple[bool, str]:
+        """
+        Read-only sandbox observation. Never writes anything.
+        """
+
+        action = self._action_of(proposal)
+
+        if action == "list":
+            pattern = proposal.get("pattern") or "**/*"
+
+            try:
+                listing = self.workspace.list_files(
+                    str(pattern)
+                )
+
+            except Exception as exc:
+                return False, f"LIST ERROR: {exc}"
+
+            return True, (
+                f"LIST {pattern}:\n"
+                + "\n".join(listing[:200])
             )
 
-        return self._apply_proposal(proposal)
+        if action == "read":
+            path = proposal.get("path")
+
+            if not isinstance(path, str) or not path.strip():
+                return False, "READ ERROR: path is required"
+
+            if len(observed) >= self.limits.max_files_read:
+                return False, (
+                    "READ ERROR: max_files_read "
+                    "budget exceeded"
+                )
+
+            try:
+                content = self.workspace.read(
+                    path.strip()
+                )
+
+            except Exception as exc:
+                return False, f"READ ERROR {path}: {exc}"
+
+            observed[self._normalize(path)] = content
+
+            return True, (
+                f"FILE {path}:\n"
+                + content[: self.limits.max_read_bytes]
+            )
+
+        if action == "search":
+            query = proposal.get("query") or proposal.get(
+                "text"
+            )
+
+            project = getattr(
+                self.workspace,
+                "project",
+                None,
+            )
+
+            if not isinstance(query, str) or not query:
+                return False, "SEARCH ERROR: query is required"
+
+            if project is None:
+                return False, "SEARCH ERROR: no project tools"
+
+            try:
+                matches = project.search(str(query))
+
+            except Exception as exc:
+                return False, f"SEARCH ERROR: {exc}"
+
+            return True, (
+                f"SEARCH {query}:\n"
+                + "\n".join(matches[:50])
+            )
+
+        return False, f"unknown observe action: {action}"
+
+    def _validate_envelope(
+        self,
+        proposal: dict[str, object],
+        observed: dict[str, str],
+    ) -> str | None:
+        """
+        Fully validate the action envelope BEFORE writing anything.
+
+        Returns None when valid, otherwise an error string.
+        """
+
+        files = proposal.get("files")
+        commands = proposal.get("commands")
+
+        if files is None and commands is None:
+            return "action envelope has no files or commands"
+
+        if files is not None:
+            if not isinstance(files, list):
+                return "'files' must be a list"
+
+            if len(files) > 25:
+                return "too many files in one envelope"
+
+            files_tools = getattr(
+                self.workspace,
+                "files",
+                None,
+            )
+
+            for entry in files:
+                if not isinstance(entry, dict):
+                    return "each file entry must be an object"
+
+                path = entry.get("path")
+                content = entry.get("content", "")
+
+                if (
+                    not isinstance(path, str)
+                    or not path.strip()
+                ):
+                    return "file entry requires a path"
+
+                if is_absolute_path(path):
+                    return (
+                        "absolute paths are forbidden: "
+                        f"{path}"
+                    )
+
+                if not isinstance(content, str):
+                    return "file content must be a string"
+
+                if (
+                    len(content.encode("utf-8"))
+                    > self.limits.max_file_bytes
+                ):
+                    return (
+                        "file exceeds max_file_bytes: "
+                        f"{path}"
+                    )
+
+                if files_tools is not None:
+                    try:
+                        files_tools.policy.resolve(path)
+
+                    except PolicyViolation as error:
+                        return str(error)
+
+                # OBSERVE BEFORE EDIT: an existing file must have been
+                # read during this attempt before it is modified.
+                if self._normalize(path) not in observed:
+                    try:
+                        exists = self.workspace.exists(path)
+
+                    except Exception as error:
+                        return str(error)
+
+                    if (
+                        exists
+                        and self._normalize(path)
+                        not in self.known_files
+                    ):
+                        return (
+                            "observe-before-edit violated: "
+                            f"must read {path} before editing"
+                        )
+
+        if commands is not None:
+            if not isinstance(commands, list):
+                return "'commands' must be a list"
+
+            policy = getattr(
+                self.command_runner,
+                "policy",
+                None,
+            ) or CommandPolicy()
+
+            for command in commands:
+                if (
+                    not isinstance(command, str)
+                    or not command.strip()
+                ):
+                    return (
+                        "each command must be a "
+                        "non-empty string"
+                    )
+
+                try:
+                    policy.validate(command)
+
+                except PolicyViolation as error:
+                    return str(error)
+
+        return None
 
     def _apply_proposal(
         self,
         proposal: dict[str, object],
+        *,
+        read_files: list[str] | None = None,
     ) -> ExecutionResult:
         files = proposal.get("files")
         commands = proposal.get("commands")
@@ -303,6 +612,10 @@ class CodeExecutor:
 
                 relative = self.workspace.relative(
                     written
+                )
+
+                self.known_files.add(
+                    self._normalize(raw_path)
                 )
 
                 artifacts.append(relative)
@@ -439,7 +752,9 @@ class CodeExecutor:
             evidence=evidence,
             commands=command_results,
             failure_reason=failure_reason,
+            read_files=list(read_files or []),
         )
+
 
 
 

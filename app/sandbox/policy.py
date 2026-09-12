@@ -42,6 +42,16 @@ _PACKAGE_MANAGER_PATTERNS = (
     ),
     re.compile(r"\bbrew\s+install\b", re.IGNORECASE),
     re.compile(r"\bconda\s+install\b", re.IGNORECASE),
+    # Host shells: model commands must never target the host OS.
+    re.compile(r"\bpowershell(\.exe)?\b", re.IGNORECASE),
+    re.compile(r"\bpwsh(\.exe)?\b", re.IGNORECASE),
+    re.compile(r"\bcmd(\.exe)?\b", re.IGNORECASE),
+    # Network fetch from the sandbox runtime.
+    re.compile(r"\bcurl\b", re.IGNORECASE),
+    re.compile(r"\bwget\b", re.IGNORECASE),
+    re.compile(r"\bgit\s+clone\b", re.IGNORECASE),
+    re.compile(r"\bpip3?\s+download\b", re.IGNORECASE),
+    re.compile(r"\bnpm\s+(publish|login)\b", re.IGNORECASE),
 )
 
 

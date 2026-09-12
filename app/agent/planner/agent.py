@@ -102,6 +102,7 @@ class PlannerAgent:
         self.task_builder = (
             task_builder or TaskBuilder()
         )
+        self._step_drafts_by_key: dict = {}
 
         self.contract_builder = (
             contract_builder or ContractBuilder()
@@ -169,6 +170,12 @@ class PlannerAgent:
             try:
                 tasks = self.task_builder.build(
                     components
+                )
+
+                self._step_drafts_by_key = (
+                    self.task_builder.build_steps(
+                        components
+                    )
                 )
 
                 self.contract_builder.validate_contracts(
@@ -246,14 +253,23 @@ class PlannerAgent:
             if self.step_store.get_steps(task.id):
                 continue
 
-            criteria = (
-                list(task.success_criteria)
-                or [task.title]
+            planned_steps = (
+                self._step_drafts_by_key.get(
+                    task.key or "",
+                    [],
+                )
             )
 
-            self.step_store.create_steps(
-                task.id,
-                [
+            if planned_steps:
+                step_drafts = list(planned_steps)
+
+            else:
+                criteria = (
+                    list(task.success_criteria)
+                    or [task.title]
+                )
+
+                step_drafts = [
                     StepDraft(
                         title=task.title,
                         description=(
@@ -264,6 +280,10 @@ class PlannerAgent:
                         produces=list(task.produces),
                         success_criteria=criteria,
                     )
-                ],
+                ]
+
+            self.step_store.create_steps(
+                task.id,
+                step_drafts,
             )
 

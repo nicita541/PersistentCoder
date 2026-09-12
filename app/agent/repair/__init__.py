@@ -1,4 +1,5 @@
 from app.agent.repair.agent import (
+    ApproachPlan,
     RepairAgent,
     RepairOutcome,
 )
@@ -17,6 +18,7 @@ from app.agent.repair.strategies import (
 __all__ = [
     "RepairAgent",
     "RepairOutcome",
+    "ApproachPlan",
     "FailureAnalyzer",
     "FailureAnalysis",
     "RepairStrategySelector",

@@ -4,6 +4,10 @@ import subprocess
 from pathlib import Path
 from typing import Callable
 
+from app.sandbox.limits import (
+    DEFAULT_LIMITS,
+    LimitExceeded,
+)
 from app.sandbox.paths import (
     PROJECT_ROOT,
     SANDBOX_CONTAINER_USER,
@@ -24,6 +28,23 @@ from app.tools.terminal_tools import CommandResult
 CONTAINER_PIDS_LIMIT = 256
 CONTAINER_MEMORY = "1g"
 CONTAINER_CPUS = "1.0"
+
+# Flags that must NEVER be present in a sandbox container run.
+FORBIDDEN_FLAG_TOKENS = (
+    "--privileged",
+    "--pid=host",
+    "--ipc=host",
+    "--uts=host",
+    "--network=host",
+    "--net=host",
+    "--device",
+    "-v/var/run/docker.sock",
+    "docker.sock",
+    "--env",
+    "-e",
+    "--env-file",
+    "--privileged=true",
+)
 
 # Backward-compatible alias.
 DEFAULT_IMAGE = SANDBOX_IMAGE
@@ -56,6 +77,7 @@ class SandboxCommandRunner:
         cpus: str = CONTAINER_CPUS,
         pids_limit: int = CONTAINER_PIDS_LIMIT,
         user: str = SANDBOX_CONTAINER_USER,
+        limits=DEFAULT_LIMITS,
     ) -> None:
         self.sandbox_root = Path(
             sandbox_root
@@ -78,6 +100,7 @@ class SandboxCommandRunner:
         self.cpus = cpus
         self.pids_limit = pids_limit
         self.user = user
+        self.limits = limits
         self._probe = (
             daemon_probe or self._docker_info
         )
@@ -227,6 +250,47 @@ class SandboxCommandRunner:
             ),
         }
 
+    def forbidden_flags_present(
+        self,
+        arguments: list[str] | None = None,
+    ) -> list[str]:
+        """
+        Return any forbidden Docker flag tokens found in the argv.
+
+        Used by tests and as a defence-in-depth assertion.
+        """
+
+        argv = (
+            arguments
+            if arguments is not None
+            else self.command_arguments("true")
+        )
+
+        found: list[str] = []
+
+        for token in FORBIDDEN_FLAG_TOKENS:
+            for argument in argv:
+                if argument == token or argument.startswith(
+                    token + "="
+                ):
+                    found.append(token)
+                    break
+
+        return sorted(set(found))
+
+    def _truncate(self, text: str) -> str:
+        limit = self.limits.max_output_bytes
+
+        if limit is None or len(text) <= limit:
+            return text
+
+        return (
+            text[:limit]
+            + "\n...[truncated "
+            + str(len(text) - limit)
+            + " bytes]"
+        )
+
     def command_arguments(
         self,
         command: str,
@@ -330,7 +394,12 @@ class SandboxCommandRunner:
         return CommandResult(
             command=validated,
             returncode=completed.returncode,
-            stdout=completed.stdout or "",
-            stderr=completed.stderr or "",
+            stdout=self._truncate(
+                completed.stdout or ""
+            ),
+            stderr=self._truncate(
+                completed.stderr or ""
+            ),
         )
+
 
