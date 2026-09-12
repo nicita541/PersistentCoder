@@ -14,11 +14,17 @@ from app.sandbox.policy import (
     PolicyViolation,
     is_absolute_path,
 )
-
+from app.context.builder import ACTION_PROTOCOL
 
 
 class CodeExecutorError(RuntimeError):
     pass
+
+
+# Bounded corrective re-prompts for a malformed action envelope.
+# Nothing is written during these retries: they only spend tool-loop
+# iterations teaching the model the protocol.
+MAX_ENVELOPE_RETRIES = 2
 
 
 class CodeExecutor:
@@ -84,8 +90,17 @@ class CodeExecutor:
         ):
             project_context = ""
 
+            # When the Context layer owns relevance selection, the
+            # CodingAgent must NOT receive a whole-project dump: the
+            # snapshot stays only as a fallback for direct/test wiring.
             if (
-                self.workspace is not None
+                getattr(
+                    self.context,
+                    "selector",
+                    None,
+                )
+                is None
+                and self.workspace is not None
                 and getattr(
                     self.workspace,
                     "project",
@@ -149,6 +164,7 @@ class CodeExecutor:
     ) -> ExecutionResult:
         observed: dict[str, str] = {}
         transcript: list[str] = []
+        envelope_errors = 0
 
         for _ in range(self.limits.max_tool_iterations):
             messages = self._build_messages(
@@ -191,12 +207,27 @@ class CodeExecutor:
                 proposal = extract_json_object(answer)
 
             except ValueError:
-                return self._fail(
-                    "model did not return a valid action envelope",
-                    "invalid model response",
-                    ["model_response:" + answer[:200]],
-                    observed,
+                envelope_errors += 1
+
+                if envelope_errors > MAX_ENVELOPE_RETRIES:
+                    return self._fail(
+                        "model did not return a valid "
+                        "action envelope",
+                        "invalid model response",
+                        [
+                            "model_response:"
+                            + answer[:200]
+                        ],
+                        observed,
+                    )
+
+                transcript.append(
+                    "SYSTEM FEEDBACK: the previous reply was "
+                    "not a valid JSON action envelope.\n"
+                    + ACTION_PROTOCOL
                 )
+
+                continue
 
             action = self._action_of(proposal)
 
@@ -211,6 +242,10 @@ class CodeExecutor:
                 continue
 
             if action == "edit":
+                proposal = self._normalize_proposal(
+                    proposal
+                )
+
                 error = self._validate_envelope(
                     proposal,
                     observed,
@@ -229,12 +264,29 @@ class CodeExecutor:
                     read_files=sorted(observed),
                 )
 
-            return self._fail(
-                "unknown action",
-                f"unknown action: {action!r}",
-                ["unknown_action"],
-                observed,
+            # A small model often emits JSON that does not follow the
+            # protocol yet. Nothing has been written, so the safe and
+            # useful action is a bounded corrective re-prompt instead
+            # of failing the whole attempt immediately.
+            envelope_errors += 1
+
+            if envelope_errors > MAX_ENVELOPE_RETRIES:
+                return self._fail(
+                    "unknown action",
+                    f"unknown action: {action!r}",
+                    ["unknown_action"],
+                    observed,
+                )
+
+            transcript.append(
+                "SYSTEM FEEDBACK: the previous reply did not "
+                "contain a usable action.\n"
+                "PREVIOUS REPLY:\n"
+                f"{answer[:400]}\n"
+                + ACTION_PROTOCOL
             )
+
+            continue
 
         return self._fail(
             "tool loop budget exceeded",
@@ -263,10 +315,50 @@ class CodeExecutor:
     def _action_of(
         proposal: dict[str, object],
     ) -> str | None:
+        """
+        Deterministic normalization of the model's reply into one of
+        the protocol actions. Small models emit synonyms and
+        single-file shapes; accepting them is safe because the
+        envelope is still fully validated before any write.
+        """
+
         raw = proposal.get("action")
 
         if isinstance(raw, str) and raw.strip():
-            return raw.strip().casefold()
+            action = raw.strip().casefold()
+
+            if action in {"list", "ls", "list_files", "tree"}:
+                return "list"
+
+            if action in {
+                "read",
+                "read_file",
+                "open",
+                "cat",
+            }:
+                return "read"
+
+            if action in {
+                "search",
+                "grep",
+                "find",
+                "find_symbol",
+            }:
+                return "search"
+
+            if action in {
+                "edit",
+                "write",
+                "create",
+                "update",
+                "apply",
+                "patch",
+                "modify",
+                "save",
+            }:
+                return "edit"
+
+            return action
 
         if (
             "files" in proposal
@@ -274,7 +366,68 @@ class CodeExecutor:
         ):
             return "edit"
 
+        # Single-file shapes:
+        #   {"path": "...", "content": "..."}
+        #   {"file": {"path": "...", "content": "..."}}
+        if (
+            isinstance(proposal.get("path"), str)
+            and "content" in proposal
+        ):
+            return "edit"
+
+        if isinstance(proposal.get("file"), dict):
+            return "edit"
+
+        # Search shapes.
+        for key in ("query", "needle", "text"):
+            if isinstance(proposal.get(key), str):
+                return "search"
+
         return None
+
+    @staticmethod
+    def _normalize_proposal(
+        proposal: dict[str, object],
+    ) -> dict[str, object]:
+        """
+        Turn accepted synonyms / single-file shapes into the canonical
+        envelope. Pure normalization: validation still happens
+        afterwards.
+        """
+
+        if (
+            "files" not in proposal
+            and "commands" not in proposal
+        ):
+            entry = proposal.get("file")
+
+            if not isinstance(entry, dict):
+                if (
+                    isinstance(
+                        proposal.get("path"),
+                        str,
+                    )
+                    and "content" in proposal
+                ):
+                    entry = {
+                        "path": proposal["path"],
+                        "content": proposal.get(
+                            "content",
+                            "",
+                        ),
+                    }
+
+                else:
+                    entry = None
+
+            if entry is not None:
+                normalized = dict(proposal)
+
+                normalized["files"] = [entry]
+
+                return normalized
+
+        return proposal
 
     def _normalize(
         self,

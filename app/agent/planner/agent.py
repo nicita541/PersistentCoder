@@ -14,6 +14,9 @@ from app.agent.planner.decomposer import (
 from app.agent.planner.dependency_builder import (
     DependencyBuilder,
 )
+from app.agent.planner.step_validator import (
+    StepValidator,
+)
 from app.agent.planner.task_builder import (
     TaskBuilder,
 )
@@ -58,6 +61,7 @@ class PlannerAgent:
         task_builder=None,
         contract_builder=None,
         dependency_builder=None,
+        step_validator=None,
     ) -> None:
         if max_repair_attempts < 0:
             raise ValueError(
@@ -103,6 +107,14 @@ class PlannerAgent:
             task_builder or TaskBuilder()
         )
         self._step_drafts_by_key: dict = {}
+
+        self.step_validator = (
+            step_validator or StepValidator()
+        )
+
+        # Non-fatal step quality findings of the last planning pass
+        # (reported to the user, never auto-passed).
+        self.last_step_warnings: list[str] = []
 
         self.contract_builder = (
             contract_builder or ContractBuilder()
@@ -172,9 +184,40 @@ class PlannerAgent:
                     components
                 )
 
+                key_edges = (
+                    self.task_builder.key_require_edges(
+                        tasks
+                    )
+                )
+
+                tasks = (
+                    self.task_builder
+                    .normalize_key_requires(tasks)
+                )
+
                 self._step_drafts_by_key = (
                     self.task_builder.build_steps(
                         components
+                    )
+                )
+
+                step_errors = (
+                    self.step_validator.validate_all(
+                        tasks,
+                        self._step_drafts_by_key,
+                    )
+                )
+
+                if step_errors:
+                    raise PlannerError(
+                        "invalid step decomposition: "
+                        + "; ".join(step_errors)
+                    )
+
+                self.last_step_warnings = (
+                    self.step_validator.warnings_all(
+                        tasks,
+                        self._step_drafts_by_key,
                     )
                 )
 
@@ -197,6 +240,14 @@ class PlannerAgent:
                         self.dependency_builder
                         .infer_from_contracts(tasks)
                     )
+
+                tasks = (
+                    self.task_builder
+                    .merge_key_require_edges(
+                        tasks,
+                        key_edges,
+                    )
+                )
 
             except PlannerError as error:
                 if attempt >= self.max_plan_repairs:
@@ -231,6 +282,41 @@ class PlannerAgent:
 
         plan_id = self.task_store.create_plan(
             draft
+        )
+
+        self._create_steps(plan_id)
+
+        return PlanningResult(
+            plan_id=plan_id,
+            draft=draft,
+        )
+
+    def replan(
+        self,
+        request: str,
+        *,
+        previous_plan_id: int,
+        reason: str,
+        invalidate_task_keys: tuple[str, ...] = (),
+    ) -> PlanningResult:
+        """
+        GLOBAL PLAN REPLAN (level 3).
+
+        Creates a NEW plan revision: the previous plan and its tasks
+        stay in SQLite (marked SUPERSEDED), already DONE tasks are
+        carried over, explicitly invalidated tasks are marked
+        SUPERSEDED, and the WHY is stored with the new revision.
+        """
+
+        draft = self.build_draft(request)
+
+        plan_id = self.task_store.create_replan(
+            previous_plan_id,
+            draft,
+            reason=reason,
+            invalidate_task_keys=tuple(
+                invalidate_task_keys
+            ),
         )
 
         self._create_steps(plan_id)

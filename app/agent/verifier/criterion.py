@@ -15,6 +15,50 @@ _IMPORT_TOKEN_RE = re.compile(
 )
 
 
+def classify_criterion(
+    text: str,
+) -> str:
+    """
+    Deterministic classification of a success criterion into the
+    authoritative check CriterionEvaluator would run.
+
+    Returns one of: "py_compile", "import", "pytest", "file_exists",
+    or "unknown" (unknown criteria can never auto-PASS).
+    """
+
+    raw = (text or "").strip()
+
+    if not raw:
+        return "unknown"
+
+    lowered = raw.casefold()
+
+    def _has(
+        hints: tuple[str, ...],
+    ) -> bool:
+        return any(hint in lowered for hint in hints)
+
+    if _has(CriterionEvaluator.SYNTAX_HINTS):
+        return "py_compile"
+
+    if _has(CriterionEvaluator.IMPORT_HINTS):
+        return "import"
+
+    if (
+        _has(CriterionEvaluator.TEST_HINTS)
+        and _has(CriterionEvaluator.PASS_HINTS)
+    ):
+        return "pytest"
+
+    if _has(CriterionEvaluator.EXIST_HINTS):
+        if _FILE_TOKEN_RE.search(raw):
+            return "file_exists"
+
+        return "unknown"
+
+    return "unknown"
+
+
 class CriterionEvaluator:
     """
     Maps each success criterion to an AUTHORITATIVE check executed
@@ -302,6 +346,33 @@ class CriterionEvaluator:
             ),
         )
 
+    @staticmethod
+    def _test_target(
+        text: str,
+    ) -> str | None:
+        """
+        A criterion like "pytest tests/test_calc.py passes" must run
+        THAT test file, not the entire repository suite.
+        """
+
+        for raw in _FILE_TOKEN_RE.findall(text):
+            token = (
+                raw.replace("\\", "/").lstrip("./")
+            )
+
+            if not token.endswith(".py"):
+                continue
+
+            stem = token.split("/")[-1][:-3].casefold()
+
+            if (
+                stem.startswith("test_")
+                or stem.endswith("_test")
+            ):
+                return token
+
+        return None
+
     def _pytest(
         self,
         criterion: str,
@@ -314,9 +385,14 @@ class CriterionEvaluator:
                 reason="no command runner",
             )
 
-        ok, output = self._run(
-            f"{self.python} -m pytest -q"
-        )
+        target = self._test_target(criterion)
+
+        command = f"{self.python} -m pytest -q"
+
+        if target:
+            command += f' "{target}"'
+
+        ok, output = self._run(command)
 
         return CriterionResult(
             criterion=criterion,

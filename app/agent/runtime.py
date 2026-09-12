@@ -22,9 +22,15 @@ from app.agent.verifier.evidence import (
 )
 from app.agent.verifier.quality_gate import QualityGate
 from app.context.builder import ContextBuilder
+from app.context.selector import RepoContextSelector
 from app.memory.manager import MemoryManager
+from app.memory.retrieval import MemoryRetriever
 from app.memory.store import MemoryStore
+from app.policy.injection import (
+    enforce_system_policy,
+)
 from app.tasks.attempt_store import AttemptStore
+from app.tasks.models import AttemptStatus
 from app.tasks.replan_store import ReplanStore
 from app.tasks.replanner import Replanner
 from app.tasks.scheduler import TaskScheduler
@@ -45,6 +51,9 @@ from app.tools.file_tools import FileTools
 from app.tools.project_tools import ProjectTools
 from app.sandbox.paths import ensure_layout
 from app.sandbox.runner import SandboxCommandRunner
+from app.sandbox.dependencies import (
+    DependencyResolver,
+)
 from app.sandbox.workspace import SandboxWorkspace
 
 
@@ -90,29 +99,10 @@ class AgentRuntime:
         use_llm_dependencies: bool = True,
         planner_repair_attempts: int = 1,
         planner_plan_repairs: int = 2,
+        resume_interrupted: bool = True,
+        allow_dependency_build: bool = False,
     ) -> None:
         ensure_layout()
-
-        if workspace_root is None:
-            # Production: agents edit a sandbox snapshot,
-            # never the host project directly.
-            self.sandbox_workspace = (
-                SandboxWorkspace.create(
-                    project_root=(
-                        project_root or PROJECT_ROOT
-                    ),
-                )
-            )
-            self.workspace_root = (
-                self.sandbox_workspace.workspace_root
-            )
-
-        else:
-            # Explicit root (tests / framework tooling).
-            self.sandbox_workspace = None
-            self.workspace_root = Path(
-                workspace_root
-            ).resolve()
 
         self.database_path = (
             Path(database_path)
@@ -136,6 +126,58 @@ class AgentRuntime:
 
         self.current_run_id: int | None = None
         self.last_run_id: int | None = None
+
+        # ==================================
+        # CRASH RECOVERY (sandbox)
+        # ==================================
+
+        # A crashed attempt leaves the sandbox dirty. Restore every
+        # interrupted session to its last committed checkpoint BEFORE
+        # any tool is wired, and never auto-continue a half-written
+        # attempt. A restored session may be resumed instead of
+        # starting from a fresh copy.
+        self.resumed_run_id: int | None = None
+        self.resumed_session_id: str | None = None
+        self.recovery: list[dict[str, object]] = []
+
+        if workspace_root is None:
+            # Production: agents edit a sandbox snapshot,
+            # never the host project directly.
+            self.sandbox_workspace = None
+            self.workspace_root = (
+                Path(project_root or PROJECT_ROOT)
+            ).resolve()
+
+            self.recovery = self.recover_sandboxes(
+                resume=resume_interrupted
+            )
+
+            if self.sandbox_workspace is None:
+                self.sandbox_workspace = (
+                    SandboxWorkspace.create(
+                        project_root=self.workspace_root,
+                    )
+                )
+
+                self.workspace_root = (
+                    self.sandbox_workspace
+                    .workspace_root
+                )
+
+        else:
+            # Explicit root (tests / framework tooling).
+            self.sandbox_workspace = None
+            self.workspace_root = Path(
+                workspace_root
+            ).resolve()
+
+        if self.sandbox_workspace is not None:
+            self.session_id: str | None = (
+                self.sandbox_workspace.session_id
+            )
+
+        else:
+            self.session_id = None
 
         self.events.subscribe(self._persist_event)
 
@@ -171,6 +213,19 @@ class AgentRuntime:
 
         else:
             self.system_prompt = ""
+
+        # ==================================
+        # GLOBAL SYSTEM POLICY (every call)
+        # ==================================
+
+        # One LLM client is shared by every agent in this runtime.
+        # Stage instructions never replace the System Policy: this
+        # wrapper guarantees the policy is present in EVERY semantic
+        # call, so no stage can silently forget it.
+        self.llm = enforce_system_policy(
+            self.llm,
+            self.system_prompt,
+        )
 
         # ==================================
         # TOOLS LAYER (single)
@@ -247,10 +302,18 @@ class AgentRuntime:
         # CONTEXT (single)
         # ==================================
 
+        self.memory_retriever = MemoryRetriever()
+
+        self.repo_selector = RepoContextSelector(
+            self.project_tools,
+        )
+
         self.context = ContextBuilder(
             memory=self.memory,
             project=self.project_tools,
             system_prompt=self.system_prompt,
+            retriever=self.memory_retriever,
+            selector=self.repo_selector,
         )
 
         # ==================================
@@ -281,6 +344,33 @@ class AgentRuntime:
         self.command_runner = SandboxCommandRunner(
             sandbox_root=self.workspace_root,
         )
+
+        # ==================================
+        # DEPENDENCIES (framework-controlled, offline-first)
+        # ==================================
+
+        # The model can never install anything at runtime. When the
+        # framework is explicitly allowed to, it prepares a derived
+        # Docker image with the project's OWN manifests at build
+        # time; otherwise the base image is used and the status is
+        # reported as BLOCKED (never silently ignored).
+        self.dependencies = DependencyResolver(
+            allow_build=allow_dependency_build,
+        )
+
+        self.dependency_plan = None
+
+        if self.sandbox_workspace is not None:
+            self.dependency_plan = (
+                self.dependencies.plan(
+                    self.workspace_root
+                )
+            )
+
+            if self.dependency_plan.ready:
+                self.command_runner.image = (
+                    self.dependency_plan.image
+                )
 
         # Session-wide set of files the agent itself created.
         self.known_files: set[str] = set()
@@ -352,10 +442,204 @@ class AgentRuntime:
             max_task_attempts=max_task_attempts,
         )
 
+        # Last finished AgentState (CLI: /status, /patch, /apply).
+        self.last_state = None
+
+        # Finish the crash-recovery bookkeeping now that the
+        # AttemptStore exists: an attempt that was IN_PROGRESS when
+        # the process died becomes BLOCKED (never PASS, never DONE).
+        self.interrupted_attempts = (
+            self._mark_interrupted_attempts()
+        )
+
+    # ==================================
+    # CRASH RECOVERY
+    # ==================================
+
+    def recover_sandboxes(
+        self,
+        *,
+        resume: bool = True,
+    ) -> list[dict[str, object]]:
+        """
+        Roll every crash-interrupted sandbox session back to its last
+        committed checkpoint.
+
+        The interrupted attempt is never treated as DONE and is never
+        auto-continued: files written by the half-finished attempt are
+        discarded, a recovery event is recorded, and only then may a
+        safe resume happen.
+        """
+
+        recovered: list[dict[str, object]] = []
+
+        for run in self.interrupted_runs:
+            run_id = int(run["id"])
+            session_id = run.get("sandbox_session_id")
+
+            record: dict[str, object] = {
+                "run_id": run_id,
+                "session_id": session_id,
+                "checkpoint": None,
+                "restored": False,
+                "resumed": False,
+                "note": "",
+            }
+
+            if not session_id:
+                record["note"] = (
+                    "no sandbox session recorded; "
+                    "nothing to restore"
+                )
+
+            else:
+                try:
+                    workspace = (
+                        SandboxWorkspace.open_session(
+                            str(session_id)
+                        )
+                    )
+
+                except Exception as error:
+                    workspace = None
+                    record["note"] = (
+                        "sandbox recovery error: "
+                        f"{error}"
+                    )
+
+                if workspace is None:
+                    if not record["note"]:
+                        record["note"] = (
+                            "sandbox session is gone; "
+                            "nothing to restore"
+                        )
+
+                else:
+                    label = (
+                        run.get("checkpoint_id")
+                        or workspace.latest_checkpoint()
+                    )
+
+                    restored = (
+                        workspace.rollback(label)
+                        if label
+                        else False
+                    )
+
+                    record.update(
+                        {
+                            "checkpoint": label,
+                            "restored": restored,
+                            "note": (
+                                "rolled back to checkpoint "
+                                f"'{label}'"
+                                if restored
+                                else "no uncommitted checkpoint; "
+                                "workspace already at last "
+                                "committed state"
+                            ),
+                        }
+                    )
+
+                    self.runtime_store.log_event(
+                        run_id,
+                        "recovery",
+                        payload={
+                            "session_id": str(
+                                session_id
+                            ),
+                            "checkpoint": label,
+                            "restored": restored,
+                        },
+                    )
+
+                    if (
+                        resume
+                        and restored
+                        and self.resumed_run_id is None
+                    ):
+                        # Continue in the restored sandbox instead of
+                        # silently starting from a fresh copy.
+                        self.sandbox_workspace = (
+                            workspace
+                        )
+
+                        self.workspace_root = (
+                            workspace.workspace_root
+                        )
+
+                        self.resumed_run_id = run_id
+                        self.resumed_session_id = str(
+                            session_id
+                        )
+
+                        record["resumed"] = True
+
+            try:
+                self.runtime_store.set_recovery_note(
+                    run_id,
+                    str(record["note"]),
+                )
+
+            except Exception:
+                pass
+
+            recovered.append(record)
+
+        return recovered
+
+    def _mark_interrupted_attempts(
+        self,
+    ) -> list[int]:
+        """
+        Close attempts that were IN_PROGRESS when the process died.
+
+        AttemptStore is the source of truth: an unfinished attempt
+        becomes BLOCKED, so escalation limits are computed from
+        persisted history, not from in-memory counters.
+        """
+
+        blocked: list[int] = []
+
+        for run in self.interrupted_runs:
+            attempt_id = run.get("attempt_id")
+
+            if attempt_id is None:
+                continue
+
+            try:
+                attempt = self.attempt_store.get_attempt(
+                    int(attempt_id)
+                )
+
+                if attempt is None:
+                    continue
+
+                if (
+                    attempt.status
+                    is AttemptStatus.IN_PROGRESS
+                ):
+                    self.attempt_store.finish_attempt(
+                        int(attempt_id),
+                        status=AttemptStatus.BLOCKED,
+                        failure_reason=(
+                            "interrupted by process crash "
+                            "(recovered on restart)"
+                        ),
+                    )
+
+                    blocked.append(int(attempt_id))
+
+            except Exception:
+                continue
+
+        return blocked
+
     def run(self, request: str):
         run_id = self.runtime_store.start_run(request)
         self.current_run_id = run_id
         self.last_run_id = run_id
+        self.last_state = None
 
         if self.sandbox_workspace is not None:
             self.runtime_store.update_run(
@@ -401,8 +685,429 @@ class AgentRuntime:
 
         self.runtime_store.finish_run(run_id, status)
         self.current_run_id = None
+        self.last_state = state
 
         return state
+
+    # ==================================
+    # CLI / USER-FACING VIEW
+    # ==================================
+
+    def run_status(self) -> dict[str, object]:
+        """
+        Compact status of the current/last run + sandbox.
+        """
+
+        run = (
+            self.runtime_store.get_run(
+                self.last_run_id
+            )
+            if self.last_run_id is not None
+            else None
+        )
+
+        state = getattr(self, "last_state", None)
+
+        plan = self.plan_store.get_active_plan()
+
+        return {
+            "run_id": self.last_run_id,
+            "run_status": (
+                run.get("status") if run else None
+            ),
+            "phase": (
+                state.phase.value
+                if state is not None
+                else (run.get("phase") if run else None)
+            ),
+            "plan_id": (
+                state.plan_id
+                if state is not None
+                else (run.get("plan_id") if run else None)
+            ),
+            "task_id": run.get("task_id") if run else None,
+            "step_id": run.get("step_id") if run else None,
+            "attempt_id": (
+                run.get("attempt_id") if run else None
+            ),
+            "sandbox": self.sandbox_status(),
+            "sandbox_session_id": self.session_id,
+            "workspace": str(self.workspace_root),
+            "patch": self.last_patch_path,
+            "interrupted_runs": len(
+                self.interrupted_runs
+            ),
+            "recovery": list(self.recovery),
+            "active_plan": (
+                plan.id if plan else None
+            ),
+            "dependencies": (
+                {
+                    "status": self.dependency_plan.status,
+                    "image": self.dependency_plan.image,
+                    "reason": self.dependency_plan.reason,
+                }
+                if self.dependency_plan is not None
+                else None
+            ),
+        }
+
+    def describe_plan(self) -> str:
+        """
+        Human-readable Plan / Task / Step view.
+        """
+
+        state = getattr(self, "last_state", None)
+
+        plan_id = (
+            state.plan_id
+            if state is not None
+            else None
+        )
+
+        if plan_id is None:
+            active = self.plan_store.get_active_plan()
+            plan_id = active.id if active else None
+
+        if plan_id is None:
+            return "PLAN: план ещё не создан."
+
+        plan = self.plan_store.get_plan(plan_id)
+
+        if plan is None:
+            return f"PLAN: план #{plan_id} не найден."
+
+        tasks = self.plan_store.get_tasks(plan_id)
+
+        lines: list[str] = [
+            f"PLAN #{plan.id} [{plan.status.value}]",
+            f"GOAL: {plan.global_goal}",
+            "",
+        ]
+
+        for task in tasks:
+            marker = {
+                "DONE": "[x]",
+                "IN_PROGRESS": "[>]",
+                "FAILED": "[!]",
+                "BLOCKED": "[#]",
+            }.get(task.status.value, "[ ]")
+
+            lines.append(
+                f"{marker} #{task.id} {task.title} "
+                f"({task.status.value})"
+            )
+
+            dependencies = (
+                self.plan_store.get_task_dependencies(
+                    task.id
+                )
+            )
+
+            if dependencies:
+                lines.append(
+                    "      depends_on: "
+                    + ", ".join(
+                        str(dependency)
+                        for dependency in dependencies
+                    )
+                )
+
+            for step in self.step_store.get_steps(
+                task.id
+            ):
+                lines.append(
+                    f"      - step #{step.id} "
+                    f"{step.title} ({step.status.value})"
+                )
+
+        warnings = list(
+            getattr(
+                self.planner,
+                "last_step_warnings",
+                [],
+            )
+            or []
+        )
+
+        if warnings:
+            lines.append("")
+            lines.append("WARNINGS (definition of done):")
+
+            lines.extend(
+                f"  ! {warning}"
+                for warning in warnings
+            )
+
+        return "\n".join(lines)
+
+    def global_replan(
+        self,
+        *,
+        reason: str,
+        request: str | None = None,
+        invalidate_task_keys: tuple[str, ...] = (),
+    ) -> dict[str, object]:
+        """
+        LEVEL 3 — GLOBAL PLAN REPLAN.
+
+        Creates a new plan revision:
+
+          - the previous plan stays in SQLite (SUPERSEDED);
+          - DONE tasks are carried over, never re-executed;
+          - explicitly invalidated task keys are marked SUPERSEDED;
+          - the WHY is stored with the new revision.
+
+        Only the framework / the user may trigger this. The model can
+        merely *propose* it through a RepairAgent decision; the
+        controller applies the state mutation.
+        """
+
+        previous = (
+            self.last_state.plan_id
+            if getattr(self, "last_state", None) is not None
+            else None
+        )
+
+        if previous is None:
+            active = self.plan_store.get_active_plan()
+            previous = active.id if active else None
+
+        if previous is None:
+            return {
+                "replanned": False,
+                "reason": "there is no previous plan",
+            }
+
+        if request is None:
+            request = (
+                self.last_state.request
+                if getattr(self, "last_state", None)
+                is not None
+                else None
+            )
+
+        if not request:
+            plan = self.plan_store.get_plan(previous)
+            request = (
+                plan.user_request if plan else None
+            )
+
+        if not request:
+            return {
+                "replanned": False,
+                "reason": "no request available for replanning",
+            }
+
+        result = self.planner.replan(
+            request,
+            previous_plan_id=previous,
+            reason=reason,
+            invalidate_task_keys=invalidate_task_keys,
+        )
+
+        revision = self.plan_store.get_plan_revision(
+            result.plan_id
+        )
+
+        # The framework applies the state mutation: the runtime now
+        # works on the new revision, so /status and /plan show it.
+        state = getattr(self, "last_state", None)
+
+        if state is not None:
+            state.plan_id = result.plan_id
+
+        if self.last_run_id is not None:
+            try:
+                self.runtime_store.log_event(
+                    self.last_run_id,
+                    "replan",
+                    plan_id=result.plan_id,
+                    payload={
+                        "previous_plan_id": previous,
+                        "reason": reason,
+                        "invalidated": list(
+                            invalidate_task_keys
+                        ),
+                    },
+                )
+
+            except Exception:
+                pass
+
+        return {
+            "replanned": True,
+            "plan_id": result.plan_id,
+            "previous_plan_id": previous,
+            "version": (
+                revision.get("version")
+                if revision
+                else None
+            ),
+            "reason": reason,
+            "invalidated": list(
+                invalidate_task_keys
+            ),
+        }
+
+    def memory_overview(self) -> dict[str, object]:
+        """
+        Active long-term memory, grouped (no giant dump).
+        """
+
+        memories = self.memory.get_active_memories()
+
+        counts: dict[str, int] = {}
+
+        for memory in memories:
+            memory_type = str(
+                memory.get("type", "?")
+            )
+
+            counts[memory_type] = (
+                counts.get(memory_type, 0) + 1
+            )
+
+        return {
+            "total": len(memories),
+            "counts": counts,
+            "memories": memories,
+        }
+
+    def patch_preview(self) -> dict[str, object]:
+        """
+        Preview of the verified patch. Never applies anything.
+        """
+
+        state = getattr(self, "last_state", None)
+
+        patch_path = self.last_patch_path
+
+        changed: list[str] = []
+
+        if self.sandbox_workspace is not None:
+            changed = [
+                relative
+                for relative in (
+                    self.sandbox_workspace
+                    .changed_files()
+                )
+                if self.sandbox_workspace
+                .is_patch_safe(relative)
+            ]
+
+        verification = None
+
+        if (
+            state is not None
+            and state.verification is not None
+        ):
+            verification = {
+                "status": state.verification.status,
+                "ok": state.verification.ok,
+                "reason": state.verification.reason,
+            }
+
+        return {
+            "patch": patch_path,
+            "patch_exists": bool(
+                patch_path
+                and Path(patch_path).exists()
+            ),
+            "changed_files": changed,
+            "verification": verification,
+            "phase": (
+                state.phase.value
+                if state is not None
+                else None
+            ),
+            "applied": False,
+        }
+
+    def apply_patch(
+        self,
+        *,
+        confirmed: bool = False,
+    ) -> dict[str, object]:
+        """
+        Apply the verified patch to the host project.
+
+        Hard prerequisites (never bypassed):
+          - the user explicitly confirmed;
+          - the last run finished DONE;
+          - verification PASS;
+          - the patch exists and every changed path is patch-safe.
+
+        There is no auto-apply anywhere in the agent loop.
+        """
+
+        preview = self.patch_preview()
+
+        if not confirmed:
+            return {
+                "applied": [],
+                "reason": "explicit confirmation required",
+                "preview": preview,
+            }
+
+        if self.sandbox_workspace is None:
+            return {
+                "applied": [],
+                "reason": "no sandbox workspace",
+                "preview": preview,
+            }
+
+        state = getattr(self, "last_state", None)
+
+        if state is None or state.phase is not AgentPhase.DONE:
+            return {
+                "applied": [],
+                "reason": (
+                    "run is not DONE; nothing may be applied"
+                ),
+                "preview": preview,
+            }
+
+        verification = state.verification
+
+        if (
+            verification is None
+            or not getattr(
+                verification,
+                "ok",
+                False,
+            )
+        ):
+            return {
+                "applied": [],
+                "reason": (
+                    "verification did not PASS; "
+                    "nothing may be applied"
+                ),
+                "preview": preview,
+            }
+
+        if not preview["patch_exists"]:
+            return {
+                "applied": [],
+                "reason": "no patch file was produced",
+                "preview": preview,
+            }
+
+        applied = (
+            self.sandbox_workspace.apply_to_project(
+                PROJECT_ROOT,
+                paths=list(
+                    preview["changed_files"]  # type: ignore[arg-type]
+                ),
+            )
+        )
+
+        return {
+            "applied": applied,
+            "reason": "applied",
+            "preview": preview,
+        }
 
     def _persist_event(self, event) -> None:
         """

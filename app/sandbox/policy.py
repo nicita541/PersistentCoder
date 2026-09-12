@@ -52,6 +52,46 @@ _PACKAGE_MANAGER_PATTERNS = (
     re.compile(r"\bgit\s+clone\b", re.IGNORECASE),
     re.compile(r"\bpip3?\s+download\b", re.IGNORECASE),
     re.compile(r"\bnpm\s+(publish|login)\b", re.IGNORECASE),
+    # Windows administration / script-host tools. The sandbox runs a
+    # Linux container as non-root, but these must be refused anyway:
+    # defence in depth, and the model must never be able to reach the
+    # host registry, services, scheduled tasks or script hosts.
+    re.compile(r"\breg(\.exe)?\s+\w+", re.IGNORECASE),
+    re.compile(
+        r"\bsc(\.exe)?\s+(query|config|start|stop|create|delete)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bschtasks(\.exe)?\b", re.IGNORECASE),
+    re.compile(r"\bwscript(\.exe)?\b", re.IGNORECASE),
+    re.compile(r"\bcscript(\.exe)?\b", re.IGNORECASE),
+    re.compile(r"\bmshta(\.exe)?\b", re.IGNORECASE),
+    re.compile(r"\brundll32(\.exe)?\b", re.IGNORECASE),
+    re.compile(r"\bregsvr32(\.exe)?\b", re.IGNORECASE),
+    re.compile(r"\bcertutil(\.exe)?\b", re.IGNORECASE),
+    re.compile(r"\bbitsadmin(\.exe)?\b", re.IGNORECASE),
+    re.compile(r"\bwmic(\.exe)?\b", re.IGNORECASE),
+    re.compile(r"\bnetsh(\.exe)?\b", re.IGNORECASE),
+    re.compile(r"\bbcdedit(\.exe)?\b", re.IGNORECASE),
+    re.compile(r"\bdiskpart(\.exe)?\b", re.IGNORECASE),
+    re.compile(r"\btaskkill(\.exe)?\b", re.IGNORECASE),
+    re.compile(r"\bnet(\.exe)?\s+(user|localgroup|use|share)\b", re.IGNORECASE),
+    # Remote fetch / code execution through PowerShell cmdlets.
+    re.compile(
+        r"\binvoke-(webrequest|restmethod|expression|command)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bstart-process\b", re.IGNORECASE),
+    re.compile(
+        r"\b(new|set)-itemproperty\b",
+        re.IGNORECASE,
+    ),
+    # Credential / remote-shell tooling (an argument is required, so
+    # ordinary file names such as "scp.py" are unaffected).
+    re.compile(
+        r"\bssh(-keygen|-add|-agent)?(\.exe)?\s+\S+",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bscp(\.exe)?\s+\S+", re.IGNORECASE),
 )
 
 
@@ -126,6 +166,13 @@ class PathPolicy:
         if is_absolute_path(raw):
             raise PolicyViolation(
                 f"absolute paths are forbidden: {raw}"
+            )
+
+        if "%" in raw:
+            # Environment-variable expansion (e.g. %USERPROFILE%) must
+            # never be usable to reach host locations.
+            raise PolicyViolation(
+                f"environment expansion is forbidden: {raw}"
             )
 
         candidate = (self.root / raw).resolve()

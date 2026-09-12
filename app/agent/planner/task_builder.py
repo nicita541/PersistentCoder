@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from app.agent.planner.decomposer import (
     PlannerError,
     optional_string_list,
@@ -138,6 +140,149 @@ class TaskBuilder:
             )
 
         return result
+
+    @staticmethod
+    def key_require_edges(
+        tasks: list[TaskDraft],
+    ) -> dict[str, list[str]]:
+        """
+        Which tasks named a SIBLING TASK KEY inside `requires`.
+
+        The edges are remembered so they can be restored after the
+        dependency stage, which owns the final `depends_on` list.
+        """
+
+        keys = {
+            str(task.key).strip().casefold(): str(
+                task.key
+            )
+            for task in tasks
+            if task.key
+        }
+
+        edges: dict[str, list[str]] = {}
+
+        for task in tasks:
+            own = str(task.key or "").strip().casefold()
+
+            moved: list[str] = []
+
+            for requirement in task.requires:
+                lookup = str(requirement).strip().casefold()
+
+                if lookup in keys and lookup != own:
+                    moved.append(keys[lookup])
+
+            if moved and task.key:
+                edges[str(task.key)] = moved
+
+        return edges
+
+    @staticmethod
+    def merge_key_require_edges(
+        tasks: list[TaskDraft],
+        edges: dict[str, list[str]],
+    ) -> list[TaskDraft]:
+        """
+        Restore remembered key->key edges into the final depends_on
+        lists (only for task keys that still exist).
+        """
+
+        if not edges:
+            return tasks
+
+        known = {
+            str(task.key)
+            for task in tasks
+            if task.key
+        }
+
+        merged: list[TaskDraft] = []
+
+        for task in tasks:
+            extra = [
+                key
+                for key in edges.get(str(task.key), [])
+                if key in known
+                and key != str(task.key)
+            ]
+
+            if not extra:
+                merged.append(task)
+                continue
+
+            depends_on = list(task.depends_on)
+
+            for key in extra:
+                if key not in depends_on:
+                    depends_on.append(key)
+
+            merged.append(
+                replace(task, depends_on=depends_on)
+            )
+
+        return merged
+
+    @staticmethod
+    def normalize_key_requires(
+        tasks: list[TaskDraft],
+    ) -> list[TaskDraft]:
+        """
+        Deterministic interpretation of one very common small-model
+        mistake: putting a SIBLING TASK KEY into `requires` instead of
+        a produced resource.
+
+        Such an entry is moved to `depends_on` (still validated as a
+        DAG). The requires/produces contract itself is untouched: only
+        entries that are exactly a sibling task key are affected.
+        """
+
+        keys = {
+            str(task.key).strip().casefold(): str(
+                task.key
+            )
+            for task in tasks
+            if task.key
+        }
+
+        normalized: list[TaskDraft] = []
+
+        for task in tasks:
+            own = str(task.key or "").strip().casefold()
+
+            moved: list[str] = []
+            remaining: list[str] = []
+
+            for requirement in task.requires:
+                lookup = str(requirement).strip().casefold()
+
+                if lookup in keys and lookup != own:
+                    moved.append(lookup)
+                    continue
+
+                remaining.append(requirement)
+
+            if not moved:
+                normalized.append(task)
+                continue
+
+            depends_on = list(task.depends_on)
+
+            for lookup in moved:
+                key = keys[lookup]
+
+                if key not in depends_on:
+                    depends_on.append(key)
+
+            normalized.append(
+                replace(
+                    task,
+                    requires=remaining,
+                    depends_on=depends_on,
+                )
+            )
+
+        return normalized
 
     def build_steps(
         self,

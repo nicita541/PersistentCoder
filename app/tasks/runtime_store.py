@@ -271,6 +271,25 @@ class RuntimeStore:
                 (INTERRUPTED, note, run_id, RUNNING),
             )
 
+    def set_recovery_note(
+        self,
+        run_id: int,
+        note: str,
+    ) -> None:
+        """Record the outcome of crash recovery for a run."""
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE agent_runs
+                SET
+                    recovery_note = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (note, run_id),
+            )
+
     def recover_interrupted(
         self,
     ) -> list[dict[str, object]]:

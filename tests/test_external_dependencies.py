@@ -43,7 +43,7 @@ def test_external_dependency_does_not_need_task_producer(
                   "requires": [],
                   "external_dependencies": ["flask"],
                   "produces": ["notes API"],
-                  "success_criteria": ["API creates notes"]
+                  "success_criteria": ["notes_api.py exists"]
                 }
               ]
             }

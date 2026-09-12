@@ -454,6 +454,34 @@ class PlanStore:
                 """
             )
 
+            # ----------------------------------
+            # PLAN REVISIONS (global replan).
+            #
+            # History is never destroyed: a replan creates a NEW
+            # plan row and the previous one becomes SUPERSEDED.
+            # ----------------------------------
+
+            plan_columns = self._get_columns(
+                connection,
+                "plans",
+            )
+
+            if "replan_reason" not in plan_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE plans
+                    ADD COLUMN replan_reason TEXT
+                    """
+                )
+
+            if "replaces_plan_id" not in plan_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE plans
+                    ADD COLUMN replaces_plan_id INTEGER
+                    """
+                )
+
     # ==========================================
     # JSON HELPERS
     # ==========================================
@@ -674,6 +702,172 @@ class PlanStore:
                 )
 
         return plan_id
+
+    # ==========================================
+    # PLAN REVISIONS / GLOBAL REPLAN
+    # ==========================================
+
+    def set_plan_status(
+        self,
+        plan_id: int,
+        status: PlanStatus,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE plans
+                SET
+                    status = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (status.value, plan_id),
+            )
+
+    def set_plan_replan_metadata(
+        self,
+        plan_id: int,
+        *,
+        version: int,
+        replaces_plan_id: int,
+        reason: str,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE plans
+                SET
+                    version = ?,
+                    replaces_plan_id = ?,
+                    replan_reason = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    int(version),
+                    int(replaces_plan_id),
+                    reason,
+                    plan_id,
+                ),
+            )
+
+    def get_plan_revision(
+        self,
+        plan_id: int,
+    ) -> dict[str, object] | None:
+        """
+        version + replan_reason + replaces_plan_id of a plan.
+        """
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    id,
+                    version,
+                    status,
+                    replaces_plan_id,
+                    replan_reason
+
+                FROM plans
+                WHERE id = ?
+                """,
+                (plan_id,),
+            ).fetchone()
+
+        return dict(row) if row is not None else None
+
+    def create_replan(
+        self,
+        previous_plan_id: int,
+        plan: PlanDraft,
+        *,
+        reason: str,
+        invalidate_task_keys: tuple[str, ...] = (),
+    ) -> int:
+        """
+        Create a NEW plan revision without destroying history.
+
+        - the previous plan and its tasks stay in SQLite and become
+          SUPERSEDED;
+        - the new plan gets version = previous.version + 1, remembers
+          WHY it exists and which plan it replaces;
+        - tasks already DONE are carried over (never re-executed);
+        - explicitly invalidated task keys are marked SUPERSEDED.
+        """
+
+        previous = self.get_plan(previous_plan_id)
+
+        if previous is None:
+            raise ValueError(
+                f"unknown plan: {previous_plan_id}"
+            )
+
+        done_by_key: dict[str, TaskRecord] = {}
+
+        for task in self.get_tasks(previous_plan_id):
+            if (
+                task.status is TaskStatus.DONE
+                and task.key
+            ):
+                done_by_key[task.key] = task
+
+        new_plan_id = self.create_plan(plan)
+
+        self.set_plan_status(
+            previous_plan_id,
+            PlanStatus.SUPERSEDED,
+        )
+
+        self.set_plan_replan_metadata(
+            new_plan_id,
+            version=int(previous.version) + 1,
+            replaces_plan_id=previous_plan_id,
+            reason=reason,
+        )
+
+        invalidated = set(invalidate_task_keys)
+
+        for task in self.get_tasks(new_plan_id):
+            key = task.key or ""
+
+            if key in invalidated:
+                self.update_task_status(
+                    task.id,
+                    TaskStatus.SUPERSEDED,
+                )
+
+                continue
+
+            carried = done_by_key.get(key)
+
+            if carried is None:
+                continue
+
+            self.update_task_status(
+                task.id,
+                TaskStatus.DONE,
+            )
+
+            self.set_task_result(
+                task.id,
+                result_summary=(
+                    carried.result_summary
+                    or "carried over from previous plan "
+                    "revision"
+                ),
+                result_artifacts=list(
+                    carried.result_artifacts
+                ),
+                verification_status=(
+                    carried.verification_status or "PASS"
+                ),
+                verification_evidence=list(
+                    carried.verification_evidence
+                ),
+            )
+
+        return new_plan_id
 
     def _create_plan_without_external_dependencies(
         self,

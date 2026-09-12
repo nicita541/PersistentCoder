@@ -19,11 +19,26 @@ def show_commands() -> None:
     console.print()
     console.print("[dim]Команды:[/dim]")
     console.print(
-        "[dim]/remember текст — сохранить правило "
-        "вручную[/dim]"
+        "[dim]/status — текущий run / план / task / step "
+        "/ attempt / sandbox[/dim]"
     )
     console.print(
-        "[dim]/memories — показать активную память[/dim]"
+        "[dim]/plan — план, задачи, шаги, зависимости[/dim]"
+    )
+    console.print(
+        "[dim]/memory — активная долговременная память[/dim]"
+    )
+    console.print(
+        "[dim]/patch — путь patch, изменённые файлы, "
+        "верификация[/dim]"
+    )
+    console.print(
+        "[dim]/apply — применить verified patch "
+        "(нужно подтверждение)[/dim]"
+    )
+    console.print(
+        "[dim]/remember текст — сохранить правило "
+        "вручную[/dim]"
     )
     console.print(
         "[dim]/clear — очистить временный контекст[/dim]"
@@ -31,22 +46,31 @@ def show_commands() -> None:
     console.print("[dim]/exit — выход[/dim]")
 
 
-def show_memory(
-    memories: list[dict[str, object]],
-) -> None:
-    if not memories:
+def show_memory(runtime) -> None:
+    overview = runtime.memory_overview()
+
+    if not overview["memories"]:
         console.print(
             "[yellow]Постоянная память пуста.[/yellow]"
         )
         return
 
+    counts = ", ".join(
+        f"{name}: {count}"
+        for name, count
+        in overview["counts"].items()
+    )
+
     console.print()
     console.print(
         "[bold cyan]Persistent Memory:"
-        "[/bold cyan]"
+        f"[/bold cyan] {overview['total']} активных"
+        f" ({counts})"
     )
 
-    for memory in memories:
+    limit = 30
+
+    for memory in overview["memories"][:limit]:
         line = (
             f"[{memory['id']}] "
             f"{memory['type']} | "
@@ -58,22 +82,296 @@ def show_memory(
 
         console.print(line)
 
+    remaining = (
+        len(overview["memories"]) - limit
+    )
 
-def render_state(state) -> str:
+    if remaining > 0:
+        console.print(
+            f"[dim]... ещё {remaining} записей[/dim]"
+        )
+
+
+def render_plan(runtime) -> None:
+    console.print()
+    console.print(
+        "[bold cyan]PLAN[/bold cyan]"
+    )
+
+    console.print(
+        runtime.describe_plan()
+    )
+
+
+def render_status(runtime) -> None:
+    status = runtime.run_status()
+
+    console.print()
+    console.print(
+        "[bold cyan]STATUS[/bold cyan]"
+    )
+
+    for key in (
+        "run_id",
+        "run_status",
+        "phase",
+        "plan_id",
+        "task_id",
+        "step_id",
+        "attempt_id",
+        "active_plan",
+        "sandbox_session_id",
+        "workspace",
+        "patch",
+        "interrupted_runs",
+    ):
+        console.print(
+            f"{key}: {status.get(key)}"
+        )
+
+    console.print(status.get("sandbox"))
+
+    dependencies = status.get("dependencies")
+
+    if dependencies:
+        console.print(
+            "dependencies: "
+            f"{dependencies['status']} — "
+            f"{dependencies['image']} "
+            f"({dependencies['reason']})"
+        )
+
+    for record in status.get("recovery") or []:
+        console.print(
+            "[yellow]recovery:[/yellow] "
+            f"run #{record['run_id']} — "
+            f"{record['note']}"
+        )
+
+
+def render_patch(runtime) -> None:
+    preview = runtime.patch_preview()
+
+    console.print()
+    console.print(
+        "[bold cyan]PATCH[/bold cyan]"
+    )
+
+    if not preview["patch"]:
+        console.print(
+            "[yellow]Patch ещё не создан. "
+            "Сначала выполните задачу.[/yellow]"
+        )
+        return
+
+    console.print(f"path: {preview['patch']}")
+    console.print(
+        f"exists: {preview['patch_exists']}"
+    )
+    console.print("changed files:")
+
+    changed = preview["changed_files"] or []
+
+    if not changed:
+        console.print("  (нет)")
+
+    for path in changed:
+        console.print(f"  - {path}")
+
+    verification = preview.get(
+        "verification"
+    )
+
+    if verification:
+        console.print(
+            "verification: "
+            f"{verification['status']} — "
+            f"{verification['reason']}"
+        )
+
+    console.print(
+        "[dim]Changes NOT applied automatically.[/dim]"
+    )
+
+
+def apply_patch_with_confirmation(runtime) -> None:
+    preview = runtime.patch_preview()
+
+    if not preview["patch"]:
+        console.print(
+            "[yellow]Patch не создан: "
+            "нечего применять.[/yellow]"
+        )
+        return
+
+    verification = (
+        preview.get("verification") or {}
+    )
+
+    if (
+        preview.get("phase") != "DONE"
+        or not verification.get("ok")
+    ):
+        console.print(
+            "[bold red]Apply запрещён: "
+            "run != DONE или verification != PASS."
+            "[/bold red]"
+        )
+        console.print(
+            "[dim]Изменения не применены.[/dim]"
+        )
+        return
+
+    render_patch(runtime)
+
+    answer = console.input(
+        "[bold yellow]Apply verified patch? "
+        "[y/N]:[/bold yellow] "
+    ).strip().casefold()
+
+    if answer not in {"y", "yes", "д", "да"}:
+        console.print(
+            "[yellow]Apply отменён "
+            "(по умолчанию — нет).[/yellow]"
+        )
+        return
+
+    result = runtime.apply_patch(confirmed=True)
+
+    applied = result.get("applied") or []
+
+    if not applied:
+        console.print(
+            "[bold red]Не применено: "
+            f"{result.get('reason')}[/bold red]"
+        )
+        return
+
+    console.print(
+        "[green]Применено "
+        f"{len(applied)} файл(ов):[/green]"
+    )
+
+    for path in applied:
+        console.print(f"  - {path}")
+
+
+def render_result(state, runtime) -> str:
+    """
+    Compact user-facing result: plan progress + verified result.
+
+    Internal noise (raw prompts, JSON envelopes) is never shown
+    unless the run actually failed.
+    """
+
     lines: list[str] = [
         f"**Фаза:** {state.phase.value}"
     ]
 
     if state.plan_id is not None:
-        lines.append(f"**План:** #{state.plan_id}")
+        lines.append(
+            f"**План:** #{state.plan_id}"
+        )
 
     if state.global_goal:
-        lines.append(f"**Цель:** {state.global_goal}")
-
-    if state.execution is not None:
         lines.append(
-            f"**Выполнение:** {state.execution.summary}"
+            f"**Цель:** {state.global_goal}"
         )
+
+    execution = state.execution
+
+    lines.append("")
+    lines.append("**RESULT**")
+
+    if execution is not None:
+        lines.append(
+            "✓ прочитано файлов: "
+            f"{len(execution.read_files)}"
+        )
+
+        changed = [
+            artifact
+            for artifact in execution.artifacts
+        ]
+
+        lines.append(
+            f"✓ изменено файлов: {len(changed)}"
+        )
+
+        for artifact in changed[:20]:
+            lines.append(f"  - {artifact}")
+
+        for command in execution.commands:
+            marker = (
+                "✓"
+                if command.returncode == 0
+                else "✗"
+            )
+
+            lines.append(
+                f"{marker} {command.command} "
+                f"(rc={command.returncode})"
+            )
+
+    verification = state.verification
+
+    if verification is not None:
+        for criterion in (
+            verification.criterion_results
+        ):
+            marker = (
+                "✓"
+                if criterion.status == "PASS"
+                else "✗"
+            )
+
+            lines.append(
+                f"{marker} {criterion.criterion} "
+                f"[{criterion.check}]"
+            )
+
+        lines.append(
+            "✓ верификация: "
+            f"{verification.status} — "
+            f"{verification.reason}"
+        )
+
+    if state.repair.required:
+        lines.append(
+            f"**Repair:** {state.repair.action} "
+            f"({state.repair.scope}) — "
+            f"{state.repair.reason}"
+        )
+
+    if state.patch_path:
+        lines.append("")
+        lines.append(
+            f"**Patch:** {state.patch_path}"
+        )
+        lines.append(
+            "Changes NOT applied. "
+            "Use /patch to inspect, /apply to apply "
+            "after confirmation."
+        )
+
+    lines.append("")
+    lines.append(
+        "**Результат:** "
+        f"{state.completion or state.phase.value}"
+    )
+
+    return "\n\n".join(lines)
+
+
+def render_failure_hint(state) -> str:
+    """
+    Extra hint block shown only when a run did not finish DONE.
+    """
+
+    if state.phase.value == "DONE":
+        return ""
+
+    lines: list[str] = []
 
     if state.verification is not None:
         lines.append(
@@ -89,16 +387,8 @@ def render_state(state) -> str:
             f"{state.repair.reason}"
         )
 
-    if state.patch_path:
-        lines.append(
-            f"**Patch:** {state.patch_path} "
-            "(not applied)"
-        )
-
-    lines.append(
-        f"**Результат:** "
-        f"{state.completion or state.phase.value}"
-    )
+    if not lines:
+        return ""
 
     return "\n\n".join(lines)
 
@@ -182,9 +472,32 @@ def main() -> None:
             )
             continue
 
-        if normalized == "/memories":
-            show_memory(
-                runtime.memory.get_active_memories()
+        if normalized in {"help", "/help", "?"}:
+            show_commands()
+            continue
+
+        if normalized == "/status":
+            render_status(runtime)
+            continue
+
+        if normalized == "/plan":
+            render_plan(runtime)
+            continue
+
+        if normalized in {
+            "/memory",
+            "/memories",
+        }:
+            show_memory(runtime)
+            continue
+
+        if normalized == "/patch":
+            render_patch(runtime)
+            continue
+
+        if normalized == "/apply":
+            apply_patch_with_confirmation(
+                runtime
             )
             continue
 
@@ -249,7 +562,9 @@ def main() -> None:
             )
             continue
 
-        answer = render_state(state)
+        answer = render_result(state, runtime)
+
+        hint = render_failure_hint(state)
 
         console.print()
         console.print(
@@ -257,6 +572,9 @@ def main() -> None:
             "[/bold cyan]"
         )
         console.print(Markdown(answer))
+
+        if hint:
+            console.print(Markdown(hint))
 
 
 if __name__ == "__main__":

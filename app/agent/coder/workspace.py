@@ -23,6 +23,21 @@ class Workspace:
         project_tools: ProjectTools | None = None,
     ) -> None:
         self.root = Path(root).resolve()
+
+        # Defence in depth: the CodingAgent workspace is ALWAYS the
+        # sandbox snapshot, never the host project root. Refusing the
+        # project root here means a wiring mistake can never turn the
+        # agent into a direct host-file editor.
+        from app.sandbox.paths import (
+            PROJECT_ROOT,
+        )
+
+        if self.root == PROJECT_ROOT:
+            raise ValueError(
+                "refusing the host project root as the agent "
+                "workspace"
+            )
+
         self.files = file_tools or FileTools(
             self.root
         )

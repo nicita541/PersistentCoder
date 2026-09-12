@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import re
 import shutil
 import uuid
 from datetime import datetime, timezone
@@ -245,6 +246,54 @@ class SandboxWorkspace:
             limits=limits,
         )
 
+    @classmethod
+    def open_session(
+        cls,
+        session_id: str,
+        *,
+        sandbox_root: str | Path | None = None,
+        limits=DEFAULT_LIMITS,
+    ) -> "SandboxWorkspace | None":
+        """
+        Re-open an existing sandbox session (crash recovery / resume).
+
+        Nothing is copied: the caller gets the old workspace and its
+        checkpoints so it can restore the last committed state.
+        Returns None when the session no longer exists.
+        """
+
+        if sandbox_root is not None:
+            sandbox_root = Path(sandbox_root)
+            sessions = sandbox_root / "sessions"
+            snapshots = sandbox_root / "snapshots"
+            patches = sandbox_root / "patches"
+
+        else:
+            sessions = SANDBOX_SESSIONS
+            snapshots = SANDBOX_SNAPSHOTS
+            patches = SANDBOX_PATCHES
+
+        workspace_root = (
+            sessions / session_id / "workspace"
+        )
+
+        baseline_root = snapshots / session_id
+
+        if not workspace_root.exists():
+            return None
+
+        return cls(
+            session_id=session_id,
+            workspace_root=workspace_root,
+            baseline_root=baseline_root,
+            patch_root=patches,
+            checkpoints_root=(
+                snapshots
+                / f"{session_id}__checkpoints"
+            ),
+            limits=limits,
+        )
+
     # ==================================
     # TRANSACTIONAL CHECKPOINTS
     # ==================================
@@ -344,6 +393,56 @@ class SandboxWorkspace:
             self.checkpoints_root
             / _safe_label(label)
         ).exists()
+
+    def list_checkpoints(
+        self,
+    ) -> list[str]:
+        """
+        Existing checkpoints, oldest -> newest.
+
+        Attempt labels (attempt-1, attempt-2, ...) are ordered
+        numerically, everything else lexicographically, so "latest"
+        is always the most recent attempt.
+        """
+
+        if not self.checkpoints_root.exists():
+            return []
+
+        labels = [
+            child.name
+            for child in self.checkpoints_root.iterdir()
+            if child.is_dir()
+        ]
+
+        return sorted(
+            labels,
+            key=self._checkpoint_key,
+        )
+
+    @staticmethod
+    def _checkpoint_key(
+        label: str,
+    ) -> tuple[int, int, str]:
+        match = re.fullmatch(
+            r"attempt-(\d+)",
+            label,
+        )
+
+        if match:
+            return (
+                1,
+                int(match.group(1)),
+                label,
+            )
+
+        return (0, 0, label)
+
+    def latest_checkpoint(
+        self,
+    ) -> str | None:
+        labels = self.list_checkpoints()
+
+        return labels[-1] if labels else None
 
     # ==================================
     # PATCH SAFETY
