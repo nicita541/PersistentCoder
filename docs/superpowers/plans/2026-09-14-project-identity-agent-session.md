@@ -241,7 +241,7 @@ git commit -m "feat: scope task state by project"
 - Consumes: project `StoreContext`; `DATA_ROOT / "global" / "persistent_coder.db"`.
 - Produces: `MemoryScope.GLOBAL`, `MemoryScope.PROJECT`; `MemoryStore(database_path: Path, *, scope: MemoryScope, project_id: str | None = None)`; `MemoryManager.get_active_memories() -> list[dict[str, object]]` returns explicit global rules plus only the current project's records; `remember(..., global_rule: bool = False)`.
 
-- [ ] **Step 1: Write failing scope and migration tests**
+- [x] **Step 1: Write failing scope and migration tests**
 
 ```python
 def memory_manager(project_db: Path, project_id: str, global_db: Path) -> MemoryManager:
@@ -276,13 +276,13 @@ def test_only_explicit_user_rule_becomes_global(tmp_path):
         a.remember("В проекте используется SQLite.", global_rule=True)
 ```
 
-- [ ] **Step 2: Run the tests and confirm missing scope failures**
+- [x] **Step 2: Run the tests and confirm missing scope failures**
 
 Run: `python -m pytest tests/test_memory_project_scope.py -q`
 
 Expected: FAIL because global/project stores are not separated.
 
-- [ ] **Step 3: Implement explicit memory routing**
+- [x] **Step 3: Implement explicit memory routing**
 
 ```python
 class MemoryScope(str, Enum):
@@ -303,13 +303,13 @@ class MemoryManager:
 
 Add `scope` and nullable `project_id` columns idempotently. A global insert requires `memory_type == "USER_RULE"`, `scope == "GLOBAL"`, and `project_id IS NULL`; a project insert requires the manager's project ID. Old rows retain `scope = NULL` and are excluded from new retrieval. Duplicate/supersede/merge queries operate within one scope only.
 
-- [ ] **Step 4: Run memory and context regressions**
+- [x] **Step 4: Run memory and context regressions**
 
 Run: `python -m pytest tests/test_memory_project_scope.py tests/test_memory_store.py tests/test_memory_manager.py tests/test_memory_retrieval.py tests/test_memory_merge.py tests/test_memory_conflicts.py tests/test_context_selector.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add app/memory app/context/builder.py tests/test_memory_project_scope.py tests/test_memory_store.py tests/test_memory_retrieval.py

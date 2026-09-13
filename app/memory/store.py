@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+import re
+from enum import Enum
 from pathlib import Path
 
 
@@ -13,16 +15,42 @@ DEFAULT_DATABASE_PATH = (
 )
 
 
+class MemoryScope(str, Enum):
+    GLOBAL = "GLOBAL"
+    PROJECT = "PROJECT"
+
+
+_PROJECT_ID = re.compile(r"[0-9a-f]{64}")
+
+
 class MemoryStore:
     def __init__(
         self,
         database_path: Path | None = None,
+        *,
+        scope: MemoryScope | None = None,
+        project_id: str | None = None,
     ) -> None:
         self.database_path = (
             database_path
             if database_path is not None
             else DEFAULT_DATABASE_PATH
         )
+        self.scope = scope
+        self.project_id = project_id
+
+        if scope is MemoryScope.PROJECT:
+            if (
+                project_id is None
+                or _PROJECT_ID.fullmatch(project_id) is None
+            ):
+                raise ValueError(
+                    "project memory requires a lowercase SHA-256 project_id"
+                )
+        elif project_id is not None:
+            raise ValueError(
+                "project_id is valid only for PROJECT memory scope"
+            )
 
         self.database_path.parent.mkdir(
             parents=True,
@@ -56,6 +84,9 @@ class MemoryStore:
                         PRIMARY KEY AUTOINCREMENT,
 
                     type TEXT NOT NULL,
+
+                    scope TEXT,
+                    project_id TEXT,
 
                     content TEXT NOT NULL,
 
@@ -158,6 +189,33 @@ class MemoryStore:
                     """
                 )
 
+            if "scope" not in columns:
+                connection.execute(
+                    "ALTER TABLE memories ADD COLUMN scope TEXT"
+                )
+
+            if "project_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE memories ADD COLUMN project_id TEXT"
+                )
+
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_memories_scope_project_status
+                ON memories(scope, project_id, status)
+                """
+            )
+
+    def _scope_clause(self) -> tuple[str, tuple[object, ...]]:
+        if self.scope is MemoryScope.GLOBAL:
+            return "scope = 'GLOBAL' AND project_id IS NULL", ()
+        if self.scope is MemoryScope.PROJECT:
+            return (
+                "scope = 'PROJECT' AND project_id = ?",
+                (self.project_id,),
+            )
+        return "scope IS NULL AND project_id IS NULL", ()
+
     def add_memory(
         self,
         *,
@@ -168,11 +226,21 @@ class MemoryStore:
         why: str | None = None,
         confidence: float = 1.0,
     ) -> int:
+        if (
+            self.scope is MemoryScope.GLOBAL
+            and memory_type != "USER_RULE"
+        ):
+            raise ValueError(
+                "global memory accepts only USER_RULE records"
+            )
+
         with self._connect() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO memories (
                     type,
+                    scope,
+                    project_id,
                     content,
                     why,
                     source,
@@ -189,6 +257,8 @@ class MemoryStore:
                     ?,
                     ?,
                     ?,
+                    ?,
+                    ?,
                     'ACTIVE',
                     NULL,
                     CURRENT_TIMESTAMP
@@ -196,6 +266,8 @@ class MemoryStore:
                 """,
                 (
                     memory_type,
+                    self.scope.value if self.scope is not None else None,
+                    self.project_id,
                     content,
                     why,
                     source,
@@ -227,6 +299,8 @@ class MemoryStore:
             *memory_ids,
             superseded_by,
         ]
+        scope_sql, scope_parameters = self._scope_clause()
+        parameters.extend(scope_parameters)
 
         with self._connect() as connection:
             connection.execute(
@@ -242,19 +316,31 @@ class MemoryStore:
                     id IN ({placeholders})
                     AND status = 'ACTIVE'
                     AND id != ?
+                    AND {scope_sql}
                 """,
                 parameters,
             )
 
     def get_active_memories(
         self,
+        *,
+        memory_type: str | None = None,
     ) -> list[dict[str, object]]:
+        scope_sql, scope_parameters = self._scope_clause()
+        type_sql = ""
+        parameters: list[object] = list(scope_parameters)
+        if memory_type is not None:
+            type_sql = " AND type = ?"
+            parameters.append(memory_type)
+
         with self._connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT
                     id,
                     type,
+                    scope,
+                    project_id,
                     content,
                     why,
                     source,
@@ -268,11 +354,14 @@ class MemoryStore:
                 FROM memories
 
                 WHERE status = 'ACTIVE'
+                    AND {scope_sql}
+                    {type_sql}
 
                 ORDER BY
                     importance DESC,
                     id ASC
-                """
+                """,
+                parameters,
             ).fetchall()
 
         return [
