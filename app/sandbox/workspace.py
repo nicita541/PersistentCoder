@@ -86,6 +86,10 @@ class SandboxIdentityError(RuntimeError):
     """Raised when sandbox metadata does not match its source project."""
 
 
+class SandboxResetError(RuntimeError):
+    """Raised when a sandbox reset cannot complete transactionally."""
+
+
 
 def _project_files(root: Path):
     for path in sorted(root.rglob("*")):
@@ -432,6 +436,76 @@ class SandboxWorkspace:
             metadata_path=metadata_path,
             limits=limits,
         )
+
+    def _replace_tree(
+        self,
+        source: Path,
+        destination: Path,
+    ) -> None:
+        source.replace(destination)
+
+    @staticmethod
+    def _remove_tree(path: Path) -> None:
+        if path.exists():
+            shutil.rmtree(path)
+
+    def _reset_from_source(self) -> None:
+        if self.source_project_root is None:
+            raise SandboxResetError("sandbox source project is unknown")
+
+        token = uuid.uuid4().hex
+        baseline_stage = self.baseline_root.parent / (
+            f".{self.baseline_root.name}.stage-{token}"
+        )
+        workspace_stage = self.workspace_root.parent / (
+            f".{self.workspace_root.name}.stage-{token}"
+        )
+        baseline_backup = self.baseline_root.parent / (
+            f".{self.baseline_root.name}.backup-{token}"
+        )
+        workspace_backup = self.workspace_root.parent / (
+            f".{self.workspace_root.name}.backup-{token}"
+        )
+        committed = False
+
+        try:
+            _copy_tree(self.source_project_root, baseline_stage)
+            _copy_tree(self.source_project_root, workspace_stage)
+
+            self.baseline_root.replace(baseline_backup)
+            self.workspace_root.replace(workspace_backup)
+
+            self._replace_tree(baseline_stage, self.baseline_root)
+            self._replace_tree(workspace_stage, self.workspace_root)
+
+            self._remove_tree(self.checkpoints_root)
+            self._active_checkpoint = None
+            committed = True
+        except Exception as error:
+            try:
+                self._remove_tree(self.baseline_root)
+                self._remove_tree(self.workspace_root)
+                if baseline_backup.exists():
+                    baseline_backup.replace(self.baseline_root)
+                if workspace_backup.exists():
+                    workspace_backup.replace(self.workspace_root)
+            except Exception as rollback_error:
+                raise SandboxResetError(
+                    "sandbox reset and rollback both failed"
+                ) from rollback_error
+            raise SandboxResetError("sandbox reset failed") from error
+        finally:
+            self._remove_tree(baseline_stage)
+            self._remove_tree(workspace_stage)
+            if committed:
+                self._remove_tree(baseline_backup)
+                self._remove_tree(workspace_backup)
+
+    def rebase_from_source(self) -> None:
+        self._reset_from_source()
+
+    def discard_and_recreate(self) -> None:
+        self._reset_from_source()
 
     # ==================================
     # TRANSACTIONAL CHECKPOINTS

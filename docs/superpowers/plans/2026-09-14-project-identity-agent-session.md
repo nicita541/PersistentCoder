@@ -522,7 +522,7 @@ git commit -m "feat: persist agent session lifecycle"
 - Consumes: project-bound `SandboxWorkspace`.
 - Produces: `SandboxWorkspace.rebase_from_source() -> None`; `SandboxWorkspace.discard_and_recreate() -> None`; both preserve identity and session ID while replacing baseline/workspace atomically.
 
-- [ ] **Step 1: Write failing rebase/discard tests**
+- [x] **Step 1: Write failing rebase/discard tests**
 
 ```python
 def tree_digest(root: Path) -> dict[str, bytes]:
@@ -560,23 +560,23 @@ def test_failed_rebase_restores_previous_baseline_and_workspace(workspace, monke
     assert (tree_digest(workspace.baseline_root), tree_digest(workspace.workspace_root)) == before
 ```
 
-- [ ] **Step 2: Run tests and confirm methods are absent**
+- [x] **Step 2: Run tests and confirm methods are absent**
 
 Run: `python -m pytest tests/security/test_session_rebase_discard.py -q`
 
 Expected: FAIL with missing reset methods.
 
-- [ ] **Step 3: Implement staged replacement**
+- [x] **Step 3: Implement staged replacement**
 
 Build the replacement baseline and workspace under the same project sandbox filesystem using unique temporary directory names. Only after both copies succeed, rename the current trees to backups and promote both replacements. On any promotion failure, restore both backups. Remove backups after success. `discard_and_recreate()` delegates to the same transaction because both operations establish source as the new clean baseline; the session layer distinguishes their semantic outcome.
 
-- [ ] **Step 4: Run workspace regressions**
+- [x] **Step 4: Run workspace regressions**
 
 Run: `python -m pytest tests/security/test_session_rebase_discard.py tests/security/test_transactions.py tests/security/test_sandbox_limits_and_patches.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add app/sandbox/workspace.py tests/security/test_session_rebase_discard.py
