@@ -1043,3 +1043,129 @@ button {
     background:
         var(--vscode-scrollbarSlider-hoverBackground);
 }
+
+/* =========================================
+   REAL BACKEND STATE
+========================================= */
+
+.status-dot.starting {
+    background:
+        var(
+            --vscode-editorWarning-foreground
+        );
+}
+
+.status-dot.ready {
+    background:
+        var(
+            --vscode-testing-iconPassed
+        );
+}
+
+.status-dot.error {
+    background:
+        var(
+            --vscode-testing-iconFailed
+        );
+}
+
+.status-dot.stopped {
+    background:
+        var(
+            --vscode-descriptionForeground
+        );
+}
+
+
+.agent-card.error
+.agent-card-icon {
+    color:
+        var(
+            --vscode-testing-iconFailed
+        );
+}
+
+
+.send-button:disabled {
+    opacity: 0.55;
+
+    cursor:
+        not-allowed;
+}
+
+
+#messageInput:disabled {
+    opacity: 0.7;
+
+    cursor:
+        not-allowed;
+}
+
+
+.run-result {
+    margin-top: 10px;
+
+    padding-top: 8px;
+
+    border-top:
+        1px solid
+        var(
+            --vscode-panel-border
+        );
+}
+
+
+.result-row {
+    min-height: 25px;
+
+    display: flex;
+
+    align-items:
+        flex-start;
+
+    justify-content:
+        space-between;
+
+    gap: 12px;
+
+    color:
+        var(
+            --vscode-descriptionForeground
+        );
+
+    font-size: 9px;
+}
+
+
+.result-row strong {
+    color:
+        var(
+            --vscode-foreground
+        );
+
+    text-align:
+        right;
+}
+
+
+.result-row code {
+    max-width: 70%;
+
+    overflow-wrap:
+        anywhere;
+
+    color:
+        var(
+            --vscode-textLink-foreground
+        );
+
+    font-family:
+        var(
+            --vscode-editor-font-family
+        );
+
+    font-size: 8px;
+
+    text-align:
+        right;
+}
