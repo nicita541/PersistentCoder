@@ -51,7 +51,7 @@
 - Consumes: framework `PROJECT_ROOT`, `DATA_ROOT`, and `SANDBOX_ROOT` constants.
 - Produces: `ProjectIdentity.from_source_root(source_root: str | Path) -> ProjectIdentity`; `ProjectStorage.for_identity(identity: ProjectIdentity) -> ProjectStorage`; `ProjectStorage.ensure_layout() -> None`.
 
-- [ ] **Step 1: Write failing identity and containment tests**
+- [x] **Step 1: Write failing identity and containment tests**
 
 ```python
 def test_project_identity_is_stable_for_equivalent_roots(tmp_path):
@@ -75,13 +75,13 @@ def test_project_storage_never_writes_under_target(tmp_path):
     assert storage.database_path == DATA_ROOT / "projects" / identity.project_id / "persistent_coder.db"
 ```
 
-- [ ] **Step 2: Run the tests and confirm the missing-module failure**
+- [x] **Step 2: Run the tests and confirm the missing-module failure**
 
 Run: `python -m pytest tests/test_project_identity.py -q`
 
 Expected: FAIL because `app.project_identity` and `app.storage` do not exist.
 
-- [ ] **Step 3: Implement pure identity and storage values**
+- [x] **Step 3: Implement pure identity and storage values**
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -117,13 +117,13 @@ class ProjectStorage:
 
 `ensure_layout()` must create only the database parent and the project sandbox subdirectories `sessions`, `snapshots`, `patches`, `logs`, and `tmp`. Add explicit `is_relative_to(PROJECT_ROOT)` guards before creating them.
 
-- [ ] **Step 4: Run focused tests**
+- [x] **Step 4: Run focused tests**
 
 Run: `python -m pytest tests/test_project_identity.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add app/project_identity.py app/storage.py app/sandbox/paths.py tests/test_project_identity.py
