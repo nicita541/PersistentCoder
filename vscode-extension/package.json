@@ -1,0 +1,47 @@
+{
+  "name": "persistentcoder",
+  "displayName": "PersistentCoder",
+  "description": "Local AI coding assistant",
+  "version": "0.0.1",
+  "publisher": "local",
+  "private": true,
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onView:persistentCoder.chatView"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "persistentCoder",
+          "title": "PersistentCoder",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "persistentCoder": [
+        {
+          "type": "webview",
+          "id": "persistentCoder.chatView",
+          "name": "Chat"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.5.0"
+  }
+}
