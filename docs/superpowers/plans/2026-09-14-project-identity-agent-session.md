@@ -420,7 +420,7 @@ git commit -m "feat: namespace sandbox sessions by project"
 - Consumes: `StoreContext`, `SandboxWorkspace.session_id`.
 - Produces: `SessionStatus`; `AgentSession`; `AgentSession.transition(target, *, patch_manifest_id=None)`; `SessionStore.create/get/update/list_dirty`.
 
-- [ ] **Step 1: Write failing transition and persistence tests**
+- [x] **Step 1: Write failing transition and persistence tests**
 
 ```python
 def make_session(status: SessionStatus = SessionStatus.CLEAN) -> AgentSession:
@@ -462,13 +462,13 @@ def test_session_store_is_project_scoped(tmp_path):
     assert SessionStore(context_b).get(session_id) is None
 ```
 
-- [ ] **Step 2: Run tests and confirm missing session types**
+- [x] **Step 2: Run tests and confirm missing session types**
 
 Run: `python -m pytest tests/agent/test_agent_session.py tests/test_session_store.py -q`
 
 Expected: FAIL because the session state machine and table do not exist.
 
-- [ ] **Step 3: Implement deterministic transitions and idempotent table creation**
+- [x] **Step 3: Implement deterministic transitions and idempotent table creation**
 
 ```python
 class SessionStatus(str, Enum):
@@ -499,13 +499,13 @@ ALLOWED_TRANSITIONS = {
 
 The `agent_sessions` table stores `id`, `project_id`, `canonical_source_root`, `sandbox_session_id`, `status`, nullable `active_run_id`, nullable `patch_manifest_id`, timestamps, and a monotonically increasing `version`. Updates use `WHERE id = ? AND project_id = ? AND version = ?` so stale writers fail closed.
 
-- [ ] **Step 4: Run session tests**
+- [x] **Step 4: Run session tests**
 
 Run: `python -m pytest tests/agent/test_agent_session.py tests/test_session_store.py -q`
 
 Expected: PASS, including illegal-transition and stale-version negative tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add app/agent/session.py app/tasks/session_store.py app/tasks/models.py tests/agent/test_agent_session.py tests/test_session_store.py
