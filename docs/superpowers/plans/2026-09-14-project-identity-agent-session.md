@@ -328,7 +328,7 @@ git commit -m "feat: isolate project memory"
 - Consumes: `ProjectIdentity`, `ProjectStorage.sandbox_root`.
 - Produces: `SandboxWorkspace.create(project_root, identity, storage, session_id=None)`; `SandboxWorkspace.open_session(identity, storage, session_id)`; workspace exposes `project_id` and canonical `source_project_root`.
 
-- [ ] **Step 1: Write failing namespace and mismatch tests**
+- [x] **Step 1: Write failing namespace and mismatch tests**
 
 ```python
 def project_case(tmp_path: Path, name: str):
@@ -373,13 +373,13 @@ def test_open_session_rejects_tampered_source_identity(tmp_path):
         )
 ```
 
-- [ ] **Step 2: Run the tests and confirm current global-path behavior fails**
+- [x] **Step 2: Run the tests and confirm current global-path behavior fails**
 
 Run: `python -m pytest tests/security/test_project_sandbox_isolation.py -q`
 
 Expected: FAIL because sandbox sessions currently live in global `sessions` and `snapshots` directories without identity metadata.
 
-- [ ] **Step 3: Add project-rooted paths and identity metadata**
+- [x] **Step 3: Add project-rooted paths and identity metadata**
 
 Store a UTF-8 JSON metadata file beside each session workspace:
 
@@ -394,13 +394,13 @@ Store a UTF-8 JSON metadata file beside each session workspace:
 
 `open_session` must resolve the project namespace first, validate `session_id` with `_safe_label`, load metadata, compare both ID and canonical root, and fail before reading a checkpoint on mismatch. Do not search other project namespaces for a matching session ID.
 
-- [ ] **Step 4: Run sandbox and crash-recovery tests**
+- [x] **Step 4: Run sandbox and crash-recovery tests**
 
 Run: `python -m pytest tests/security/test_project_sandbox_isolation.py tests/security/test_crash_recovery.py tests/security/test_transactions.py tests/security/test_sandbox_limits_and_patches.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add app/sandbox tests/security/test_project_sandbox_isolation.py tests/security/test_crash_recovery.py
