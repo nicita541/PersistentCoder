@@ -27,3 +27,6 @@ models/
 # VS Code extension build
 vscode-extension/node_modules/
 vscode-extension/out/
+
+# Isolated development worktrees
+.worktrees/
