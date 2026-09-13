@@ -148,7 +148,7 @@ git commit -m "feat: add canonical project identity"
 - Consumes: `ProjectIdentity.project_id`, `ProjectStorage.database_path`.
 - Produces: `StoreContext(database_path: Path, project_id: str, canonical_source_root: str)`; all store constructors accept `context: StoreContext`; run and plan records expose `project_id`.
 
-- [ ] **Step 1: Write failing store-binding tests**
+- [x] **Step 1: Write failing store-binding tests**
 
 ```python
 def test_runtime_store_recovers_only_matching_project(tmp_path):
@@ -183,13 +183,13 @@ def test_active_plan_is_project_scoped(tmp_path):
     assert store_b.get_active_plan() is None
 ```
 
-- [ ] **Step 2: Run the focused tests and confirm constructor/schema failures**
+- [x] **Step 2: Run the focused tests and confirm constructor/schema failures**
 
 Run: `python -m pytest tests/test_project_store_isolation.py -q`
 
 Expected: FAIL because `StoreContext` and project columns do not exist.
 
-- [ ] **Step 3: Add idempotent schema migrations and project filters**
+- [x] **Step 3: Add idempotent schema migrations and project filters**
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -213,13 +213,13 @@ ALTER TABLE plans ADD COLUMN project_id TEXT;
 
 New inserts always populate the binding. `get_active_plan`, `get_running_runs`, `recover_interrupted`, event queries, and every lookup used by runtime recovery add `WHERE project_id = ?`. Rows with `NULL project_id` remain untouched and cannot match. Child task/step/attempt/replan/verification rows remain transitively owned by a bound plan or run, and their public lookup methods must validate the parent plan binding before returning data.
 
-- [ ] **Step 4: Update test fixtures and run store regressions**
+- [x] **Step 4: Update test fixtures and run store regressions**
 
 Run: `python -m pytest tests/test_project_store_isolation.py tests/test_task_store.py tests/test_task_attempts.py tests/test_task_steps.py tests/test_plan_versioning.py tests/security/test_crash_recovery.py -q`
 
 Expected: PASS, including migration of old nullable schemas without assigning legacy rows to the current project.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add app/tasks tests/conftest.py tests/test_project_store_isolation.py tests/security/test_crash_recovery.py

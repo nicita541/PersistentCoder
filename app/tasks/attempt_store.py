@@ -12,6 +12,12 @@ from app.tasks.models import (
 from app.tasks.store import (
     DEFAULT_DATABASE_PATH,
 )
+from app.tasks.store_context import (
+    StoreContext,
+    owns_step,
+    owns_task,
+    split_store_binding,
+)
 
 
 class AttemptStoreError(
@@ -23,12 +29,11 @@ class AttemptStoreError(
 class AttemptStore:
     def __init__(
         self,
-        database_path: Path | None = None,
+        database_path: StoreContext | str | Path | None = None,
     ) -> None:
-        self.database_path = (
-            Path(database_path)
-            if database_path is not None
-            else DEFAULT_DATABASE_PATH
+        self.database_path, self.context = split_store_binding(
+            database_path,
+            default_database_path=DEFAULT_DATABASE_PATH,
         )
 
         self.database_path.parent.mkdir(
@@ -291,6 +296,29 @@ class AttemptStore:
             ),
         )
 
+    def _owns_attempt(
+        self,
+        connection: sqlite3.Connection,
+        attempt_id: int,
+    ) -> bool:
+        row = connection.execute(
+            "SELECT task_id, step_id FROM attempts WHERE id = ?",
+            (attempt_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if row["task_id"] is not None:
+            return owns_task(
+                connection,
+                self.context,
+                int(row["task_id"]),
+            )
+        return owns_step(
+            connection,
+            self.context,
+            int(row["step_id"]),
+        )
+
     def _start_attempt(
         self,
         *,
@@ -308,6 +336,16 @@ class AttemptStore:
 
         try:
             with self._connect() as connection:
+                target_owned = (
+                    owns_task(connection, self.context, target_id)
+                    if target_type is AttemptTargetType.TASK
+                    else owns_step(connection, self.context, target_id)
+                )
+                if not target_owned:
+                    raise AttemptStoreError(
+                        f"unknown {target_type.value.lower()}: {target_id}"
+                    )
+
                 target = connection.execute(
                     f"""
                     SELECT
@@ -467,6 +505,9 @@ class AttemptStore:
         attempt_id: int,
     ) -> AttemptRecord | None:
         with self._connect() as connection:
+            if not self._owns_attempt(connection, attempt_id):
+                return None
+
             row = connection.execute(
                 """
                 SELECT *
@@ -488,6 +529,9 @@ class AttemptStore:
         step_id: int,
     ) -> list[AttemptRecord]:
         with self._connect() as connection:
+            if not owns_step(connection, self.context, step_id):
+                return []
+
             rows = connection.execute(
                 """
                 SELECT *
@@ -508,6 +552,9 @@ class AttemptStore:
         task_id: int,
     ) -> list[AttemptRecord]:
         with self._connect() as connection:
+            if not owns_task(connection, self.context, task_id):
+                return []
+
             rows = connection.execute(
                 """
                 SELECT *
@@ -554,6 +601,11 @@ class AttemptStore:
             )
 
         with self._connect() as connection:
+            if not self._owns_attempt(connection, attempt_id):
+                raise AttemptStoreError(
+                    f"unknown attempt: {attempt_id}"
+                )
+
             row = connection.execute(
                 """
                 SELECT status

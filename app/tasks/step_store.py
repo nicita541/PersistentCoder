@@ -12,6 +12,12 @@ from app.tasks.models import (
 from app.tasks.store import (
     DEFAULT_DATABASE_PATH,
 )
+from app.tasks.store_context import (
+    StoreContext,
+    owns_step,
+    owns_task,
+    split_store_binding,
+)
 
 
 class StepStoreError(
@@ -23,12 +29,11 @@ class StepStoreError(
 class StepStore:
     def __init__(
         self,
-        database_path: Path | None = None,
+        database_path: StoreContext | str | Path | None = None,
     ) -> None:
-        self.database_path = (
-            Path(database_path)
-            if database_path is not None
-            else DEFAULT_DATABASE_PATH
+        self.database_path, self.context = split_store_binding(
+            database_path,
+            default_database_path=DEFAULT_DATABASE_PATH,
         )
 
         self.database_path.parent.mkdir(
@@ -195,16 +200,7 @@ class StepStore:
             )
 
         with self._connect() as connection:
-            task_exists = connection.execute(
-                """
-                SELECT id
-                FROM tasks
-                WHERE id = ?
-                """,
-                (task_id,),
-            ).fetchone()
-
-            if task_exists is None:
+            if not owns_task(connection, self.context, task_id):
                 raise StepStoreError(
                     f"unknown task: {task_id}"
                 )
@@ -394,6 +390,9 @@ class StepStore:
         task_id: int,
     ) -> list[StepRecord]:
         with self._connect() as connection:
+            if not owns_task(connection, self.context, task_id):
+                return []
+
             rows = connection.execute(
                 """
                 SELECT *
@@ -414,6 +413,9 @@ class StepStore:
         step_id: int,
     ) -> StepRecord | None:
         with self._connect() as connection:
+            if not owns_step(connection, self.context, step_id):
+                return None
+
             row = connection.execute(
                 """
                 SELECT *
@@ -437,7 +439,13 @@ class StepStore:
         step_id: int | None,
     ) -> None:
         with self._connect() as connection:
+            if not owns_task(connection, self.context, task_id):
+                raise StepStoreError(f"unknown task: {task_id}")
+
             if step_id is not None:
+                if not owns_step(connection, self.context, step_id):
+                    raise StepStoreError(f"unknown step: {step_id}")
+
                 row = connection.execute(
                     """
                     SELECT
@@ -486,6 +494,9 @@ class StepStore:
         status: StepStatus,
     ) -> None:
         with self._connect() as connection:
+            if not owns_step(connection, self.context, step_id):
+                raise StepStoreError(f"unknown step: {step_id}")
+
             if (
                 status
                 is StepStatus.IN_PROGRESS
@@ -567,6 +578,9 @@ class StepStore:
         verification_evidence: list[str],
     ) -> None:
         with self._connect() as connection:
+            if not owns_step(connection, self.context, step_id):
+                raise StepStoreError(f"unknown step: {step_id}")
+
             connection.execute(
                 """
                 UPDATE steps
@@ -603,6 +617,9 @@ class StepStore:
         failure_reason: str | None = None,
     ) -> None:
         with self._connect() as connection:
+            if not owns_step(connection, self.context, step_id):
+                raise StepStoreError(f"unknown step: {step_id}")
+
             connection.execute(
                 """
                 UPDATE steps

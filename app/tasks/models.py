@@ -236,6 +236,9 @@ class PlanRecord:
     created_at: str
     updated_at: str
 
+    project_id: str | None = None
+    canonical_source_root: str | None = None
+
 class ReplanScope(str, Enum):
     ACTION = "ACTION"
     STEP = "STEP"
