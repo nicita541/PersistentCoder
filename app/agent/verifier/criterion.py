@@ -59,6 +59,26 @@ def classify_criterion(
     return "unknown"
 
 
+def is_test_file(
+    path: str,
+) -> bool:
+    """
+    True for Python test files (test_x.py / x_test.py).
+    """
+
+    token = str(path or "").replace("\\", "/")
+
+    if not token.endswith(".py"):
+        return False
+
+    stem = token.split("/")[-1][:-3].casefold()
+
+    return (
+        stem.startswith("test_")
+        or stem.endswith("_test")
+    )
+
+
 class CriterionEvaluator:
     """
     Maps each success criterion to an AUTHORITATIVE check executed
@@ -94,10 +114,22 @@ class CriterionEvaluator:
         workspace,
         command_runner,
         python: str = "python",
+        test_targets=None,
     ) -> None:
         self.workspace = workspace
         self.command_runner = command_runner
         self.python = python
+
+        # Test files this verification should target when a criterion
+        # says "tests pass" without naming one: the test files the
+        # attempt actually created or changed. Running a whole
+        # repository suite would be wrong here (and would fail on
+        # unrelated project tests).
+        self.test_targets: list[str] = [
+            str(target)
+            for target in (test_targets or [])
+        ]
+
         self._command_cache: dict[
             str,
             tuple[bool, str],
@@ -373,6 +405,30 @@ class CriterionEvaluator:
 
         return None
 
+    def _default_test_target(self) -> str | None:
+        """
+        Test file changed by this attempt, when the criterion itself
+        does not name one. Only real, existing sandbox files count.
+        """
+
+        for target in self.test_targets:
+            token = str(target).replace("\\", "/").lstrip("./")
+
+            if not is_test_file(token):
+                continue
+
+            if self.workspace is not None:
+                try:
+                    if not self.workspace.exists(token):
+                        continue
+
+                except Exception:
+                    continue
+
+            return token
+
+        return None
+
     def _pytest(
         self,
         criterion: str,
@@ -386,6 +442,9 @@ class CriterionEvaluator:
             )
 
         target = self._test_target(criterion)
+
+        if not target:
+            target = self._default_test_target()
 
         command = f"{self.python} -m pytest -q"
 

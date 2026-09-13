@@ -379,6 +379,68 @@ class RuntimeStore:
 
         return [dict(row) for row in rows]
 
+    def event_timeline(
+        self,
+        run_id: int,
+    ) -> list[dict[str, object]]:
+        """
+        Per-stage durations for one run.
+
+        Uses the millisecond timestamp the runtime writes into each
+        event payload, falling back to the second-resolution
+        created_at column. This is how a slow stage is located
+        without guessing.
+        """
+
+        timeline: list[dict[str, object]] = []
+
+        previous_ms: int | None = None
+
+        for row in self.get_events(run_id):
+            payload = row.get("payload")
+
+            stamp: int | None = None
+
+            if isinstance(payload, str):
+                try:
+                    data = json.loads(payload)
+
+                except ValueError:
+                    data = {}
+
+                candidate = data.get("ts_ms")
+
+                if isinstance(candidate, int):
+                    stamp = candidate
+
+            delta = (
+                None
+                if (
+                    stamp is None
+                    or previous_ms is None
+                )
+                else stamp - previous_ms
+            )
+
+            timeline.append(
+                {
+                    "event": row.get("event_type"),
+                    "at": row.get("created_at"),
+                    "ts_ms": stamp,
+                    "since_previous_ms": delta,
+                    "task_id": row.get("task_id"),
+                    "step_id": row.get("step_id"),
+                    "attempt_id": row.get(
+                        "attempt_id"
+                    ),
+                }
+            )
+
+            if stamp is not None:
+                previous_ms = stamp
+
+        return timeline
+
     def count_events(
         self,
         run_id: int,

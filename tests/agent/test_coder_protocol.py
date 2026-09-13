@@ -140,6 +140,179 @@ def test_json_without_any_action_is_rejected(tmp_path):
     assert "unknown action" in result.failure_reason
 
 
+def test_describe_only_envelope_is_reprompted(tmp_path):
+    llm = FakeLLM(
+        [
+            "```json\n"
+            '{"action": "create", "file": "calculator.py"}'
+            "\n```",
+            coder_envelope(
+                path="calculator.py",
+                content="def add(a, b):\n    return a + b\n",
+            ),
+        ]
+    )
+
+    agent = _agent(tmp_path, llm)
+
+    result = agent.execute(FakeTask())
+
+    assert result.ok is True
+    assert (tmp_path / "calculator.py").exists()
+
+    second_prompt = "\n".join(
+        str(message.get("content", ""))
+        for message in llm.calls[1]
+    )
+
+    assert "NO file content" in second_prompt
+    assert "ACTION PROTOCOL" in second_prompt
+
+
+def test_create_action_with_file_and_content_is_accepted(tmp_path):
+    llm = FakeLLM(
+        [
+            json.dumps(
+                {
+                    "action": "create",
+                    "file": "calc.py",
+                    "content": "VALUE = 1\n",
+                }
+            )
+        ]
+    )
+
+    agent = _agent(tmp_path, llm)
+
+    result = agent.execute(FakeTask())
+
+    assert result.ok is True
+    assert (tmp_path / "calc.py").exists()
+
+
+def test_describe_only_envelope_fails_after_bounded_retries(
+    tmp_path,
+):
+    llm = FakeLLM(
+        default=json.dumps(
+            {"action": "create", "file": "calculator.py"}
+        )
+    )
+
+    agent = _agent(tmp_path, llm)
+
+    result = agent.execute(FakeTask())
+
+    assert result.ok is False
+    assert "no files or commands" in result.summary
+    assert not (tmp_path / "calculator.py").exists()
+
+
+def test_markdown_fenced_envelope_is_accepted(tmp_path):
+    llm = FakeLLM(
+        [
+            "```json\n"
+            + json.dumps(
+                {
+                    "action": "edit",
+                    "files": [
+                        {
+                            "path": "calc.py",
+                            "content": (
+                                "def add(a, b):\n"
+                                "    return a + b\n"
+                            ),
+                        }
+                    ],
+                    "commands": [],
+                }
+            )
+            + "\n```"
+        ]
+    )
+
+    agent = _agent(tmp_path, llm)
+
+    result = agent.execute(FakeTask())
+
+    # A fenced but valid envelope is normalized, not rejected.
+    assert result.ok is True
+    assert (tmp_path / "calc.py").exists()
+
+
+def test_fenced_garbage_is_still_rejected(tmp_path):
+    llm = FakeLLM(
+        default="```json\nnot json at all\n```"
+    )
+
+    agent = _agent(tmp_path, llm)
+
+    result = agent.execute(FakeTask())
+
+    assert result.ok is False
+    assert result.failure_reason == "invalid model response"
+
+
+def test_content_key_synonyms_are_accepted(tmp_path):
+    llm = FakeLLM(
+        [
+            json.dumps(
+                {
+                    "path": "calc.py",
+                    "code": "def add(a, b):\n    return a + b\n",
+                }
+            )
+        ]
+    )
+
+    agent = _agent(tmp_path, llm)
+
+    result = agent.execute(FakeTask())
+
+    assert result.ok is True
+    assert "def add" in (
+        tmp_path / "calc.py"
+    ).read_text(encoding="utf-8")
+
+
+def test_path_to_content_mapping_is_accepted(tmp_path):
+    llm = FakeLLM(
+        [
+            json.dumps(
+                {
+                    "files": {
+                        "pkg/mod.py": "VALUE = 1\n",
+                    }
+                }
+            )
+        ]
+    )
+
+    agent = _agent(tmp_path, llm)
+
+    result = agent.execute(FakeTask())
+
+    assert result.ok is True
+    assert (tmp_path / "pkg" / "mod.py").exists()
+
+
+def test_unknown_action_is_not_guessed(tmp_path):
+    llm = FakeLLM(
+        default=json.dumps(
+            {"summary": "I would add the function"}
+        )
+    )
+
+    agent = _agent(tmp_path, llm)
+
+    result = agent.execute(FakeTask())
+
+    # No files, no recognizable action: nothing is written.
+    assert result.ok is False
+    assert "unknown action" in result.failure_reason
+    assert list(tmp_path.glob("*.py")) == []
+
+
 def test_read_before_edit_is_still_enforced(tmp_path):
     (tmp_path / "out.txt").write_text(
         "old",

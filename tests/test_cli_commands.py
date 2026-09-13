@@ -122,6 +122,47 @@ def test_status_and_plan_and_patch_after_a_run(
     assert "NOT applied" in text
 
 
+def test_timeline_reports_stage_durations(
+    tmp_path,
+    monkeypatch,
+):
+    runtime = _runtime(tmp_path)
+
+    state = runtime.run("Создай artifact.txt")
+
+    assert state.phase is AgentPhase.DONE
+
+    timeline = runtime.timeline()
+
+    assert timeline
+    assert any(
+        entry["event"] == "plan"
+        for entry in timeline
+    )
+
+    # Durations are millisecond deltas from the durable event log.
+    deltas = [
+        entry["since_previous_ms"]
+        for entry in timeline
+        if entry["since_previous_ms"] is not None
+    ]
+
+    assert deltas
+    assert all(
+        isinstance(delta, int) and delta >= 0
+        for delta in deltas
+    )
+
+    buffer = _capture(monkeypatch)
+
+    main_module.render_timeline(runtime)
+
+    text = buffer.getvalue()
+
+    assert "TIMELINE" in text
+    assert "plan" in text
+
+
 def test_apply_is_refused_without_a_verified_done_run(
     tmp_path,
     monkeypatch,

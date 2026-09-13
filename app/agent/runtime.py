@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from app.agent.coder.agent import CodingAgent
@@ -382,6 +383,7 @@ class AgentRuntime:
             system_prompt=self.system_prompt,
             command_runner=self.command_runner,
             known_files=self.known_files,
+            on_event=self.events.emit,
         )
 
         self.coder = CodingAgent(self.executor)
@@ -1109,6 +1111,25 @@ class AgentRuntime:
             "preview": preview,
         }
 
+    def timeline(
+        self,
+        run_id: int | None = None,
+    ) -> list[dict[str, object]]:
+        """
+        Stage durations of a run (Шаг 6: где именно тратится время).
+        """
+
+        target = (
+            run_id if run_id is not None else self.last_run_id
+        )
+
+        if target is None:
+            return []
+
+        return self.runtime_store.event_timeline(
+            int(target)
+        )
+
     def _persist_event(self, event) -> None:
         """
         Persist a compact event record (no prompts / file contents).
@@ -1124,6 +1145,15 @@ class AgentRuntime:
         payload = event.payload or {}
 
         try:
+            # Millisecond stamp: stage durations are read back from
+            # the durable event log (no separate timing subsystem).
+            payload = dict(payload)
+
+            payload.setdefault(
+                "ts_ms",
+                int(time.time() * 1000),
+            )
+
             self.runtime_store.update_run(
                 run_id,
                 plan_id=payload.get("plan_id"),

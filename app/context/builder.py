@@ -15,16 +15,23 @@ ACTION_PROTOCOL = (
     '1) list sandbox files: {"action": "list", "pattern": "**/*.py"}\n'
     '2) read one file:      {"action": "read", "path": "relative/file.py"}\n'
     '3) search the repo:    {"action": "search", "query": "def add"}\n'
-    '4) create/update files: {"action": "edit",\n'
+    "4) create/update files: {\"action\": \"edit\",\n"
     '     "files": [{"path": "relative/file.py", '
     '"content": "COMPLETE new file content"}],\n'
-    '     "commands": ["python -m pytest -q"]}\n'
+    '     "commands": ["python -m pytest -q test_your_module.py"]}\n'
     "Rules:\n"
     "- paths are always RELATIVE, never absolute;\n"
     "- an existing file must be READ in this task before it is "
     "edited;\n"
     '- "content" is the COMPLETE new file content, not a diff;\n'
-    "- commands run only inside the sandbox container."
+    "- keep every file SHORT and focused on the current step: only "
+    "the requested functions. A reply that is cut off before the "
+    "closing brace is an invalid reply;\n"
+    "- one file per reply is enough; do the rest in later steps;\n"
+    "- commands run only inside the sandbox container;\n"
+    "- run only the tests related to your change (name the test "
+    "files explicitly); never run an unrelated whole-repository "
+    "test suite."
 )
 
 

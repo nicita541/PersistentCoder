@@ -7,6 +7,7 @@ from app.agent.state import (
 )
 from app.agent.verifier.criterion import (
     CriterionEvaluator,
+    is_test_file,
 )
 from app.agent.verifier.evidence import (
     EvidenceCollector,
@@ -143,6 +144,16 @@ class VerificationAgent:
             )
 
         criteria = self._criteria_for(task, step)
+
+        # Authoritative pytest scope: the test files this attempt
+        # actually changed (never the whole repository by accident).
+        self.criteria.test_targets = [
+            artifact
+            for artifact in (
+                execution.artifacts or []
+            )
+            if is_test_file(artifact)
+        ]
 
         if not criteria:
             return VerificationResult(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
 
 # ==========================================
@@ -14,15 +15,18 @@ class ContextLimits:
     """
     Bounds for repository context selection.
 
-    A small local model must never receive the whole repository.
+    A small local model must never receive the whole repository, and
+    a SHORT prompt matters twice: weak models follow the action
+    protocol far better with it, and every extra kilobyte costs
+    prefill time on CPU.
     """
 
-    max_candidate_files: int = 80
-    max_selected_files: int = 6
-    max_file_bytes: int = 8_000
-    max_total_context_bytes: int = 24_000
-    max_search_terms: int = 6
-    max_search_results: int = 24
+    max_candidate_files: int = 40
+    max_selected_files: int = 3
+    max_file_bytes: int = 3_000
+    max_total_context_bytes: int = 7_000
+    max_search_terms: int = 4
+    max_search_results: int = 16
 
 
 DEFAULT_CONTEXT_LIMITS = ContextLimits()
@@ -473,6 +477,31 @@ class RepoContextSelector:
         return selected
 
 
+    def _listing_text(
+        self,
+        paths: list[str],
+    ) -> str:
+        if not paths:
+            return ""
+
+        lines = [
+            "RELEVANT PROJECT FILES (paths only):"
+        ]
+
+        lines.extend(
+            f"- {path}"
+            for path in paths[
+                : self.limits.max_candidate_files
+            ]
+        )
+
+        lines.append(
+            "No existing file was referenced by this task, so no "
+            "file content is included. READ a file before editing it."
+        )
+
+        return "\n".join(lines)
+
     def select(
         self,
         *,
@@ -506,6 +535,81 @@ class RepoContextSelector:
             touched=touched,
             extra=extra,
         )
+
+        text = self.task_text(
+            task=task,
+            step=step,
+            feedback=feedback,
+            extra=extra,
+        )
+
+        explicit = self.explicit_paths(text) | {
+            _normalize_path(path)
+            for path in explicit_paths
+        }
+
+        if explicit:
+            # Reference-driven: include ONLY the referenced files
+            # (when they exist), their test counterparts and files
+            # already touched in this run. Unrelated search hits stay
+            # out of the prompt entirely.
+            allowed: list[str] = []
+
+            existing = set(
+                self.project.list_files()
+            )
+
+            touched_set = {
+                _normalize_path(path)
+                for path in touched
+            }
+
+            for path in explicit:
+                if path in existing:
+                    allowed.append(path)
+
+            for candidate in paths:
+                if candidate in touched_set:
+                    allowed.append(candidate)
+
+            stems = {
+                Path(path).stem.casefold()
+                for path in allowed
+            }
+
+            for candidate in paths:
+                if candidate in allowed:
+                    continue
+
+                stem = Path(candidate).stem.casefold()
+
+                if not stem.startswith("test_"):
+                    continue
+
+                remainder = stem[
+                    len("test_"):
+                ]
+
+                if any(
+                    declared in remainder
+                    or remainder in declared
+                    for declared in stems
+                ):
+                    allowed.append(candidate)
+
+            paths = allowed[
+                : self.limits.max_selected_files
+            ]
+
+        else:
+            # The task references no existing file: send the relevant
+            # PATHS only. Dumping unrelated file bodies makes a small
+            # model "helpfully" rewrite them.
+            return RepoContext(
+                files=(),
+                text=self._listing_text(paths),
+                candidates=tuple(candidates),
+            )
 
         files: list[str] = []
         rendered: list[str] = []

@@ -154,6 +154,60 @@ def test_selector_truncates_large_files(tmp_path):
     assert len(context.text.encode("utf-8")) < 5000
 
 
+def test_referenced_task_excludes_unrelated_search_hits(tmp_path):
+    root = _make_project(tmp_path)
+
+    # An unrelated module that mentions the same identifier.
+    (root / "src" / "billing" / "exporter.py").write_text(
+        "def export_csv(rows):\n"
+        "    # UserService.authenticate is mentioned here too\n"
+        "    return ';'.join(rows)\n",
+        encoding="utf-8",
+    )
+
+    builder = ContextBuilder(selector=_selector(root))
+
+    task = _Task(
+        "Исправить падение UserService.authenticate",
+        "Падает в src/users/service.py",
+        ["tests pass"],
+    )
+
+    content = builder.build_task_messages(
+        task=task
+    )[-1]["content"]
+
+    # The referenced file and its test are included...
+    assert "FILE: src/users/service.py" in content
+    assert "test_user_service.py" in content
+
+    # ... but an unrelated search hit's body is not.
+    assert "def export_csv" not in content
+
+
+def test_no_referenced_file_means_no_file_content(tmp_path):
+    root = _make_project(tmp_path)
+
+    builder = ContextBuilder(selector=_selector(root))
+
+    task = _Task(
+        "Create a calculator module with add and subtract",
+        "Add pytest tests for both functions.",
+        ["tests pass"],
+    )
+
+    content = builder.build_task_messages(
+        task=task
+    )[-1]["content"]
+
+    # No unrelated file body is dumped into the prompt: either a
+    # paths-only listing or nothing at all.
+    assert "def export_csv" not in content
+    assert "class UserService" not in content
+    assert "def authenticate" not in content
+    assert "FILE: " not in content
+
+
 def test_context_builder_uses_relevance_selection(tmp_path):
     root = _make_project(tmp_path)
 

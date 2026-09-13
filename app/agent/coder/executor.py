@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from app.agent.state import (
     CommandExecution,
     ExecutionResult,
@@ -19,6 +21,77 @@ from app.context.builder import ACTION_PROTOCOL
 
 class CodeExecutorError(RuntimeError):
     pass
+
+
+# Keys that unambiguously carry a file's full content when the model
+# also names a relative path. Accepting them is normalization, not
+# guessing: validation (path policy, limits, observe-before-edit)
+# still runs before anything is written.
+CONTENT_KEYS = (
+    "content",
+    "code",
+    "file_content",
+    "source",
+    "body",
+    "text",
+    "new_content",
+)
+
+
+def strip_markdown_fence(
+    answer: str,
+) -> str:
+    """
+    Small models very often wrap an otherwise valid JSON envelope in
+    a markdown code fence. Stripping the fence is deterministic
+    normalization, not guessing: the object itself is still fully
+    validated before anything is written.
+    """
+
+    text = (answer or "").strip()
+
+    if not text.startswith("```"):
+        return text
+
+    first_newline = text.find("\n")
+
+    if first_newline == -1:
+        return text
+
+    body = text[first_newline + 1:]
+
+    stripped = body.rstrip()
+
+    if stripped.endswith("```"):
+        stripped = stripped[:-3]
+
+    return stripped.strip()
+
+
+def _content_key(
+    proposal: dict[str, object],
+) -> str | None:
+    for key in CONTENT_KEYS:
+        if isinstance(proposal.get(key), str):
+            return key
+
+    return None
+
+
+def _normalize_files(
+    files: object,
+) -> object:
+    """
+    Accept the mapping form {"relative/path": "content"} as well.
+    """
+
+    if isinstance(files, dict):
+        return [
+            {"path": path, "content": content}
+            for path, content in files.items()
+        ]
+
+    return files
 
 
 # Bounded corrective re-prompts for a malformed action envelope.
@@ -56,6 +129,7 @@ class CodeExecutor:
         command_runner=None,
         limits=DEFAULT_LIMITS,
         known_files=None,
+        on_event=None,
     ) -> None:
         self.workspace = workspace
         self.llm = llm
@@ -66,6 +140,9 @@ class CodeExecutor:
         self.command_runner = command_runner
         self.limits = limits
 
+        # Optional progress/timing sink (Agent Layer event bus).
+        self.on_event = on_event
+
         # Paths the agent itself created during this session. These
         # are already "known" and do not require an explicit read
         # before a later attempt may rewrite them.
@@ -74,6 +151,24 @@ class CodeExecutor:
             if known_files is not None
             else set()
         )
+
+    def _notify(
+        self,
+        name: str,
+        payload: dict[str, object],
+    ) -> None:
+        """
+        Report stage progress/timing. Never breaks the tool loop.
+        """
+
+        if self.on_event is None:
+            return
+
+        try:
+            self.on_event(name, payload)
+
+        except Exception:
+            pass
 
     def _build_messages(
         self,
@@ -166,11 +261,41 @@ class CodeExecutor:
         transcript: list[str] = []
         envelope_errors = 0
 
-        for _ in range(self.limits.max_tool_iterations):
+        for iteration in range(
+            1,
+            self.limits.max_tool_iterations + 1,
+        ):
+            context_started = time.time()
+
             messages = self._build_messages(
                 task,
                 step,
                 feedback,
+            )
+
+            self._notify(
+                "context_selection",
+                {
+                    "iteration": iteration,
+                    "duration_ms": int(
+                        (
+                            time.time()
+                            - context_started
+                        )
+                        * 1000
+                    ),
+                    "prompt_chars": sum(
+                        len(
+                            str(
+                                message.get(
+                                    "content",
+                                    "",
+                                )
+                            )
+                        )
+                        for message in messages
+                    ),
+                },
             )
 
             if transcript:
@@ -185,9 +310,28 @@ class CodeExecutor:
                 ]
 
             try:
+                llm_started = time.time()
+
                 raw_answer = self.llm.chat(
                     messages,
                     max_new_tokens=self.max_new_tokens,
+                )
+
+                self._notify(
+                    "llm_tool_iteration",
+                    {
+                        "iteration": iteration,
+                        "duration_ms": int(
+                            (
+                                time.time()
+                                - llm_started
+                            )
+                            * 1000
+                        ),
+                        "answer_chars": len(
+                            raw_answer or ""
+                        ),
+                    },
                 )
 
             except Exception as exc:
@@ -204,7 +348,9 @@ class CodeExecutor:
             )
 
             try:
-                proposal = extract_json_object(answer)
+                proposal = extract_json_object(
+                    strip_markdown_fence(answer)
+                )
 
             except ValueError:
                 envelope_errors += 1
@@ -223,7 +369,12 @@ class CodeExecutor:
 
                 transcript.append(
                     "SYSTEM FEEDBACK: the previous reply was "
-                    "not a valid JSON action envelope.\n"
+                    "not a valid JSON object. It was probably cut "
+                    "off before the closing brace because the file "
+                    "was too long.\n"
+                    "Reply again with a SMALLER file (only what "
+                    "the current step needs) as ONE complete JSON "
+                    "object.\n"
                     + ACTION_PROTOCOL
                 )
 
@@ -245,6 +396,37 @@ class CodeExecutor:
                 proposal = self._normalize_proposal(
                     proposal
                 )
+
+                if (
+                    "files" not in proposal
+                    and "commands" not in proposal
+                ):
+                    # Valid JSON, but the model described WHAT it
+                    # wants instead of providing the payload (very
+                    # common with "create"/"file" shapes). Nothing is
+                    # written: ask for the complete content instead.
+                    envelope_errors += 1
+
+                    if (
+                        envelope_errors
+                        > MAX_ENVELOPE_RETRIES
+                    ):
+                        return self._fail(
+                            "action envelope has no "
+                            "files or commands",
+                            "empty action envelope",
+                            ["empty_action_envelope"],
+                            observed,
+                        )
+
+                    transcript.append(
+                        "SYSTEM FEEDBACK: the reply described an "
+                        "action but contained NO file content. "
+                        "Reply again with the COMPLETE content:\n"
+                        + ACTION_PROTOCOL
+                    )
+
+                    continue
 
                 error = self._validate_envelope(
                     proposal,
@@ -368,14 +550,19 @@ class CodeExecutor:
 
         # Single-file shapes:
         #   {"path": "...", "content": "..."}
+        #   {"path": "...", "code": "..."}
         #   {"file": {"path": "...", "content": "..."}}
         if (
             isinstance(proposal.get("path"), str)
-            and "content" in proposal
+            and _content_key(proposal)
         ):
             return "edit"
 
         if isinstance(proposal.get("file"), dict):
+            return "edit"
+
+        # A dict mapping relative paths to their full content.
+        if isinstance(proposal.get("files"), dict):
             return "edit"
 
         # Search shapes.
@@ -401,20 +588,33 @@ class CodeExecutor:
         ):
             entry = proposal.get("file")
 
+            if isinstance(entry, str):
+                # {"action": "create", "file": "a.py",
+                #  "content": "..."}
+                key = _content_key(proposal)
+
+                if key:
+                    entry = {
+                        "path": entry,
+                        "content": proposal[key],
+                    }
+
+                else:
+                    entry = None
+
             if not isinstance(entry, dict):
+                key = _content_key(proposal)
+
                 if (
                     isinstance(
                         proposal.get("path"),
                         str,
                     )
-                    and "content" in proposal
+                    and key
                 ):
                     entry = {
                         "path": proposal["path"],
-                        "content": proposal.get(
-                            "content",
-                            "",
-                        ),
+                        "content": proposal[key],
                     }
 
                 else:
@@ -427,7 +627,14 @@ class CodeExecutor:
 
                 return normalized
 
-        return proposal
+        normalized = dict(proposal)
+
+        if normalized.get("files") is not None:
+            normalized["files"] = _normalize_files(
+                normalized["files"]
+            )
+
+        return normalized
 
     def _normalize(
         self,
@@ -829,10 +1036,29 @@ class CodeExecutor:
                         )
 
                     try:
+                        command_started = time.time()
+
                         result = (
                             self.command_runner.run(
                                 command
                             )
+                        )
+
+                        self._notify(
+                            "docker_command",
+                            {
+                                "command": command[:200],
+                                "returncode": (
+                                    result.returncode
+                                ),
+                                "duration_ms": int(
+                                    (
+                                        time.time()
+                                        - command_started
+                                    )
+                                    * 1000
+                                ),
+                            },
                         )
 
                     except PolicyViolation as error:

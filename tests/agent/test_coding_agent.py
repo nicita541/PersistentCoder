@@ -99,6 +99,68 @@ def test_command_runs_through_injected_sandbox_runner(
 
 
 
+def test_executor_reports_stage_timings(tmp_path):
+    events: list[tuple[str, dict]] = []
+
+    workspace = Workspace(tmp_path)
+
+    executor = CodeExecutor(
+        workspace=workspace,
+        llm=FakeLLM(
+            [coder_envelope(path="out.txt", content="hi")]
+        ),
+        context=ContextBuilder(project=workspace.project),
+        on_event=lambda name, payload: events.append(
+            (name, payload)
+        ),
+    )
+
+    result = executor.execute(FakeTask())
+
+    assert result.ok is True
+
+    names = [name for name, _payload in events]
+
+    assert "context_selection" in names
+    assert "llm_tool_iteration" in names
+
+    for name, payload in events:
+        assert isinstance(payload.get("duration_ms"), int)
+        assert payload["duration_ms"] >= 0
+
+
+def test_docker_command_timing_is_reported(tmp_path):
+    events: list[tuple[str, dict]] = []
+
+    workspace = Workspace(tmp_path)
+
+    executor = CodeExecutor(
+        workspace=workspace,
+        llm=FakeLLM(
+            [coder_envelope(command="python -m pytest -q")]
+        ),
+        context=ContextBuilder(project=workspace.project),
+        command_runner=RecordingCommandRunner(stdout="1 passed"),
+        on_event=lambda name, payload: events.append(
+            (name, payload)
+        ),
+    )
+
+    result = executor.execute(FakeTask())
+
+    assert result.ok is True
+
+    docker = [
+        payload
+        for name, payload in events
+        if name == "docker_command"
+    ]
+
+    assert docker
+    assert docker[0]["returncode"] == 0
+    assert docker[0]["duration_ms"] >= 0
+
+
 def test_invalid_json_is_not_fake_success(tmp_path):
     llm = FakeLLM(["this is not json"])
 

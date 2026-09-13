@@ -33,6 +33,10 @@ def show_commands() -> None:
         "верификация[/dim]"
     )
     console.print(
+        "[dim]/timeline — длительности стадий последнего "
+        "прогона[/dim]"
+    )
+    console.print(
         "[dim]/apply — применить verified patch "
         "(нужно подтверждение)[/dim]"
     )
@@ -192,6 +196,42 @@ def render_patch(runtime) -> None:
     console.print(
         "[dim]Changes NOT applied automatically.[/dim]"
     )
+
+
+def render_timeline(runtime) -> None:
+    """
+    Stage durations of the last run: where the time actually went.
+    """
+
+    timeline = runtime.timeline()
+
+    console.print()
+    console.print(
+        "[bold cyan]TIMELINE[/bold cyan]"
+    )
+
+    if not timeline:
+        console.print(
+            "[yellow]Нет данных о прогоне.[/yellow]"
+        )
+        return
+
+    for entry in timeline:
+        delta = entry.get("since_previous_ms")
+
+        delta_text = (
+            f"{delta} ms"
+            if delta is not None
+            else "-"
+        )
+
+        console.print(
+            f"{entry['event']:<24} "
+            f"+{delta_text:<10} "
+            f"(task={entry.get('task_id')} "
+            f"step={entry.get('step_id')} "
+            f"attempt={entry.get('attempt_id')})"
+        )
 
 
 def apply_patch_with_confirmation(runtime) -> None:
@@ -393,6 +433,64 @@ def render_failure_hint(state) -> str:
     return "\n\n".join(lines)
 
 
+def make_progress_reporter(console):
+    """
+    Live stage progress for the interactive user.
+
+    A CPU-only local model can spend minutes in one tool iteration:
+    silence is unacceptable, so every stage reports itself.
+    """
+
+    def report(event) -> None:
+        payload = event.payload or {}
+
+        if event.name == "llm_tool_iteration":
+            console.print(
+                "[dim]llm iteration "
+                f"{payload.get('iteration')}: "
+                f"{payload.get('duration_ms')} ms, "
+                f"{payload.get('answer_chars')} chars"
+                "[/dim]"
+            )
+            return
+
+        if event.name == "context_selection":
+            console.print(
+                "[dim]context selection: "
+                f"{payload.get('duration_ms')} ms, "
+                f"prompt {payload.get('prompt_chars')} chars"
+                "[/dim]"
+            )
+            return
+
+        if event.name == "docker_command":
+            console.print(
+                "[dim]docker command (rc="
+                f"{payload.get('returncode')}, "
+                f"{payload.get('duration_ms')} ms): "
+                f"{payload.get('command')}[/dim]"
+            )
+            return
+
+        if event.name in {
+            "plan",
+            "task_selected",
+            "attempt_start",
+            "attempt_finish",
+            "verify",
+            "repair",
+            "step_done",
+        }:
+            console.print(
+                f"[dim]{event.name} "
+                f"{payload.get('status') or ''}"
+                f"{payload.get('reason') or ''}"
+                "[/dim]"
+            )
+
+    return report
+
+
 def main() -> None:
     console.print(
         "[bold cyan]PersistentCoder[/bold cyan]"
@@ -439,6 +537,12 @@ def main() -> None:
     )
 
     show_commands()
+
+    # Live stage progress (a 1.5B model on CPU is slow; silence is not
+    # an option for an interactive user).
+    runtime.events.subscribe(
+        make_progress_reporter(console)
+    )
 
     while True:
         console.print()
@@ -493,6 +597,10 @@ def main() -> None:
 
         if normalized == "/patch":
             render_patch(runtime)
+            continue
+
+        if normalized == "/timeline":
+            render_timeline(runtime)
             continue
 
         if normalized == "/apply":
