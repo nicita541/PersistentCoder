@@ -1169,3 +1169,95 @@ button {
     text-align:
         right;
 }
+
+/* =========================================
+   WORK MODE
+========================================= */
+
+.mode-selector {
+    height: 25px;
+
+    padding:
+        0 7px;
+
+    border:
+        1px solid
+        var(
+            --vscode-dropdown-border,
+            var(--vscode-panel-border)
+        );
+
+    border-radius: 6px;
+
+    outline: none;
+
+    cursor: pointer;
+
+    background:
+        var(--vscode-dropdown-background);
+
+    color:
+        var(--vscode-dropdown-foreground);
+
+    font-family:
+        var(--vscode-font-family);
+
+    font-size: 9px;
+}
+
+
+.mode-selector:focus {
+    border-color:
+        var(--vscode-focusBorder);
+}
+
+
+.mode-selector:disabled {
+    opacity: 0.55;
+
+    cursor:
+        not-allowed;
+}
+
+
+.result-note {
+    margin:
+        5px 0 7px;
+
+    padding:
+        6px 7px;
+
+    border-radius: 6px;
+
+    background:
+        var(--vscode-textBlockQuote-background);
+
+    color:
+        var(--vscode-descriptionForeground);
+
+    font-size: 9px;
+
+    line-height: 1.4;
+}
+
+
+.result-reason {
+    margin:
+        5px 0 7px;
+
+    padding:
+        6px 7px;
+
+    border:
+        1px solid
+        var(--vscode-panel-border);
+
+    border-radius: 6px;
+
+    color:
+        var(--vscode-descriptionForeground);
+
+    font-size: 9px;
+
+    line-height: 1.4;
+}

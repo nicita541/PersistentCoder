@@ -1,4 +1,17 @@
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
+
+
+export type WorkMode =
+    | "sandbox"
+    | "auto_apply";
+
+
+export interface AutoApplyResult {
+    attempted: boolean;
+    applied: boolean;
+    files: string[];
+    reason: string | null;
+}
 
 
 export interface RunVerification {
@@ -50,6 +63,10 @@ export interface RunResult {
               reason: string | null;
           }
         | null;
+
+    work_mode: WorkMode;
+
+    auto_apply: AutoApplyResult;
 }
 
 
@@ -147,6 +164,51 @@ function readStringArray(
 }
 
 
+function readWorkMode(
+    value: unknown
+): WorkMode {
+    if (
+        value === "sandbox" ||
+        value === "auto_apply"
+    ) {
+        return value;
+    }
+
+    throw new Error(
+        "Invalid work_mode from backend"
+    );
+}
+
+
+function parseAutoApply(
+    value: unknown
+): AutoApplyResult {
+    if (!isRecord(value)) {
+        throw new Error(
+            "Invalid auto_apply result"
+        );
+    }
+
+    return {
+        attempted:
+            value.attempted === true,
+
+        applied:
+            value.applied === true,
+
+        files:
+            readStringArray(
+                value.files
+            ),
+
+        reason:
+            readNullableString(
+                value.reason
+            )
+    };
+}
+
+
 function parseRunResult(
     value: unknown
 ): RunResult {
@@ -175,44 +237,47 @@ function parseRunResult(
             ok:
                 value.verification.ok === true,
 
-            status: readString(
-                value.verification.status
-            ),
+            status:
+                readString(
+                    value.verification.status
+                ),
 
-            reason: readString(
-                value.verification.reason
-            ),
+            reason:
+                readString(
+                    value.verification.reason
+                ),
 
-            criteria: rawCriteria
-                .filter(isRecord)
-                .map(
-                    (criterion) => ({
-                        criterion:
-                            readString(
-                                criterion.criterion
-                            ),
+            criteria:
+                rawCriteria
+                    .filter(isRecord)
+                    .map(
+                        (criterion) => ({
+                            criterion:
+                                readString(
+                                    criterion.criterion
+                                ),
 
-                        status:
-                            readString(
-                                criterion.status
-                            ),
+                            status:
+                                readString(
+                                    criterion.status
+                                ),
 
-                        check:
-                            readString(
-                                criterion.check
-                            ),
+                            check:
+                                readString(
+                                    criterion.check
+                                ),
 
-                        reason:
-                            readString(
-                                criterion.reason
-                            ),
+                            reason:
+                                readString(
+                                    criterion.reason
+                                ),
 
-                        evidence:
-                            readStringArray(
-                                criterion.evidence
-                            )
-                    })
-                )
+                            evidence:
+                                readStringArray(
+                                    criterion.evidence
+                                )
+                        })
+                    )
         };
     }
 
@@ -292,23 +357,30 @@ function parseRunResult(
 
                       action:
                           readNullableString(
-                              value.repair
-                                  .action
+                              value.repair.action
                           ),
 
                       scope:
                           readNullableString(
-                              value.repair
-                                  .scope
+                              value.repair.scope
                           ),
 
                       reason:
                           readNullableString(
-                              value.repair
-                                  .reason
+                              value.repair.reason
                           )
                   }
-                : null
+                : null,
+
+        work_mode:
+            readWorkMode(
+                value.work_mode
+            ),
+
+        auto_apply:
+            parseAutoApply(
+                value.auto_apply
+            )
     };
 }
 
@@ -330,10 +402,10 @@ export function parseBackendMessage(
 
     if (type === "ready") {
         if (
-            typeof value.protocol_version
-                !== "number" ||
-            typeof value.pid
-                !== "number"
+            typeof value.protocol_version !==
+                "number" ||
+            typeof value.pid !==
+                "number"
         ) {
             throw new Error(
                 "Invalid ready message"
@@ -352,6 +424,7 @@ export function parseBackendMessage(
     if (type === "pong") {
         return {
             type,
+
             request_id:
                 readString(
                     value.request_id
@@ -362,6 +435,7 @@ export function parseBackendMessage(
     if (type === "run_started") {
         return {
             type,
+
             request_id:
                 readString(
                     value.request_id
@@ -372,6 +446,7 @@ export function parseBackendMessage(
     if (type === "run_completed") {
         return {
             type,
+
             request_id:
                 readString(
                     value.request_id
@@ -387,6 +462,7 @@ export function parseBackendMessage(
     if (type === "run_failed") {
         return {
             type,
+
             request_id:
                 readString(
                     value.request_id
@@ -435,13 +511,15 @@ export function parseBackendMessage(
 export function makeRunRequest(
     requestId: string,
     request: string,
-    projectRoot: string
+    projectRoot: string,
+    workMode: WorkMode
 ): string {
     return JSON.stringify({
         type: "run",
         request_id: requestId,
         request,
-        project_root: projectRoot
+        project_root: projectRoot,
+        work_mode: workMode
     });
 }
 

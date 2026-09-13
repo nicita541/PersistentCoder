@@ -105,6 +105,38 @@ class AgentRuntime:
     ) -> None:
         ensure_layout()
 
+                # ==================================
+        # SOURCE PROJECT IDENTITY
+        # ==================================
+
+        # The source project is the real project opened by the user.
+        #
+        # It is intentionally kept separate from workspace_root:
+        #
+        #   source_project_root
+        #       -> real host project
+        #
+        #   workspace_root
+        #       -> sandbox session copy
+        #
+        # Agents and Docker operate only on workspace_root.
+        # Only framework-controlled apply_patch() may write into
+        # source_project_root after verification PASS.
+        if project_root is not None:
+            self.source_project_root = Path(
+                project_root
+            ).resolve()
+
+        elif workspace_root is not None:
+            self.source_project_root = Path(
+                workspace_root
+            ).resolve()
+
+        else:
+            self.source_project_root = (
+                PROJECT_ROOT.resolve()
+            )
+
         self.database_path = (
             Path(database_path)
             if database_path is not None
@@ -146,8 +178,8 @@ class AgentRuntime:
             # never the host project directly.
             self.sandbox_workspace = None
             self.workspace_root = (
-                Path(project_root or PROJECT_ROOT)
-            ).resolve()
+                self.source_project_root
+            )
 
             self.recovery = self.recover_sandboxes(
                 resume=resume_interrupted
@@ -735,6 +767,9 @@ class AgentRuntime:
             "sandbox": self.sandbox_status(),
             "sandbox_session_id": self.session_id,
             "workspace": str(self.workspace_root),
+            "source_project_root": str(
+                self.source_project_root
+            ),
             "patch": self.last_patch_path,
             "interrupted_runs": len(
                 self.interrupted_runs
@@ -1098,9 +1133,9 @@ class AgentRuntime:
 
         applied = (
             self.sandbox_workspace.apply_to_project(
-                PROJECT_ROOT,
+                self.source_project_root,
                 paths=list(
-                    preview["changed_files"]  # type: ignore[arg-type]
+                    preview["changed_files"]
                 ),
             )
         )

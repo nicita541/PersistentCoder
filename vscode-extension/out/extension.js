@@ -35,17 +35,39 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.activate = activate;
 exports.deactivate = deactivate;
+const path = __importStar(require("path"));
 const vscode = __importStar(require("vscode"));
+const PersistentCoderProcess_1 = require("./backend/PersistentCoderProcess");
 const PersistentCoderViewProvider_1 = require("./PersistentCoderViewProvider");
 function activate(context) {
-    const provider = new PersistentCoderViewProvider_1.PersistentCoderViewProvider(context.extensionUri);
-    context.subscriptions.push(vscode.window.registerWebviewViewProvider(PersistentCoderViewProvider_1.PersistentCoderViewProvider.viewType, provider, {
+    const backendRoot = path.dirname(context.extensionUri.fsPath);
+    const output = vscode.window.createOutputChannel("PersistentCoder");
+    const backend = new PersistentCoderProcess_1.PersistentCoderProcess(backendRoot, output);
+    const provider = new PersistentCoderViewProvider_1.PersistentCoderViewProvider(context.extensionUri, backend);
+    context.subscriptions.push(output, backend, provider);
+    context.subscriptions.push(vscode.window
+        .registerWebviewViewProvider(PersistentCoderViewProvider_1.PersistentCoderViewProvider
+        .viewType, provider, {
         webviewOptions: {
             retainContextWhenHidden: true
         }
     }));
+    try {
+        backend.start();
+    }
+    catch (error) {
+        const message = error instanceof Error
+            ? error.message
+            : String(error);
+        output.appendLine("[backend startup] " +
+            message);
+        vscode.window
+            .showErrorMessage("PersistentCoder backend: " +
+            message);
+    }
 }
 function deactivate() {
-    // Пока ничего очищать вручную не требуется.
+    // Resources are disposed through
+    // context.subscriptions.
 }
 //# sourceMappingURL=extension.js.map

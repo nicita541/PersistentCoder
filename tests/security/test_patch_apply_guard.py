@@ -148,38 +148,61 @@ def test_apply_refused_when_verification_failed(tmp_path):
     assert "verification" in str(result["reason"])
 
 
-def test_apply_writes_only_safe_paths_after_confirmation(
+def test_apply_targets_source_project_not_module_project_root(
     tmp_path,
     monkeypatch,
 ):
-    project = _project(tmp_path / "project")
-    host = _project(tmp_path / "host")
+    project = _project(
+        tmp_path / "source-project"
+    )
+
+    wrong_project = _project(
+        tmp_path / "wrong-project"
+    )
 
     monkeypatch.setattr(
         "app.agent.runtime.PROJECT_ROOT",
-        host,
+        wrong_project,
     )
 
-    runtime = _runtime(project, tmp_path / "pc.db")
+    runtime = _runtime(
+        project,
+        tmp_path / "pc.db",
+    )
 
-    workspace = Path(runtime.workspace_root)
+    workspace = Path(
+        runtime.workspace_root
+    )
 
-    (workspace / "src" / "app.py").write_text(
+    (
+        workspace
+        / "src"
+        / "app.py"
+    ).write_text(
         "VALUE = 2\n",
         encoding="utf-8",
     )
 
-    # A denied path must never enter the patch / apply set.
-    (workspace / ".env").write_text(
+    # Protected file must never be applied.
+    (
+        workspace
+        / ".env"
+    ).write_text(
         "SECRET=stolen\n",
         encoding="utf-8",
     )
 
-    patch = runtime.sandbox_workspace.write_patch()
+    patch = (
+        runtime
+        .sandbox_workspace
+        .write_patch()
+    )
 
     assert patch is not None
 
-    runtime.last_patch_path = str(patch)
+    runtime.last_patch_path = str(
+        patch
+    )
 
     runtime.last_state = SimpleNamespace(
         phase=AgentPhase.DONE,
@@ -192,18 +215,47 @@ def test_apply_writes_only_safe_paths_after_confirmation(
 
     preview = runtime.patch_preview()
 
-    assert "src/app.py" in preview["changed_files"]
-    assert ".env" not in preview["changed_files"]
+    assert (
+        "src/app.py"
+        in preview["changed_files"]
+    )
 
-    result = runtime.apply_patch(confirmed=True)
+    assert (
+        ".env"
+        not in preview["changed_files"]
+    )
 
-    assert result["applied"] == ["src/app.py"]
+    result = runtime.apply_patch(
+        confirmed=True
+    )
 
-    assert (host / "src" / "app.py").read_text(
+    assert result["applied"] == [
+        "src/app.py",
+    ]
+
+    # MUST update the actual project
+    # AgentRuntime was created for.
+    assert (
+        project
+        / "src"
+        / "app.py"
+    ).read_text(
         encoding="utf-8"
     ) == "VALUE = 2\n"
 
-    # Secrets are never copied into the host project.
-    assert (host / ".env").read_text(
+    # MUST NOT use module-level PROJECT_ROOT.
+    assert (
+        wrong_project
+        / "src"
+        / "app.py"
+    ).read_text(
+        encoding="utf-8"
+    ) == "VALUE = 1\n"
+
+    # Protected host file remains untouched.
+    assert (
+        project
+        / ".env"
+    ).read_text(
         encoding="utf-8"
     ) == "SECRET=host-only\n"

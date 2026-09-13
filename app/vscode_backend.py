@@ -12,12 +12,21 @@ from app.agent.runtime import AgentRuntime
 from app.sandbox.paths import configure_project_env
 
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
+
+WORK_MODE_SANDBOX = "sandbox"
+WORK_MODE_AUTO_APPLY = "auto_apply"
+
+ALLOWED_WORK_MODES = frozenset(
+    {
+        WORK_MODE_SANDBOX,
+        WORK_MODE_AUTO_APPLY,
+    }
+)
 
 
-# stdout принадлежит протоколу.
-# Даже если во время AgentRuntime кто-то случайно вызовет print(),
-# мы перенаправим такой вывод в stderr.
+# stdout принадлежит JSONL protocol.
+# Любые обычные print() внутри runtime уходят в stderr.
 _PROTOCOL_STDOUT = sys.stdout
 
 
@@ -41,6 +50,23 @@ def _require_string(
     if not value:
         raise ProtocolError(
             f"{key} is required"
+        )
+
+    return value
+
+
+def _require_work_mode(
+    data: dict[str, object],
+) -> str:
+    value = _require_string(
+        data,
+        "work_mode",
+    )
+
+    if value not in ALLOWED_WORK_MODES:
+        raise ProtocolError(
+            "work_mode must be one of: "
+            "sandbox, auto_apply"
         )
 
     return value
@@ -89,17 +115,24 @@ def parse_client_message(
     if message_type == "run":
         return {
             "type": "run",
+
             "request_id": _require_string(
                 value,
                 "request_id",
             ),
+
             "request": _require_string(
                 value,
                 "request",
             ),
+
             "project_root": _require_string(
                 value,
                 "project_root",
+            ),
+
+            "work_mode": _require_work_mode(
+                value
             ),
         }
 
@@ -200,6 +233,7 @@ def state_to_result(
                             "",
                         )
                     ),
+
                     "returncode": int(
                         getattr(
                             command,
@@ -237,6 +271,7 @@ def state_to_result(
                             "",
                         )
                     ),
+
                     "status": str(
                         getattr(
                             criterion,
@@ -244,6 +279,7 @@ def state_to_result(
                             "",
                         )
                     ),
+
                     "check": str(
                         getattr(
                             criterion,
@@ -251,6 +287,7 @@ def state_to_result(
                             "",
                         )
                     ),
+
                     "reason": str(
                         getattr(
                             criterion,
@@ -258,6 +295,7 @@ def state_to_result(
                             "",
                         )
                     ),
+
                     "evidence": [
                         str(item)
                         for item in (
@@ -280,6 +318,7 @@ def state_to_result(
                     False,
                 )
             ),
+
             "status": str(
                 getattr(
                     verification,
@@ -287,6 +326,7 @@ def state_to_result(
                     "",
                 )
             ),
+
             "reason": str(
                 getattr(
                     verification,
@@ -294,6 +334,7 @@ def state_to_result(
                     "",
                 )
             ),
+
             "criteria": criteria,
         }
 
@@ -311,16 +352,19 @@ def state_to_result(
                     False,
                 )
             ),
+
             "action": getattr(
                 repair,
                 "action",
                 None,
             ),
+
             "scope": getattr(
                 repair,
                 "scope",
                 None,
             ),
+
             "reason": getattr(
                 repair,
                 "reason",
@@ -347,36 +391,55 @@ def state_to_result(
             "last_run_id",
             None,
         ),
+
         "phase": _phase_value(
             state
         ),
+
         "plan_id": getattr(
             state,
             "plan_id",
             None,
         ),
+
         "global_goal": getattr(
             state,
             "global_goal",
             None,
         ),
+
         "completion": getattr(
             state,
             "completion",
             None,
         ),
+
         "patch_path": (
             str(patch_path)
             if patch_path
             else None
         ),
+
         "read_files": read_files,
         "changed_files": changed_files,
         "commands": commands,
+
         "verification": (
             verification_data
         ),
-        "repair": repair_data,
+
+        "repair": (
+            repair_data
+        ),
+    }
+
+
+def _empty_auto_apply_result() -> dict[str, object]:
+    return {
+        "attempted": False,
+        "applied": False,
+        "files": [],
+        "reason": None,
     }
 
 
@@ -384,11 +447,11 @@ class BackendSession:
     """
     Один локальный Python backend процесс.
 
-    AgentRuntime создаётся лениво только при первом RUN.
-    Поэтому само открытие VS Code не загружает Qwen.
+    Runtime создаётся лениво при первом RUN.
 
-    В рамках одного backend процесса используется один Runtime
-    для одного открытого workspace.
+    Backend process привязан ровно к одному source project.
+    Если VS Code переключился на другой workspace,
+    backend должен быть перезапущен.
     """
 
     def __init__(self) -> None:
@@ -437,8 +500,6 @@ class BackendSession:
         if self.runtime is None:
             self.project_root = root
 
-            # stdout зарезервирован под JSONL protocol.
-            # Любой обычный print уходит в stderr.
             with redirect_stdout(
                 sys.stderr
             ):
@@ -464,7 +525,13 @@ class BackendSession:
         self,
         request: str,
         project_root: str,
+        work_mode: str,
     ) -> dict[str, object]:
+        if work_mode not in ALLOWED_WORK_MODES:
+            raise RuntimeError(
+                "unsupported work mode"
+            )
+
         runtime = self._get_runtime(
             project_root
         )
@@ -476,10 +543,135 @@ class BackendSession:
                 request
             )
 
-        return state_to_result(
+        result = state_to_result(
             state,
             runtime,
         )
+
+        result["work_mode"] = (
+            work_mode
+        )
+
+        auto_apply = (
+            _empty_auto_apply_result()
+        )
+
+        result["auto_apply"] = (
+            auto_apply
+        )
+
+        if (
+            work_mode
+            != WORK_MODE_AUTO_APPLY
+        ):
+            return result
+
+        # Direct mode in the UI means:
+        #
+        # sandbox
+        # -> verification
+        # -> patch
+        # -> framework-controlled auto apply
+        #
+        # It NEVER means direct LLM host writes.
+        auto_apply["attempted"] = True
+
+        if result["phase"] != "DONE":
+            auto_apply["reason"] = (
+                "run is not DONE; "
+                "auto-apply blocked"
+            )
+
+            return result
+
+        verification = result.get(
+            "verification"
+        )
+
+        if (
+            not isinstance(
+                verification,
+                dict,
+            )
+            or verification.get("ok")
+            is not True
+        ):
+            auto_apply["reason"] = (
+                "verification did not PASS; "
+                "auto-apply blocked"
+            )
+
+            return result
+
+        if not result.get(
+            "patch_path"
+        ):
+            auto_apply["reason"] = (
+                "no patch was produced; "
+                "auto-apply blocked"
+            )
+
+            return result
+
+        try:
+            with redirect_stdout(
+                sys.stderr
+            ):
+                apply_result = (
+                    runtime.apply_patch(
+                        confirmed=True
+                    )
+                )
+
+        except Exception as error:
+            auto_apply["reason"] = (
+                "apply failed: "
+                f"{error}"
+            )
+
+            return result
+
+        if not isinstance(
+            apply_result,
+            dict,
+        ):
+            auto_apply["reason"] = (
+                "invalid apply result"
+            )
+
+            return result
+
+        raw_files = apply_result.get(
+            "applied",
+            [],
+        )
+
+        files = (
+            [
+                str(path)
+                for path in raw_files
+            ]
+            if isinstance(
+                raw_files,
+                list,
+            )
+            else []
+        )
+
+        auto_apply["files"] = files
+        auto_apply["applied"] = bool(
+            files
+        )
+
+        auto_apply["reason"] = str(
+            apply_result.get(
+                "reason",
+                "",
+            )
+            or ""
+        )
+
+        return result
 
 
 def _send(
@@ -517,9 +709,11 @@ def serve(
         stdout,
         {
             "type": "ready",
+
             "protocol_version": (
                 PROTOCOL_VERSION
             ),
+
             "pid": os.getpid(),
         },
     )
@@ -565,6 +759,7 @@ def serve(
                     stdout,
                     {
                         "type": "pong",
+
                         "request_id": (
                             request_id
                         ),
@@ -592,6 +787,7 @@ def serve(
                     {
                         "type":
                             "run_started",
+
                         "request_id":
                             request_id,
                     },
@@ -604,9 +800,16 @@ def serve(
                                 "request"
                             ]
                         ),
+
                         str(
                             message[
                                 "project_root"
+                            ]
+                        ),
+
+                        str(
+                            message[
+                                "work_mode"
                             ]
                         ),
                     )
@@ -617,8 +820,10 @@ def serve(
                         {
                             "type":
                                 "run_failed",
+
                             "request_id":
                                 request_id,
+
                             "error": str(
                                 error
                             ),
@@ -632,9 +837,12 @@ def serve(
                     {
                         "type":
                             "run_completed",
+
                         "request_id":
                             request_id,
-                        "result": result,
+
+                        "result":
+                            result,
                     },
                 )
 
@@ -644,18 +852,17 @@ def serve(
                 {
                     "type":
                         "protocol_error",
+
                     "request_id":
                         request_id,
-                    "error": str(
-                        error
-                    ),
+
+                    "error":
+                        str(error),
                 },
             )
 
 
 def main() -> int:
-    # Те же project-local environment rules,
-    # которые использует CLI.
     configure_project_env()
 
     serve(

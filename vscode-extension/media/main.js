@@ -7,48 +7,45 @@ const messages =
         "messages"
     );
 
-
 const welcome =
     document.getElementById(
         "welcome"
     );
-
 
 const input =
     document.getElementById(
         "messageInput"
     );
 
-
 const sendButton =
     document.getElementById(
         "sendButton"
     );
-
 
 const newChatButton =
     document.getElementById(
         "newChatButton"
     );
 
-
 const settingsButton =
     document.getElementById(
         "settingsButton"
     );
-
 
 const attachButton =
     document.getElementById(
         "attachButton"
     );
 
+const workModeSelect =
+    document.getElementById(
+        "workModeSelect"
+    );
 
 const backendStatusDot =
     document.getElementById(
         "backendStatusDot"
     );
-
 
 const backendStatusText =
     document.getElementById(
@@ -56,13 +53,10 @@ const backendStatusText =
     );
 
 
-let busy =
-    false;
+let busy = false;
 
 
-/* =========================================
-   HELPERS
-========================================= */
+/* HELPERS */
 
 function hideWelcome() {
     if (welcome) {
@@ -80,37 +74,24 @@ function scrollToBottom() {
 
 function escapeHtml(value) {
     return String(value)
-        .replaceAll(
-            "&",
-            "&amp;"
-        )
-        .replaceAll(
-            "<",
-            "&lt;"
-        )
-        .replaceAll(
-            ">",
-            "&gt;"
-        )
-        .replaceAll(
-            '"',
-            "&quot;"
-        )
-        .replaceAll(
-            "'",
-            "&#039;"
-        );
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
 }
 
 
 function setBusy(value) {
-    busy =
-        value;
+    busy = value;
 
     input.disabled =
         value;
 
     sendButton.disabled =
+        value;
+
+    workModeSelect.disabled =
         value;
 
     sendButton.textContent =
@@ -132,13 +113,9 @@ function updateBackendStatus(
 }
 
 
-/* =========================================
-   USER MESSAGE
-========================================= */
+/* USER MESSAGE */
 
-function addUserMessage(
-    text
-) {
+function addUserMessage(text) {
     hideWelcome();
 
     const row =
@@ -146,42 +123,33 @@ function addUserMessage(
             "div"
         );
 
-
     row.className =
         "message-row user-row";
-
 
     const bubble =
         document.createElement(
             "div"
         );
 
-
     bubble.className =
         "user-message";
 
-
     bubble.textContent =
         text;
-
 
     row.appendChild(
         bubble
     );
 
-
     messages.appendChild(
         row
     );
-
 
     scrollToBottom();
 }
 
 
-/* =========================================
-   AGENT STATUS
-========================================= */
+/* AGENT STATUS */
 
 function addAgentStatus(
     status,
@@ -190,16 +158,13 @@ function addAgentStatus(
 ) {
     hideWelcome();
 
-
     const card =
         document.createElement(
             "section"
         );
 
-
     card.className =
         `agent-card ${status}`;
-
 
     const icon =
         status === "done"
@@ -207,7 +172,6 @@ function addAgentStatus(
             : status === "error"
                 ? "!"
                 : "●";
-
 
     card.innerHTML = `
         <div class="agent-card-header">
@@ -231,63 +195,97 @@ function addAgentStatus(
         </div>
     `;
 
-
     messages.appendChild(
         card
     );
-
 
     scrollToBottom();
 }
 
 
-/* =========================================
-   REAL FINAL RESULT
-========================================= */
+/* RESULT */
 
-function addRunResult(
-    result
-) {
+function addRunResult(result) {
     hideWelcome();
-
-
-    const card =
-        document.createElement(
-            "section"
-        );
-
 
     const verification =
         result.verification;
 
+    const verificationOk =
+        Boolean(
+            verification &&
+            verification.ok === true
+        );
 
     const verificationStatus =
         verification
             ? verification.status
             : "N/A";
 
+    const mode =
+        result.work_mode ===
+            "auto_apply"
+            ? "auto_apply"
+            : "sandbox";
 
-    const success =
+    const autoApply =
+        result.auto_apply || {
+            attempted: false,
+            applied: false,
+            files: [],
+            reason: null
+        };
+
+    const baseSuccess =
         result.phase === "DONE" &&
-        verification &&
-        verification.ok === true;
+        verificationOk;
 
+    const finalSuccess =
+        baseSuccess &&
+        (
+            mode === "sandbox" ||
+            autoApply.applied === true
+        );
+
+    let title =
+        "Task finished";
+
+    if (
+        finalSuccess &&
+        mode === "sandbox"
+    ) {
+        title =
+            "Task completed in Sandbox";
+    }
+
+    if (
+        finalSuccess &&
+        mode === "auto_apply"
+    ) {
+        title =
+            "Task completed and applied";
+    }
+
+    if (
+        baseSuccess &&
+        mode === "auto_apply" &&
+        !autoApply.applied
+    ) {
+        title =
+            "Verification passed, apply failed";
+    }
+
+    const card =
+        document.createElement(
+            "section"
+        );
 
     card.className =
         `agent-card ${
-            success
+            finalSuccess
                 ? "done"
                 : "error"
         }`;
-
-
-    const changedFiles =
-        Array.isArray(
-            result.changed_files
-        )
-            ? result.changed_files
-            : [];
-
 
     const readFiles =
         Array.isArray(
@@ -296,12 +294,19 @@ function addRunResult(
             ? result.read_files
             : [];
 
+    const changedFiles =
+        Array.isArray(
+            result.changed_files
+        )
+            ? result.changed_files
+            : [];
 
-    const patch =
+    const patchHtml =
         result.patch_path
             ? `
                 <div class="result-row">
                     <span>Patch</span>
+
                     <code>
                         ${escapeHtml(
                             result.patch_path
@@ -311,22 +316,75 @@ function addRunResult(
               `
             : "";
 
+    const verificationReason =
+        verification &&
+        verification.reason
+            ? `
+                <div class="result-reason">
+                    ${escapeHtml(
+                        verification.reason
+                    )}
+                </div>
+              `
+            : "";
+
+    let modeResultHtml = "";
+
+    if (mode === "sandbox") {
+        modeResultHtml = `
+            <div class="result-row">
+                <span>Project</span>
+                <strong>
+                    Not applied
+                </strong>
+            </div>
+
+            <div class="result-note">
+                Изменения остались в sandbox.
+                Реальный проект не изменён.
+            </div>
+        `;
+    }
+
+    if (mode === "auto_apply") {
+        modeResultHtml = `
+            <div class="result-row">
+                <span>Applied</span>
+
+                <strong>
+                    ${
+                        autoApply.applied
+                            ? "YES"
+                            : "NO"
+                    }
+                </strong>
+            </div>
+
+            ${
+                autoApply.reason
+                    ? `
+                        <div class="result-note">
+                            ${escapeHtml(
+                                autoApply.reason
+                            )}
+                        </div>
+                      `
+                    : ""
+            }
+        `;
+    }
 
     card.innerHTML = `
         <div class="agent-card-header">
 
             <div class="agent-card-icon">
-                ${success ? "✓" : "!"}
+                ${finalSuccess ? "✓" : "!"}
             </div>
 
             <div class="agent-card-content">
 
                 <div class="agent-card-title">
-                    ${
-                        success
-                            ? "Task completed"
-                            : "Task finished"
-                    }
+                    ${escapeHtml(title)}
                 </div>
 
                 <div class="agent-card-description">
@@ -341,7 +399,21 @@ function addRunResult(
         <div class="run-result">
 
             <div class="result-row">
+                <span>Mode</span>
+
+                <strong>
+                    ${
+                        mode === "auto_apply"
+                            ? "Direct"
+                            : "Sandbox"
+                    }
+                </strong>
+            </div>
+
+
+            <div class="result-row">
                 <span>Phase</span>
+
                 <strong>
                     ${escapeHtml(
                         result.phase
@@ -349,8 +421,10 @@ function addRunResult(
                 </strong>
             </div>
 
+
             <div class="result-row">
                 <span>Plan</span>
+
                 <strong>
                     ${
                         result.plan_id ??
@@ -359,22 +433,28 @@ function addRunResult(
                 </strong>
             </div>
 
+
             <div class="result-row">
                 <span>Read files</span>
+
                 <strong>
                     ${readFiles.length}
                 </strong>
             </div>
 
+
             <div class="result-row">
                 <span>Changed files</span>
+
                 <strong>
                     ${changedFiles.length}
                 </strong>
             </div>
 
+
             <div class="result-row">
                 <span>Verification</span>
+
                 <strong>
                     ${escapeHtml(
                         verificationStatus
@@ -382,59 +462,58 @@ function addRunResult(
                 </strong>
             </div>
 
-            ${patch}
+
+            ${verificationReason}
+
+            ${modeResultHtml}
+
+            ${patchHtml}
 
         </div>
     `;
-
 
     messages.appendChild(
         card
     );
 
-
     scrollToBottom();
 }
 
 
-/* =========================================
-   SEND
-========================================= */
+/* SEND */
 
 function sendMessage() {
     if (busy) {
         return;
     }
 
-
     const text =
         input.value.trim();
-
 
     if (!text) {
         return;
     }
 
+    const workMode =
+        workModeSelect.value;
 
     addUserMessage(
         text
     );
 
-
     vscode.postMessage({
         type:
             "sendMessage",
 
-        text
-    });
+        text,
 
+        workMode
+    });
 
     input.value =
         "";
 
-
     resizeInput();
-
 
     input.focus();
 }
@@ -444,7 +523,6 @@ function resizeInput() {
     input.style.height =
         "auto";
 
-
     input.style.height =
         `${Math.min(
             input.scrollHeight,
@@ -453,19 +531,15 @@ function resizeInput() {
 }
 
 
-/* =========================================
-   CHAT
-========================================= */
+/* CHAT */
 
 function resetChat() {
     if (busy) {
         return;
     }
 
-
     messages.innerHTML =
         "";
-
 
     if (welcome) {
         welcome.style.display =
@@ -476,21 +550,16 @@ function resetChat() {
         );
     }
 
-
     input.value =
         "";
 
-
     resizeInput();
-
 
     input.focus();
 }
 
 
-/* =========================================
-   DOM EVENTS
-========================================= */
+/* DOM */
 
 sendButton.addEventListener(
     "click",
@@ -571,16 +640,13 @@ document
     );
 
 
-/* =========================================
-   BACKEND MESSAGES
-========================================= */
+/* BACKEND */
 
 window.addEventListener(
     "message",
     (event) => {
         const message =
             event.data;
-
 
         if (
             message.type ===
@@ -594,7 +660,6 @@ window.addEventListener(
             return;
         }
 
-
         if (
             message.type ===
             "runStarted"
@@ -606,12 +671,11 @@ window.addEventListener(
             addAgentStatus(
                 "thinking",
                 "AgentRuntime работает",
-                "PersistentCoder получил задачу. Детальный live-stream подключим на следующем этапе."
+                "PersistentCoder выполняет задачу в изолированном sandbox."
             );
 
             return;
         }
-
 
         if (
             message.type ===
@@ -627,7 +691,6 @@ window.addEventListener(
 
             return;
         }
-
 
         if (
             message.type ===

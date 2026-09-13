@@ -37,11 +37,25 @@ exports.PersistentCoderViewProvider = void 0;
 const vscode = __importStar(require("vscode"));
 class PersistentCoderViewProvider {
     extensionUri;
+    backend;
     static viewType = "persistentCoder.chatView";
-    constructor(extensionUri) {
+    view;
+    currentRequestId;
+    disposables = [];
+    constructor(extensionUri, backend) {
         this.extensionUri = extensionUri;
+        this.backend = backend;
+        this.disposables.push(this.backend.onMessage((message) => this.handleBackendMessage(message)));
+        this.disposables.push(this.backend.onStatus((event) => this.handleBackendStatus(event)));
+    }
+    dispose() {
+        for (const disposable of this.disposables) {
+            disposable.dispose();
+        }
     }
     resolveWebviewView(webviewView) {
+        this.view =
+            webviewView;
         const webview = webviewView.webview;
         webview.options = {
             enableScripts: true,
@@ -49,62 +63,177 @@ class PersistentCoderViewProvider {
                 vscode.Uri.joinPath(this.extensionUri, "media")
             ]
         };
-        webview.html = this.getHtml(webview);
+        webview.html =
+            this.getHtml(webview);
         webview.onDidReceiveMessage(async (message) => {
-            if (typeof message !== "object" ||
-                message === null) {
-                return;
-            }
-            const data = message;
-            if (data.type === "settings") {
-                vscode.window.showInformationMessage("Настройки PersistentCoder подключим позже.");
-                return;
-            }
-            if (data.type !== "sendMessage" ||
-                typeof data.text !== "string") {
-                return;
-            }
-            const text = data.text.trim();
-            if (!text) {
-                return;
-            }
-            // -----------------------------
-            // DEMO / UI PROTOTYPE ONLY
-            // -----------------------------
-            await delay(450);
-            webview.postMessage({
-                type: "agentStatus",
-                status: "thinking",
-                title: "Анализирую задачу...",
-                description: "Изучаю запрос и структуру проекта."
-            });
-            await delay(700);
-            webview.postMessage({
-                type: "demoPlan",
-                tasks: [
-                    {
-                        title: "Изучить связанные файлы",
-                        status: "done"
-                    },
-                    {
-                        title: "Подготовить изменения",
-                        status: "active"
-                    },
-                    {
-                        title: "Запустить проверки",
-                        status: "pending"
-                    }
-                ]
-            });
-            await delay(900);
-            webview.postMessage({
-                type: "agentStatus",
-                status: "done",
-                title: "Прототип интерфейса",
-                description: "Backend пока не подключён. " +
-                    "Позже здесь будет настоящий AgentRuntime."
-            });
+            await this
+                .handleWebviewMessage(message);
         });
+        this.postBackendStatus(this.backend.status, this.backend.status ===
+            "ready"
+            ? "Local"
+            : "Starting...");
+    }
+    activeProjectRoot() {
+        const activeDocument = vscode.window
+            .activeTextEditor
+            ?.document.uri;
+        if (activeDocument) {
+            const folder = vscode.workspace
+                .getWorkspaceFolder(activeDocument);
+            if (folder) {
+                return folder.uri.fsPath;
+            }
+        }
+        const folders = vscode.workspace
+            .workspaceFolders;
+        if (folders &&
+            folders.length > 0) {
+            return folders[0].uri.fsPath;
+        }
+        return null;
+    }
+    async handleWebviewMessage(message) {
+        if (typeof message !==
+            "object" ||
+            message === null) {
+            return;
+        }
+        const data = message;
+        if (data.type ===
+            "settings") {
+            void vscode.window
+                .showInformationMessage("Настройки PersistentCoder подключим позже.");
+            return;
+        }
+        if (data.type !==
+            "sendMessage" ||
+            typeof data.text !==
+                "string") {
+            return;
+        }
+        const text = data.text.trim();
+        if (!text) {
+            return;
+        }
+        if (this.currentRequestId) {
+            this.post({
+                type: "runFailed",
+                error: "Сейчас уже выполняется одна задача."
+            });
+            return;
+        }
+        const projectRoot = this.activeProjectRoot();
+        if (!projectRoot) {
+            this.post({
+                type: "runFailed",
+                error: "Откройте папку проекта в VS Code перед запуском PersistentCoder."
+            });
+            return;
+        }
+        let workMode;
+        if (data.workMode ===
+            "sandbox") {
+            workMode =
+                "sandbox";
+        }
+        else if (data.workMode ===
+            "auto_apply") {
+            workMode =
+                "auto_apply";
+        }
+        else {
+            this.post({
+                type: "runFailed",
+                error: "Неизвестный режим работы."
+            });
+            return;
+        }
+        try {
+            this.currentRequestId =
+                this.backend.run(text, projectRoot, workMode);
+        }
+        catch (error) {
+            const errorText = error instanceof Error
+                ? error.message
+                : String(error);
+            this.post({
+                type: "runFailed",
+                error: errorText
+            });
+        }
+    }
+    handleBackendStatus(event) {
+        this.postBackendStatus(event.status, event.message);
+    }
+    postBackendStatus(status, text) {
+        this.post({
+            type: "backendStatus",
+            status,
+            text
+        });
+    }
+    handleBackendMessage(message) {
+        if (message.type ===
+            "ready") {
+            this.postBackendStatus("ready", "Local");
+            return;
+        }
+        if (message.type ===
+            "run_started") {
+            if (message.request_id !==
+                this.currentRequestId) {
+                return;
+            }
+            this.post({
+                type: "runStarted",
+                requestId: message.request_id
+            });
+            return;
+        }
+        if (message.type ===
+            "run_completed") {
+            if (message.request_id !==
+                this.currentRequestId) {
+                return;
+            }
+            this.currentRequestId =
+                undefined;
+            this.post({
+                type: "runCompleted",
+                result: message.result
+            });
+            return;
+        }
+        if (message.type ===
+            "run_failed") {
+            if (message.request_id !==
+                this.currentRequestId) {
+                return;
+            }
+            this.currentRequestId =
+                undefined;
+            this.post({
+                type: "runFailed",
+                error: message.error
+            });
+            return;
+        }
+        if (message.type ===
+            "protocol_error") {
+            this.currentRequestId =
+                undefined;
+            this.post({
+                type: "runFailed",
+                error: "Backend protocol error: " +
+                    message.error
+            });
+        }
+    }
+    post(message) {
+        void this.view
+            ?.webview
+            .postMessage(message);
     }
     getHtml(webview) {
         const cssUri = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, "media", "main.css"));
@@ -113,7 +242,9 @@ class PersistentCoderViewProvider {
         return /* html */ `
 <!DOCTYPE html>
 <html lang="ru">
+
 <head>
+
     <meta charset="UTF-8">
 
     <meta
@@ -136,33 +267,51 @@ class PersistentCoderViewProvider {
         href="${cssUri}"
     >
 
-    <title>PersistentCoder</title>
+    <title>
+        PersistentCoder
+    </title>
+
 </head>
+
 
 <body>
 
 <div class="app">
 
-    <!-- HEADER -->
 
     <header class="topbar">
 
         <div class="topbar-left">
+
             <div class="brand-icon">
                 P
             </div>
 
             <div>
+
                 <div class="brand-title">
                     PersistentCoder
                 </div>
 
                 <div class="brand-status">
-                    <span class="status-dot"></span>
-                    Local
+
+                    <span
+                        id="backendStatusDot"
+                        class="status-dot starting"
+                    ></span>
+
+                    <span
+                        id="backendStatusText"
+                    >
+                        Starting...
+                    </span>
+
                 </div>
+
             </div>
+
         </div>
+
 
         <div class="topbar-actions">
 
@@ -187,8 +336,6 @@ class PersistentCoderViewProvider {
     </header>
 
 
-    <!-- CONTENT -->
-
     <main
         id="messages"
         class="messages"
@@ -211,18 +358,21 @@ class PersistentCoderViewProvider {
                 Локальный автономный coding agent
             </p>
 
+
             <div class="local-card">
 
                 <div class="local-card-title">
-                    ● Работает локально
+                    ● Локальный backend
                 </div>
 
                 <div class="local-card-text">
-                    Модель, память, sandbox и Docker
-                    будут работать на вашем ПК.
+                    VS Code общается с PersistentCoder
+                    через локальный stdin/stdout JSON protocol.
+                    Внешний сервер не используется.
                 </div>
 
             </div>
+
 
             <div class="suggestions">
 
@@ -254,8 +404,6 @@ class PersistentCoderViewProvider {
     </main>
 
 
-    <!-- INPUT -->
-
     <footer class="composer-area">
 
         <div class="composer">
@@ -266,6 +414,7 @@ class PersistentCoderViewProvider {
                 placeholder="Напишите задачу..."
                 aria-label="Сообщение"
             ></textarea>
+
 
             <div class="composer-toolbar">
 
@@ -279,14 +428,26 @@ class PersistentCoderViewProvider {
                         ＋
                     </button>
 
+                    <select
+                        id="workModeSelect"
+                        class="mode-selector"
+                        title="Режим работы"
+                    >
+                        <option value="sandbox">
+                            Sandbox
+                        </option>
+
+                        <option value="auto_apply">
+                            Direct
+                        </option>
+                    </select>
+
                     <div class="model-selector">
                         Qwen Local
-                        <span class="chevron">
-                           ⌄
-                        </span>
                     </div>
 
                 </div>
+
 
                 <button
                     id="sendButton"
@@ -300,6 +461,7 @@ class PersistentCoderViewProvider {
 
         </div>
 
+
         <div class="composer-hint">
             Enter — отправить · Shift+Enter — новая строка
         </div>
@@ -308,10 +470,12 @@ class PersistentCoderViewProvider {
 
 </div>
 
+
 <script
     nonce="${nonce}"
     src="${jsUri}"
 ></script>
+
 
 </body>
 </html>
@@ -325,11 +489,10 @@ function getNonce() {
         "0123456789";
     let result = "";
     for (let i = 0; i < 32; i += 1) {
-        result += chars.charAt(Math.floor(Math.random() * chars.length));
+        result +=
+            chars.charAt(Math.floor(Math.random() *
+                chars.length));
     }
     return result;
-}
-function delay(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
 }
 //# sourceMappingURL=PersistentCoderViewProvider.js.map

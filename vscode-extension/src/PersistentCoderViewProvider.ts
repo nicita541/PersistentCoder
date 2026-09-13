@@ -1,7 +1,8 @@
 import * as vscode from "vscode";
 
 import {
-    BackendMessage
+    BackendMessage,
+    WorkMode
 } from "./backend/protocol";
 
 import {
@@ -174,6 +175,7 @@ export class PersistentCoderViewProvider
             message as {
                 type?: string;
                 text?: string;
+                workMode?: string;
             };
 
 
@@ -238,12 +240,41 @@ export class PersistentCoderViewProvider
             return;
         }
 
+                let workMode:
+            WorkMode;
+
+        if (
+            data.workMode ===
+            "sandbox"
+        ) {
+            workMode =
+                "sandbox";
+
+        } else if (
+            data.workMode ===
+            "auto_apply"
+        ) {
+            workMode =
+                "auto_apply";
+
+        } else {
+            this.post({
+                type:
+                    "runFailed",
+
+                error:
+                    "Неизвестный режим работы."
+            });
+
+            return;
+        }
 
         try {
             this.currentRequestId =
                 this.backend.run(
                     text,
-                    projectRoot
+                    projectRoot,
+                    workMode
                 );
 
         } catch (error) {
@@ -627,6 +658,20 @@ export class PersistentCoderViewProvider
                     >
                         ＋
                     </button>
+
+                    <select
+                        id="workModeSelect"
+                        class="mode-selector"
+                        title="Режим работы"
+                    >
+                        <option value="sandbox">
+                            Sandbox
+                        </option>
+
+                        <option value="auto_apply">
+                            Direct
+                        </option>
+                    </select>
 
                     <div class="model-selector">
                         Qwen Local

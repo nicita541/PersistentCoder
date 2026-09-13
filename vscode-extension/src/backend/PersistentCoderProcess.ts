@@ -16,7 +16,8 @@ import {
     BackendMessage,
     makeRunRequest,
     parseBackendMessage,
-    PROTOCOL_VERSION
+    PROTOCOL_VERSION,
+    WorkMode
 } from "./protocol";
 
 
@@ -340,8 +341,9 @@ export class PersistentCoderProcess
 
 
     public run(
-        request: string,
-        projectRoot: string
+    request: string,
+    projectRoot: string,
+    workMode: WorkMode
     ): string {
         if (
             this.currentStatus !==
@@ -359,13 +361,13 @@ export class PersistentCoderProcess
             makeRunRequest(
                 requestId,
                 request,
-                projectRoot
+                projectRoot,
+                workMode
             )
         );
 
         return requestId;
     }
-
 
     public dispose(): void {
         this.stopping =
