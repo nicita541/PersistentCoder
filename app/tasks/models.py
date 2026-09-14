@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 
+from app.tasks.verification_spec import VerificationSpec
+
 
 class TaskStatus(str, Enum):
     PENDING = "PENDING"
@@ -85,6 +87,7 @@ class TaskDraft:
         default_factory=list
     )
     change_paths: list[str] = field(default_factory=list)
+    verification_specs: list[VerificationSpec] = field(default_factory=list)
 
 
 @dataclass
@@ -104,6 +107,7 @@ class StepDraft:
         default_factory=list
     )
     change_paths: list[str] = field(default_factory=list)
+    verification_specs: list[VerificationSpec] = field(default_factory=list)
 
 
 @dataclass
@@ -156,6 +160,7 @@ class TaskRecord:
         default_factory=list
     )
     change_paths: list[str] = field(default_factory=list)
+    verification_specs: list[VerificationSpec] = field(default_factory=list)
 
 @dataclass
 class StepRecord:
@@ -187,6 +192,7 @@ class StepRecord:
     finished_at: str | None
     updated_at: str
     change_paths: list[str] = field(default_factory=list)
+    verification_specs: list[VerificationSpec] = field(default_factory=list)
 
 
 @dataclass

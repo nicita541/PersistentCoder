@@ -204,6 +204,9 @@ def tasks_response() -> str:
                         "database.txt exists"
                     ],
                     "change_paths": ["database.txt"],
+                    "verification_specs": [
+                        {"kind": "FILE_EXISTS", "target": "database.txt"}
+                    ],
                 },
                 {
                     "key": "models",
@@ -221,6 +224,9 @@ def tasks_response() -> str:
                         "models.txt exists"
                     ],
                     "change_paths": ["models.txt"],
+                    "verification_specs": [
+                        {"kind": "FILE_EXISTS", "target": "models.txt"}
+                    ],
                 },
                 {
                     "key": "auth",
@@ -235,6 +241,9 @@ def tasks_response() -> str:
                         "auth.txt exists"
                     ],
                     "change_paths": ["auth.txt"],
+                    "verification_specs": [
+                        {"kind": "FILE_EXISTS", "target": "auth.txt"}
+                    ],
                 },
                 {
                     "key": "notes_api",
@@ -250,6 +259,9 @@ def tasks_response() -> str:
                         "artifact.txt exists"
                     ],
                     "change_paths": ["artifact.txt"],
+                    "verification_specs": [
+                        {"kind": "FILE_EXISTS", "target": "artifact.txt"}
+                    ],
                 },
             ]
         },

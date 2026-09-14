@@ -372,6 +372,7 @@ class AgentRuntime:
             use_llm_dependencies=(
                 use_llm_dependencies
             ),
+            repo_selector=self.repo_selector,
         )
 
         self.workspace = Workspace(

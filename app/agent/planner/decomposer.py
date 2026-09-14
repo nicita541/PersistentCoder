@@ -392,6 +392,9 @@ class TaskDecomposer:
         "- change_paths lists every exact project-relative file the task may "
         "write or delete; it must not contain directories or globs, and every "
         "path must belong to exactly one task\n"
+        "- verification_specs is the authoritative machine-checkable list; "
+        "use FILE_EXISTS, FILE_ABSENT, PY_COMPILE, PY_IMPORT, PY_SYMBOL, "
+        "PY_SIGNATURE, or PYTEST with explicit project-relative targets\n"
         "- each task may include an ordered \"steps\" array "
         "(title, description, requires, produces, "
         "success_criteria); steps are meaningful "
@@ -424,6 +427,7 @@ class TaskDecomposer:
         previous_components: (
             list[dict[str, object]] | None
         ) = None,
+        repo_context: str = "",
     ) -> list[dict[str, object]]:
         goal_json = json.dumps(
             goal,
@@ -472,6 +476,8 @@ class TaskDecomposer:
                     f"{user_request}\n\n"
                     "GOAL ANALYSIS:\n"
                     f"{goal_json}\n\n"
+                    "BOUNDED REPOSITORY CONTEXT:\n"
+                    f"{repo_context or '(empty project)'}\n\n"
                     f"{repair_block}"
                     "AUTHORITATIVE RULES:\n"
                     f"{self.DECOMPOSER_RULES}\n\n"
@@ -483,6 +489,8 @@ class TaskDecomposer:
                     '"priority": 80, "requires": [], '
                     '"produces": ["sandbox_agent_test/calculator.py"], '
                     '"change_paths": ["sandbox_agent_test/calculator.py"], '
+                    '"verification_specs": [{"kind":"PY_COMPILE",'
+                    '"target":"sandbox_agent_test/calculator.py"}], '
                     '"external_dependencies": [], '
                     '"success_criteria": ["calculator.py exists"]}, '
                     '{"key": "tests", "title": "Test calculator", '
@@ -491,6 +499,8 @@ class TaskDecomposer:
                     '"requires": ["sandbox_agent_test/calculator.py"], '
                     '"produces": ["sandbox_agent_test/test_calculator.py"], '
                     '"change_paths": ["sandbox_agent_test/test_calculator.py"], '
+                    '"verification_specs": [{"kind":"PYTEST",'
+                    '"target":"sandbox_agent_test/test_calculator.py"}], '
                     '"external_dependencies": ["pytest"], '
                     '"success_criteria": ["tests pass"]}]}\n\n'
                     "IMPORTANT: every value in requires MUST appear "
@@ -507,6 +517,8 @@ class TaskDecomposer:
                     '      "requires": ["internal resource"],\n'
                     '      "produces": ["internal resource"],\n'
                     '      "change_paths": ["src/exact_file.py"],\n'
+                    '      "verification_specs": [{"kind": "FILE_EXISTS", '
+                    '"target": "src/exact_file.py"}],\n'
                     '      "external_dependencies": ["flask"],\n'
                     '      "success_criteria": ["verifiable result"]\n'
                     "    }\n"
@@ -530,6 +542,8 @@ class TaskDecomposer:
                 f"{user_request}\n\n"
                 "GOAL ANALYSIS:\n"
                 f"{goal_json}\n\n"
+                "BOUNDED REPOSITORY CONTEXT:\n"
+                f"{repo_context or '(empty project)'}\n\n"
                 "AUTHORITATIVE RULES:\n"
                 f"{self.DECOMPOSER_RULES}"
             ),

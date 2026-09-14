@@ -23,6 +23,7 @@ from app.tasks.store_context import (
     owns_task,
     split_store_binding,
 )
+from app.tasks.verification_spec import VerificationSpec, parse_verification_specs
 
 
 class StepStoreError(
@@ -108,6 +109,10 @@ class StepStore:
                         NOT NULL
                         DEFAULT '[]',
 
+                    verification_specs_json TEXT
+                        NOT NULL
+                        DEFAULT '[]',
+
                     attempt_count INTEGER
                         NOT NULL
                         DEFAULT 0,
@@ -171,6 +176,11 @@ class StepStore:
                     "ALTER TABLE steps ADD COLUMN change_paths_json "
                     "TEXT NOT NULL DEFAULT '[]'"
                 )
+            if "verification_specs_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE steps ADD COLUMN verification_specs_json "
+                    "TEXT NOT NULL DEFAULT '[]'"
+                )
 
             connection.execute(
                 """
@@ -188,6 +198,17 @@ class StepStore:
             value,
             ensure_ascii=False,
         )
+
+    @staticmethod
+    def _dump_specs(value: list[VerificationSpec]) -> str:
+        return json.dumps(
+            [spec.to_dict() for spec in value],
+            ensure_ascii=False,
+        )
+
+    @staticmethod
+    def _load_specs(value: str) -> list[VerificationSpec]:
+        return parse_verification_specs(json.loads(value))
 
     @staticmethod
     def _load_list(
@@ -278,11 +299,13 @@ class StepStore:
                         produces_json,
                         success_criteria_json,
                         change_paths_json,
+                        verification_specs_json,
                         attempt_count,
                         result_artifacts_json,
                         verification_evidence_json
                     )
                     VALUES (
+                        ?,
                         ?,
                         ?,
                         ?,
@@ -313,6 +336,7 @@ class StepStore:
                             step.success_criteria
                         ),
                         self._dump_list(step_paths),
+                        self._dump_specs(step.verification_specs),
                     ),
                 )
 
@@ -360,6 +384,9 @@ class StepStore:
             ),
             change_paths=self._load_list(
                 row["change_paths_json"]
+            ),
+            verification_specs=self._load_specs(
+                row["verification_specs_json"]
             ),
             attempt_count=int(
                 row["attempt_count"]

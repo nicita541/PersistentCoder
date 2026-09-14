@@ -179,6 +179,31 @@ class Verifier:
             StepStatus.IN_PROGRESS,
         )
 
+    def block_step(
+        self,
+        step_id: int,
+        *,
+        reason: str,
+        evidence: list[str],
+    ) -> None:
+        self._require_evidence(evidence)
+        step = self.step_store.get_step(step_id)
+        if step is None or step.status is not StepStatus.VERIFYING:
+            raise VerificationError("step must be VERIFYING before BLOCKED")
+        self.verification_store.record_step(
+            step_id,
+            status=VerificationStatus.BLOCKED,
+            evidence=evidence,
+            reason=reason,
+        )
+        self.step_store.set_step_verification(
+            step_id,
+            verification_status="BLOCKED",
+            verification_evidence=evidence,
+            failure_reason=reason,
+        )
+        self.step_store.update_step_status(step_id, StepStatus.BLOCKED)
+
     # ==========================================
     # TASK VERIFICATION
     # ==========================================
@@ -326,3 +351,27 @@ class Verifier:
             task_id,
             TaskStatus.IN_PROGRESS,
         )
+
+    def block_task(
+        self,
+        task_id: int,
+        *,
+        reason: str,
+        evidence: list[str],
+    ) -> None:
+        self._require_evidence(evidence)
+        task = self.plan_store.get_task(task_id)
+        if task is None or task.status is not TaskStatus.VERIFYING:
+            raise VerificationError("task must be VERIFYING before BLOCKED")
+        self.verification_store.record_task(
+            task_id,
+            status=VerificationStatus.BLOCKED,
+            evidence=evidence,
+            reason=reason,
+        )
+        self.plan_store.set_task_verification(
+            task_id,
+            verification_status="BLOCKED",
+            verification_evidence=evidence,
+        )
+        self.plan_store.update_task_status(task_id, TaskStatus.BLOCKED)

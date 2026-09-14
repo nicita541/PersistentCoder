@@ -9,6 +9,8 @@ from app.agent.planner.decomposer import (
     require_string_list,
 )
 from app.tasks.models import StepDraft, TaskDraft
+from app.tasks.verification_spec import parse_verification_specs
+from app.tasks.change_scope import canonicalize_change_paths
 
 
 class TaskBuilder:
@@ -127,6 +129,15 @@ class TaskBuilder:
                 "change_paths",
             )
 
+            try:
+                verification_specs = parse_verification_specs(
+                    raw_task.get("verification_specs", [])
+                )
+            except ValueError as error:
+                raise PlannerError(
+                    f"task '{key}' has invalid verification_specs: {error}"
+                ) from error
+
             result.append(
                 TaskDraft(
                     key=key,
@@ -142,6 +153,7 @@ class TaskBuilder:
                         external_dependencies
                     ),
                     change_paths=change_paths,
+                    verification_specs=verification_specs,
                 )
             )
 
@@ -311,6 +323,47 @@ class TaskBuilder:
 
             key = require_string(raw_task, "key")
 
+            task_paths = canonicalize_change_paths(
+                optional_string_list(raw_task, "change_paths")
+            )
+            if task_paths:
+                try:
+                    task_specs = parse_verification_specs(
+                        raw_task.get("verification_specs", [])
+                    )
+                except ValueError as error:
+                    raise PlannerError(
+                        f"task '{key}' has invalid verification specs: {error}"
+                    ) from error
+
+                file_steps: list[StepDraft] = []
+                for path in task_paths:
+                    path_specs = [
+                        spec for spec in task_specs if spec.target == path
+                    ]
+                    if not path_specs:
+                        raise PlannerError(
+                            f"owned file '{path}' requires a structured verification spec"
+                        )
+                    file_steps.append(
+                        StepDraft(
+                            title=f"Implement {path}",
+                            description=(
+                                f"Change only {path}. "
+                                + require_string(raw_task, "description")
+                            ),
+                            requires=optional_string_list(raw_task, "requires"),
+                            produces=[path],
+                            success_criteria=optional_string_list(
+                                raw_task, "success_criteria"
+                            ),
+                            change_paths=[path],
+                            verification_specs=path_specs,
+                        )
+                    )
+                steps_by_key[key] = file_steps
+                continue
+
             raw_steps = raw_task.get("steps", [])
 
             if raw_steps is None:
@@ -363,6 +416,9 @@ class TaskBuilder:
                         change_paths=optional_string_list(
                             raw_step,
                             "change_paths",
+                        ),
+                        verification_specs=parse_verification_specs(
+                            raw_step.get("verification_specs", [])
                         ),
                     )
                 )
