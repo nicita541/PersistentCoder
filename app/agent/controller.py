@@ -48,6 +48,7 @@ class AgentController:
         attempt_store=None,
         max_step_attempts: int = 2,
         max_task_attempts: int = 3,
+        dependency_plan=None,
     ) -> None:
         self.planner = planner
         self.coder = coder
@@ -60,6 +61,7 @@ class AgentController:
         self.events = events
         self.sandbox_workspace = sandbox_workspace
         self.attempt_store = attempt_store
+        self.dependency_plan = dependency_plan
         self._attempt_seq = 0
         self.max_step_attempts = (
             max_step_attempts
@@ -212,6 +214,35 @@ class AgentController:
     ) -> AgentState:
         task = self._require_task(state)
         step = self._active_step(state)
+
+        if (
+            task.external_dependencies
+            and self.dependency_plan is not None
+            and self.dependency_plan.status == "BLOCKED"
+        ):
+            reason = "BLOCKED_DEPENDENCY: " + str(self.dependency_plan.reason)
+            self.plan_store.update_task_status(task.id, TaskStatus.BLOCKED)
+            if step is not None:
+                self.step_store.update_step_status(step.id, StepStatus.BLOCKED)
+            state.execution = ExecutionResult(
+                ok=False,
+                summary="dependency environment unavailable",
+                failure_reason=reason,
+                evidence=["blocked_dependency"],
+            )
+            state.repair = RepairState(
+                required=False,
+                action="BLOCKED_DEPENDENCY",
+                scope="TASK",
+                reason=reason,
+            )
+            state.phase = AgentPhase.FAILED
+            state.completion = "FAILED"
+            self._emit(
+                "dependency_blocked",
+                {"task_id": task.id, "reason": reason[:400]},
+            )
+            return state
 
         self._begin_attempt(state, task, step)
 

@@ -481,6 +481,7 @@ class AgentRuntime:
             attempt_store=self.attempt_store,
             max_step_attempts=max_step_attempts,
             max_task_attempts=max_task_attempts,
+            dependency_plan=self.dependency_plan,
         )
 
         # Last finished AgentState (CLI: /status, /patch, /apply).

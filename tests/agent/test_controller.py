@@ -110,3 +110,31 @@ def test_controller_uses_injected_dependencies(
         runtime.controller.verifier
         is runtime.verification_agent
     )
+
+
+def test_blocked_dependency_gates_task_without_calling_coder(tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    task_payload = json.loads(tasks_response())
+    task_payload["tasks"][0]["external_dependencies"] = ["requests"]
+    llm = FakeLLM(
+        [goal_response(), json.dumps(task_payload), dependencies_response()],
+        default=coder_envelope(),
+    )
+    runtime = _runtime(tmp_path, llm)
+    state = runtime.controller.observe("Build")
+    runtime.controller.plan(state)
+    runtime.controller.advance(state)
+    calls_before = len(llm.calls)
+    runtime.controller.dependency_plan = SimpleNamespace(
+        status="BLOCKED", reason="build disabled"
+    )
+
+    runtime.controller.execute(state)
+
+    task = runtime.plan_store.get_task(state.active_task_id)
+    assert state.phase.value == "FAILED"
+    assert task.status.value == "BLOCKED"
+    assert "BLOCKED_DEPENDENCY" in state.execution.failure_reason
+    assert len(llm.calls) == calls_before
