@@ -653,7 +653,7 @@ Run: `python -m pytest tests/agent/test_runtime_project_session.py tests/agent/t
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add app/agent/runtime.py app/agent/controller.py app/main.py tests/agent/test_runtime_project_session.py tests/agent/test_runtime.py tests/agent/test_controller.py
@@ -674,7 +674,7 @@ git commit -m "feat: integrate project sessions into runtime"
 - Consumes: completed Stage 1 public interfaces.
 - Produces: executable security evidence and user-facing storage/recovery documentation.
 
-- [ ] **Step 1: Write end-to-end negative-security tests**
+- [x] **Step 1: Write end-to-end negative-security tests**
 
 ```python
 from tests.helpers.legacy_sqlite import seed_legacy_memory, seed_legacy_run
@@ -753,17 +753,17 @@ def seed_legacy_memory(database: Path, memory_type: str, content: str) -> None:
         )
 ```
 
-- [ ] **Step 2: Run the security file and confirm any remaining leaks**
+- [x] **Step 2: Run the security file and confirm any remaining leaks**
 
 Run: `python -m pytest tests/security/test_cross_project_runtime_isolation.py -q`
 
 Expected before final fixes: at least one FAIL if a store, recovery path, or memory query still bypasses project binding.
 
-- [ ] **Step 3: Close the specific binding gaps and document behavior**
+- [x] **Step 3: Close the specific binding gaps and document behavior**
 
 For each failing assertion, route the operation through `StoreContext` or project-scoped workspace lookup. Do not add permissive fallback queries. Document the exact `data/projects/<project_id>` and `.sandbox/projects/<project_id>` locations, global-rule behavior, dirty-session states, and legacy exclusion policy in README.
 
-- [ ] **Step 4: Run the complete Stage 1 gate**
+- [x] **Step 4: Run the complete Stage 1 gate**
 
 Run:
 
@@ -774,7 +774,13 @@ python -m pytest tests/test_project_identity.py tests/test_project_store_isolati
 
 Expected: compilation succeeds and every listed test passes. Then run `python -m pytest -q -m "not real_llm"` once as the Stage 1 aggregate regression and record all failures before starting Stage 2.
 
-- [ ] **Step 5: Commit**
+Recorded 2026-09-14: the focused gate passed 52/52. The aggregate passed
+376 tests with 3 skips and one acknowledged worktree-only infrastructure
+failure: `test_host_venv_is_under_project` resolves the worktree `.venv`
+junction to the main checkout. The same invariant passes in the main checkout;
+no Stage 1 product test failed.
+
+- [x] **Step 5: Commit**
 
 ```powershell
 git add app tests README.md

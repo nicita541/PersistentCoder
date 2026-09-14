@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from app.agent.runtime import AgentRuntime
+from app.agent.session import SessionStatus
 from app.agent.state import (
     AgentPhase,
     VerificationResult,
@@ -212,6 +213,10 @@ def test_apply_targets_source_project_not_module_project_root(
             reason="all criteria passed",
         ),
     )
+    assert runtime.session is not None
+    runtime.session.transition(SessionStatus.RUNNING)
+    runtime.session.transition(SessionStatus.DIRTY_VERIFIED)
+    runtime.session = runtime.session_store.update(runtime.session)
 
     preview = runtime.patch_preview()
 
