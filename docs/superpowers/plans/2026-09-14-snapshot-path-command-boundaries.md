@@ -116,17 +116,17 @@ installation; no silent compatibility path that bypasses the new boundary.
 - `CancellationToken.cancel()` / `.cancelled`; runner returns code 130 when
   cancelled and terminates an active container/process without host fallback.
 
-- [ ] Update argv/hardening tests first; add integration evidence that a command
+- [x] Update argv/hardening tests first; add integration evidence that a command
   can create a file for its own test process but cannot change source or the
   persistent sandbox.
-- [ ] Add tmpfs-size and cancellation limits/hooks while preserving network
+- [x] Add tmpfs-size and cancellation limits/hooks while preserving network
   none, cap-drop ALL, no-new-privileges, PIDs, memory, CPU, non-root user,
   timeout/output bounds, and docker-socket denial.
-- [ ] Use a fixed framework shell wrapper (`cp -a /input/. /workspace/ && ...`)
+- [x] Use a fixed framework shell wrapper (`cp -a /input/. /workspace/ && ...`)
   inside the container; the model controls only the already validated command.
-- [ ] Run unit security tests and Docker integration tests when the daemon/image
+- [x] Run unit security tests and Docker integration tests when the daemon/image
   is available; otherwise record explicit skips, never a host fallback.
-- [ ] Commit: `feat: isolate command writes in ephemeral tmpfs`.
+- [x] Commit: `feat: isolate command writes in ephemeral tmpfs`.
 
 ### Task 5: Add exact `AllowedChangeSet`
 

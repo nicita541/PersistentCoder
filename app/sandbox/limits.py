@@ -43,6 +43,7 @@ class SandboxLimits:
     # Commands
     max_output_bytes: int = 64_000
     command_timeout: int = 180
+    max_command_workspace_bytes: int = 64_000_000
 
 
 DEFAULT_LIMITS = SandboxLimits()
