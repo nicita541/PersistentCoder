@@ -84,6 +84,7 @@ class TaskDraft:
     external_dependencies: list[str] = field(
         default_factory=list
     )
+    change_paths: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -102,6 +103,7 @@ class StepDraft:
     success_criteria: list[str] = field(
         default_factory=list
     )
+    change_paths: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -153,6 +155,7 @@ class TaskRecord:
     external_dependencies: list[str] = field(
         default_factory=list
     )
+    change_paths: list[str] = field(default_factory=list)
 
 @dataclass
 class StepRecord:
@@ -183,6 +186,7 @@ class StepRecord:
     started_at: str | None
     finished_at: str | None
     updated_at: str
+    change_paths: list[str] = field(default_factory=list)
 
 
 @dataclass

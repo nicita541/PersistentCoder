@@ -8,6 +8,10 @@ from pathlib import Path
 from app.tasks.dependencies import (
     validate_task_graph,
 )
+from app.tasks.change_scope import (
+    canonicalize_change_paths,
+    validate_unique_task_paths,
+)
 from app.tasks.models import (
     PlanDraft,
     PlanRecord,
@@ -159,6 +163,10 @@ class PlanStore:
                         DEFAULT '[]',
 
                     success_criteria_json TEXT
+                        NOT NULL
+                        DEFAULT '[]',
+
+                    change_paths_json TEXT
                         NOT NULL
                         DEFAULT '[]',
 
@@ -483,6 +491,12 @@ class PlanStore:
                     "ALTER TABLE plans ADD COLUMN project_id TEXT"
                 )
 
+            if "change_paths_json" not in task_columns:
+                connection.execute(
+                    "ALTER TABLE tasks ADD COLUMN change_paths_json "
+                    "TEXT NOT NULL DEFAULT '[]'"
+                )
+
             if "canonical_source_root" not in plan_columns:
                 connection.execute(
                     "ALTER TABLE plans "
@@ -647,9 +661,13 @@ class PlanStore:
                 replace(
                     task,
                     key=resolved_key,
+                    change_paths=canonicalize_change_paths(
+                        task.change_paths
+                    ),
                 )
             )
 
+        validate_unique_task_paths(prepared)
         return prepared
 
     # ==========================================
@@ -1042,12 +1060,14 @@ class PlanStore:
                         requires_json,
                         produces_json,
                         success_criteria_json,
+                        change_paths_json,
                         current_step,
                         attempt_count,
                         result_artifacts_json,
                         verification_evidence_json
                     )
                     VALUES (
+                        ?,
                         ?,
                         ?,
                         ?,
@@ -1080,6 +1100,9 @@ class PlanStore:
                         ),
                         self._dump_list(
                             task.success_criteria
+                        ),
+                        self._dump_list(
+                            task.change_paths
                         ),
                     ),
                 )
@@ -1390,6 +1413,7 @@ class PlanStore:
                     requires_json,
                     produces_json,
                     success_criteria_json,
+                    change_paths_json,
                     current_step,
                     attempt_count,
                     result_summary,
@@ -1464,6 +1488,9 @@ class PlanStore:
                                 "success_criteria_json"
                             ]
                         )
+                    ),
+                    change_paths=self._load_list(
+                        row["change_paths_json"]
                     ),
                     current_step=current_step,
                     attempt_count=int(

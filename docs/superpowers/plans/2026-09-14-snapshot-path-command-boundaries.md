@@ -143,16 +143,16 @@ installation; no silent compatibility path that bypasses the new boundary.
 - `assert_can_read`, `assert_can_write`, and `assert_can_delete` return the
   canonical `ProjectPath` or raise `ChangeScopeError`.
 
-- [ ] Write tests for exact ownership, no same-directory exception, Step subset,
+- [x] Write tests for exact ownership, no same-directory exception, Step subset,
   Windows comparison keys, duplicate normalized producers, and cross-task
   ownership conflicts.
-- [ ] Implement the value object and persist canonical declared Task/Step paths
+- [x] Implement the value object and persist canonical declared Task/Step paths
   in backward-compatible nullable JSON columns. Legacy missing scope is empty,
   not unrestricted.
-- [ ] Reject conflicting producers before plan persistence and reject a Step
+- [x] Reject conflicting producers before plan persistence and reject a Step
   scope outside its Task.
-- [ ] Run task model/store/step/dependency/versioning regressions.
-- [ ] Commit: `feat: enforce exact task change scopes`.
+- [x] Run task model/store/step/dependency/versioning regressions.
+- [x] Commit: `feat: enforce exact task change scopes`.
 
 ### Task 6: Enforce current-attempt reads and exact delete
 

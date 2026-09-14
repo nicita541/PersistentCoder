@@ -4,6 +4,11 @@ import json
 import sqlite3
 from pathlib import Path
 
+from app.tasks.change_scope import (
+    AllowedChangeSet,
+    ChangeScopeError,
+    canonicalize_change_paths,
+)
 from app.tasks.models import (
     StepDraft,
     StepRecord,
@@ -42,6 +47,7 @@ class StepStore:
         )
 
         self._initialize_database()
+        self._ensure_change_paths_column()
 
     def _connect(
         self,
@@ -98,6 +104,10 @@ class StepStore:
                         NOT NULL
                         DEFAULT '[]',
 
+                    change_paths_json TEXT
+                        NOT NULL
+                        DEFAULT '[]',
+
                     attempt_count INTEGER
                         NOT NULL
                         DEFAULT 0,
@@ -147,6 +157,20 @@ class StepStore:
                 ON steps(task_id)
                 """
             )
+
+    def _ensure_change_paths_column(self) -> None:
+        with self._connect() as connection:
+            columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(steps)"
+                ).fetchall()
+            }
+            if "change_paths_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE steps ADD COLUMN change_paths_json "
+                    "TEXT NOT NULL DEFAULT '[]'"
+                )
 
             connection.execute(
                 """
@@ -205,6 +229,12 @@ class StepStore:
                     f"unknown task: {task_id}"
                 )
 
+            task_row = connection.execute(
+                "SELECT change_paths_json FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            task_paths = self._load_list(task_row["change_paths_json"])
+
             existing = connection.execute(
                 """
                 SELECT COUNT(*) AS count
@@ -228,6 +258,14 @@ class StepStore:
                 steps,
                 start=1,
             ):
+                try:
+                    step_paths = canonicalize_change_paths(
+                        step.change_paths
+                    )
+                    AllowedChangeSet(task_paths, step_paths)
+                except ChangeScopeError as error:
+                    raise StepStoreError(str(error)) from error
+
                 cursor = connection.execute(
                     """
                     INSERT INTO steps (
@@ -239,11 +277,13 @@ class StepStore:
                         requires_json,
                         produces_json,
                         success_criteria_json,
+                        change_paths_json,
                         attempt_count,
                         result_artifacts_json,
                         verification_evidence_json
                     )
                     VALUES (
+                        ?,
                         ?,
                         ?,
                         ?,
@@ -272,6 +312,7 @@ class StepStore:
                         self._dump_list(
                             step.success_criteria
                         ),
+                        self._dump_list(step_paths),
                     ),
                 )
 
@@ -316,6 +357,9 @@ class StepStore:
                         "success_criteria_json"
                     ]
                 )
+            ),
+            change_paths=self._load_list(
+                row["change_paths_json"]
             ),
             attempt_count=int(
                 row["attempt_count"]
