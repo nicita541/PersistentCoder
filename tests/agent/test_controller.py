@@ -88,7 +88,7 @@ def test_run_records_memory_experience(tmp_path):
     )
 
     assert any(
-        memory["type"] == "FACT"
+        memory["type"] == "EXPERIENCE"
         and "завершён" in str(memory["content"])
         for memory in memories
     )

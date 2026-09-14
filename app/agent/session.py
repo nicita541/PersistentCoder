@@ -18,7 +18,9 @@ class SessionTransitionError(RuntimeError):
 
 
 ALLOWED_TRANSITIONS: dict[SessionStatus, frozenset[SessionStatus]] = {
-    SessionStatus.CLEAN: frozenset({SessionStatus.RUNNING}),
+    SessionStatus.CLEAN: frozenset(
+        {SessionStatus.RUNNING, SessionStatus.DISCARDED}
+    ),
     SessionStatus.RUNNING: frozenset(
         {
             SessionStatus.DIRTY_VERIFIED,

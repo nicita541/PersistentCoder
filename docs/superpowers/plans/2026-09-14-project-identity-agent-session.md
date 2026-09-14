@@ -597,7 +597,7 @@ git commit -m "feat: reset sandbox sessions atomically"
 - Consumes: all interfaces from Tasks 1-6.
 - Produces: `AgentRuntime.project_identity`; `AgentRuntime.project_storage`; `AgentRuntime.session`; `new_session(discard_dirty: bool = False)`, `discard_session()`, `rebase_session_after_apply()`; runtime run transitions.
 
-- [ ] **Step 1: Write failing composition tests**
+- [x] **Step 1: Write failing composition tests**
 
 ```python
 def test_runtime_derives_storage_before_opening_stores(tmp_path, fake_llm):
@@ -622,13 +622,13 @@ def test_new_session_requires_explicit_dirty_resolution(tmp_path, fake_llm):
     assert runtime.session.status is SessionStatus.CLEAN
 ```
 
-- [ ] **Step 2: Run tests and confirm current identity/session failures**
+- [x] **Step 2: Run tests and confirm current identity/session failures**
 
 Run: `python -m pytest tests/agent/test_runtime_project_session.py -q`
 
 Expected: FAIL because stores and sandbox are opened before any project/session binding.
 
-- [ ] **Step 3: Reorder runtime composition and wire transitions**
+- [x] **Step 3: Reorder runtime composition and wire transitions**
 
 Runtime initialization order must be:
 
@@ -647,7 +647,7 @@ self.session_store = SessionStore(self.store_context)
 
 Only after matching interrupted runs are recovered may runtime open or create the project's sandbox and session. `run()` atomically claims a CLEAN session as RUNNING, then transitions to `DIRTY_VERIFIED` on verified sandbox changes, `CLEAN` on verified no-op, or `DIRTY_FAILED` on failure/cancellation with retained reviewable changes. Direct apply transitions through `APPLIED` and then rebases to a new CLEAN session state. Do not let event persistence exceptions alter transitions.
 
-- [ ] **Step 4: Run runtime/controller regressions**
+- [x] **Step 4: Run runtime/controller regressions**
 
 Run: `python -m pytest tests/agent/test_runtime_project_session.py tests/agent/test_runtime.py tests/agent/test_controller.py tests/agent/test_agent_loop.py tests/test_cli_commands.py -q`
 

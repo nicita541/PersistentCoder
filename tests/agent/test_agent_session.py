@@ -26,6 +26,7 @@ def _session(status: SessionStatus) -> AgentSession:
     ("source", "target"),
     [
         (SessionStatus.CLEAN, SessionStatus.RUNNING),
+        (SessionStatus.CLEAN, SessionStatus.DISCARDED),
         (SessionStatus.RUNNING, SessionStatus.DIRTY_VERIFIED),
         (SessionStatus.RUNNING, SessionStatus.DIRTY_FAILED),
         (SessionStatus.RUNNING, SessionStatus.CLEAN),

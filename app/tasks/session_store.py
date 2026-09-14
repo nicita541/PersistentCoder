@@ -115,6 +115,29 @@ class SessionStore:
             ).fetchone()
         return self._row_to_session(row) if row is not None else None
 
+    def get_by_sandbox_session_id(
+        self,
+        sandbox_session_id: str,
+    ) -> AgentSession | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM agent_sessions
+                WHERE sandbox_session_id = ?
+                    AND project_id = ?
+                    AND canonical_source_root = ?
+                ORDER BY rowid DESC
+                LIMIT 1
+                """,
+                (
+                    sandbox_session_id,
+                    self.context.project_id,
+                    self.context.canonical_source_root,
+                ),
+            ).fetchone()
+        return self._row_to_session(row) if row is not None else None
+
     def update(self, session: AgentSession) -> AgentSession:
         if (
             session.project_id != self.context.project_id

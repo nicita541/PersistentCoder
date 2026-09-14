@@ -43,6 +43,25 @@ def test_session_store_is_project_scoped(
     assert store_b.get(session_id) is None
 
 
+def test_latest_record_for_reused_sandbox_session_wins(
+    tmp_path: Path,
+) -> None:
+    context = _context(
+        tmp_path / "shared.db",
+        "a",
+        tmp_path / "project",
+    )
+    store = SessionStore(context)
+    first_id = store.create(sandbox_session_id="sandbox-a")
+    second_id = store.create(sandbox_session_id="sandbox-a")
+
+    latest = store.get_by_sandbox_session_id("sandbox-a")
+
+    assert latest is not None
+    assert latest.id == second_id
+    assert latest.id != first_id
+
+
 def test_stale_session_update_fails_closed(
     tmp_path: Path,
 ) -> None:
