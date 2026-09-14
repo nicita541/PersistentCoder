@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from app.sandbox.project_path import ProjectPath, ProjectPathError
+
 
 class PolicyViolation(RuntimeError):
     """
@@ -175,15 +177,13 @@ class PathPolicy:
                 f"environment expansion is forbidden: {raw}"
             )
 
-        candidate = (self.root / raw).resolve()
-
-        if (
-            candidate != self.root
-            and self.root not in candidate.parents
-        ):
+        try:
+            project_path = ProjectPath.parse(raw)
+            candidate = project_path.resolve_under(self.root)
+        except ProjectPathError as error:
             raise PolicyViolation(
-                f"path escapes workspace: {raw}"
-            )
+                str(error)
+            ) from error
 
         return candidate
 

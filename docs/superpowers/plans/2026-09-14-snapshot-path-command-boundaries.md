@@ -40,15 +40,15 @@ installation; no silent compatibility path that bypasses the new boundary.
 - `.value` is normalized POSIX-relative text; `.comparison_key` is
   case-insensitive on Windows; `.resolve_under(root)` verifies containment.
 
-- [ ] Write tests for `.github/workflows/ci.yml`, exact leading `./`, mixed
+- [x] Write tests for `.github/workflows/ci.yml`, exact leading `./`, mixed
   separators, duplicate separators, empty/dot, `..`, POSIX absolute, drive and
   UNC paths, NUL, and Windows case comparison.
-- [ ] Confirm tests fail against the current scattered normalization.
-- [ ] Implement the immutable normalizer and route `PathPolicy`, `FileTools`,
+- [x] Confirm tests fail against the current scattered normalization.
+- [x] Implement the immutable normalizer and route `PathPolicy`, `FileTools`,
   and `Workspace.relative` through it without weakening resolved containment.
-- [ ] Run `tests/security/test_project_path.py`, path-boundary, file-tool, and
+- [x] Run `tests/security/test_project_path.py`, path-boundary, file-tool, and
   coder protocol regressions.
-- [ ] Commit: `feat: centralize project path validation`.
+- [x] Commit: `feat: centralize project path validation`.
 
 ### Task 2: Build protected-path and ignore policy
 
