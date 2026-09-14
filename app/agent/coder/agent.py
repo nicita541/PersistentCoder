@@ -23,11 +23,13 @@ class CodingAgent:
         plan_id: int | None = None,
         feedback: str | None = None,
         allowed_changes: AllowedChangeSet | None = None,
+        cancellation_token=None,
     ) -> ExecutionResult:
         return self.executor.execute(
             task,
             step=step,
             feedback=feedback,
             allowed_changes=allowed_changes,
+            cancellation_token=cancellation_token,
         )
 

@@ -5,8 +5,8 @@ import time
 from app.agent.state import (
     CommandExecution,
     ExecutionResult,
-    extract_json_object,
 )
+from app.agent.coder.protocol import ActionEnvelopeDecoder, ProtocolError
 from app.sandbox.limits import (
     DEFAULT_LIMITS,
     LimitExceeded,
@@ -22,77 +22,6 @@ from app.tasks.change_scope import AllowedChangeSet, ChangeScopeError
 
 class CodeExecutorError(RuntimeError):
     pass
-
-
-# Keys that unambiguously carry a file's full content when the model
-# also names a relative path. Accepting them is normalization, not
-# guessing: validation (path policy, limits, observe-before-edit)
-# still runs before anything is written.
-CONTENT_KEYS = (
-    "content",
-    "code",
-    "file_content",
-    "source",
-    "body",
-    "text",
-    "new_content",
-)
-
-
-def strip_markdown_fence(
-    answer: str,
-) -> str:
-    """
-    Small models very often wrap an otherwise valid JSON envelope in
-    a markdown code fence. Stripping the fence is deterministic
-    normalization, not guessing: the object itself is still fully
-    validated before anything is written.
-    """
-
-    text = (answer or "").strip()
-
-    if not text.startswith("```"):
-        return text
-
-    first_newline = text.find("\n")
-
-    if first_newline == -1:
-        return text
-
-    body = text[first_newline + 1:]
-
-    stripped = body.rstrip()
-
-    if stripped.endswith("```"):
-        stripped = stripped[:-3]
-
-    return stripped.strip()
-
-
-def _content_key(
-    proposal: dict[str, object],
-) -> str | None:
-    for key in CONTENT_KEYS:
-        if isinstance(proposal.get(key), str):
-            return key
-
-    return None
-
-
-def _normalize_files(
-    files: object,
-) -> object:
-    """
-    Accept the mapping form {"relative/path": "content"} as well.
-    """
-
-    if isinstance(files, dict):
-        return [
-            {"path": path, "content": content}
-            for path, content in files.items()
-        ]
-
-    return files
 
 
 # Bounded corrective re-prompts for a malformed action envelope.
@@ -131,6 +60,7 @@ class CodeExecutor:
         limits=DEFAULT_LIMITS,
         known_files=None,
         on_event=None,
+        decoder: ActionEnvelopeDecoder | None = None,
     ) -> None:
         self.workspace = workspace
         self.llm = llm
@@ -143,6 +73,7 @@ class CodeExecutor:
 
         # Optional progress/timing sink (Agent Layer event bus).
         self.on_event = on_event
+        self.decoder = decoder or ActionEnvelopeDecoder()
 
         # Kept as shared runtime bookkeeping for compatibility and
         # reporting only. It never bypasses current-attempt reads.
@@ -257,15 +188,28 @@ class CodeExecutor:
         step=None,
         feedback: str | None = None,
         allowed_changes: AllowedChangeSet | None = None,
+        cancellation_token=None,
     ) -> ExecutionResult:
         observed: dict[str, str] = {}
         transcript: list[str] = []
         envelope_errors = 0
+        observation_bytes = 0
 
         for iteration in range(
             1,
             self.limits.max_tool_iterations + 1,
         ):
+            if (
+                cancellation_token is not None
+                and cancellation_token.cancelled
+            ):
+                return self._fail(
+                    "execution cancelled",
+                    "execution cancelled",
+                    ["cancelled"],
+                    observed,
+                )
+
             context_started = time.time()
 
             messages = self._build_messages(
@@ -349,11 +293,12 @@ class CodeExecutor:
             )
 
             try:
-                proposal = extract_json_object(
-                    strip_markdown_fence(answer)
+                proposal = self.decoder.decode(
+                    answer,
+                    allowed_changes=allowed_changes,
                 )
 
-            except ValueError:
+            except ProtocolError:
                 envelope_errors += 1
 
                 if envelope_errors > MAX_ENVELOPE_RETRIES:
@@ -381,7 +326,7 @@ class CodeExecutor:
 
                 continue
 
-            action = self._action_of(proposal)
+            action = proposal.get("action")
 
             if action in ("list", "read", "search"):
                 _ok, text = self._observe(
@@ -389,15 +334,57 @@ class CodeExecutor:
                     observed,
                 )
 
+                observation_bytes += len(text.encode("utf-8"))
+                if observation_bytes > self.limits.max_observe_bytes:
+                    return self._fail(
+                        "observation limit exceeded",
+                        "observation budget exceeded",
+                        ["max_observe_bytes"],
+                        observed,
+                    )
+
+                if action == "read":
+                    path = str(proposal.get("path", ""))
+                    key = ProjectPath.parse(path).comparison_key
+                    self._notify(
+                        "file_read",
+                        {
+                            "path": ProjectPath.parse(path).value,
+                            "byte_count": len(
+                                observed.get(key, "").encode("utf-8")
+                            ),
+                            "ok": _ok,
+                            "duration_ms": 0,
+                        },
+                    )
+                elif action == "list":
+                    self._notify(
+                        "file_list",
+                        {
+                            "pattern": str(proposal.get("pattern") or "**/*")[:200],
+                            "result_count": max(0, len(text.splitlines()) - 1),
+                            "ok": _ok,
+                            "duration_ms": 0,
+                        },
+                    )
+                else:
+                    self._notify(
+                        "repo_search",
+                        {
+                            "query": str(
+                                proposal.get("query") or proposal.get("text") or ""
+                            )[:200],
+                            "result_count": max(0, len(text.splitlines()) - 1),
+                            "ok": _ok,
+                            "duration_ms": 0,
+                        },
+                    )
+
                 transcript.append(text)
 
                 continue
 
             if action == "edit":
-                proposal = self._normalize_proposal(
-                    proposal
-                )
-
                 if (
                     "files" not in proposal
                     and "commands" not in proposal
@@ -446,6 +433,7 @@ class CodeExecutor:
                 return self._apply_proposal(
                     proposal,
                     read_files=sorted(observed),
+                    cancellation_token=cancellation_token,
                 )
 
             # A small model often emits JSON that does not follow the
@@ -495,149 +483,6 @@ class CodeExecutor:
         )
 
 
-    @staticmethod
-    def _action_of(
-        proposal: dict[str, object],
-    ) -> str | None:
-        """
-        Deterministic normalization of the model's reply into one of
-        the protocol actions. Small models emit synonyms and
-        single-file shapes; accepting them is safe because the
-        envelope is still fully validated before any write.
-        """
-
-        raw = proposal.get("action")
-
-        if isinstance(raw, str) and raw.strip():
-            action = raw.strip().casefold()
-
-            if action in {"list", "ls", "list_files", "tree"}:
-                return "list"
-
-            if action in {
-                "read",
-                "read_file",
-                "open",
-                "cat",
-            }:
-                return "read"
-
-            if action in {
-                "search",
-                "grep",
-                "find",
-                "find_symbol",
-            }:
-                return "search"
-
-            if action in {
-                "edit",
-                "write",
-                "create",
-                "update",
-                "apply",
-                "patch",
-                "modify",
-                "save",
-            }:
-                return "edit"
-
-            return action
-
-        if (
-            "files" in proposal
-            or "commands" in proposal
-        ):
-            return "edit"
-
-        # Single-file shapes:
-        #   {"path": "...", "content": "..."}
-        #   {"path": "...", "code": "..."}
-        #   {"file": {"path": "...", "content": "..."}}
-        if (
-            isinstance(proposal.get("path"), str)
-            and _content_key(proposal)
-        ):
-            return "edit"
-
-        if isinstance(proposal.get("file"), dict):
-            return "edit"
-
-        # A dict mapping relative paths to their full content.
-        if isinstance(proposal.get("files"), dict):
-            return "edit"
-
-        # Search shapes.
-        for key in ("query", "needle", "text"):
-            if isinstance(proposal.get(key), str):
-                return "search"
-
-        return None
-
-    @staticmethod
-    def _normalize_proposal(
-        proposal: dict[str, object],
-    ) -> dict[str, object]:
-        """
-        Turn accepted synonyms / single-file shapes into the canonical
-        envelope. Pure normalization: validation still happens
-        afterwards.
-        """
-
-        if (
-            "files" not in proposal
-            and "commands" not in proposal
-        ):
-            entry = proposal.get("file")
-
-            if isinstance(entry, str):
-                # {"action": "create", "file": "a.py",
-                #  "content": "..."}
-                key = _content_key(proposal)
-
-                if key:
-                    entry = {
-                        "path": entry,
-                        "content": proposal[key],
-                    }
-
-                else:
-                    entry = None
-
-            if not isinstance(entry, dict):
-                key = _content_key(proposal)
-
-                if (
-                    isinstance(
-                        proposal.get("path"),
-                        str,
-                    )
-                    and key
-                ):
-                    entry = {
-                        "path": proposal["path"],
-                        "content": proposal[key],
-                    }
-
-                else:
-                    entry = None
-
-            if entry is not None:
-                normalized = dict(proposal)
-
-                normalized["files"] = [entry]
-
-                return normalized
-
-        normalized = dict(proposal)
-
-        if normalized.get("files") is not None:
-            normalized["files"] = _normalize_files(
-                normalized["files"]
-            )
-
-        return normalized
-
     def _observe(
         self,
         proposal: dict[str, object],
@@ -647,7 +492,7 @@ class CodeExecutor:
         Read-only sandbox observation. Never writes anything.
         """
 
-        action = self._action_of(proposal)
+        action = proposal.get("action")
 
         if action == "list":
             pattern = proposal.get("pattern") or "**/*"
@@ -874,6 +719,7 @@ class CodeExecutor:
         proposal: dict[str, object],
         *,
         read_files: list[str] | None = None,
+        cancellation_token=None,
     ) -> ExecutionResult:
         files = proposal.get("files")
         commands = proposal.get("commands")
@@ -1010,6 +856,29 @@ class CodeExecutor:
 
                 artifacts.append(relative)
 
+            written_paths = [
+                entry["path"]
+                for entry in files
+                if isinstance(entry, dict)
+                and entry.get("operation", "write") == "write"
+            ]
+            deleted_paths = [
+                entry["path"]
+                for entry in files
+                if isinstance(entry, dict)
+                and entry.get("operation") == "delete"
+            ]
+            if written_paths:
+                self._notify(
+                    "edit_applied",
+                    {"paths": written_paths, "duration_ms": 0},
+                )
+            if deleted_paths:
+                self._notify(
+                    "delete_applied",
+                    {"paths": deleted_paths, "duration_ms": 0},
+                )
+
 
         # --------------------------------------
         # COMMANDS
@@ -1065,11 +934,13 @@ class CodeExecutor:
                     try:
                         command_started = time.time()
 
-                        result = (
-                            self.command_runner.run(
-                                command
+                        if cancellation_token is None:
+                            result = self.command_runner.run(command)
+                        else:
+                            result = self.command_runner.run(
+                                command,
+                                cancellation_token=cancellation_token,
                             )
-                        )
 
                         self._notify(
                             "docker_command",
