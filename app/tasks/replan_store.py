@@ -13,17 +13,23 @@ from app.tasks.models import (
 from app.tasks.store import (
     DEFAULT_DATABASE_PATH,
 )
+from app.tasks.store_context import (
+    StoreContext,
+    owns_plan,
+    owns_step,
+    owns_task,
+    split_store_binding,
+)
 
 
 class ReplanStore:
     def __init__(
         self,
-        database_path: Path | None = None,
+        database_path: StoreContext | str | Path | None = None,
     ) -> None:
-        self.database_path = (
-            Path(database_path)
-            if database_path is not None
-            else DEFAULT_DATABASE_PATH
+        self.database_path, self.context = split_store_binding(
+            database_path,
+            default_database_path=DEFAULT_DATABASE_PATH,
         )
 
         self.database_path.parent.mkdir(
@@ -32,6 +38,18 @@ class ReplanStore:
         )
 
         self._initialize_database()
+
+    def _owns_target(
+        self,
+        connection: sqlite3.Connection,
+        target_type: ReplanTargetType,
+        target_id: int,
+    ) -> bool:
+        if target_type is ReplanTargetType.PLAN:
+            return owns_plan(connection, self.context, target_id)
+        if target_type is ReplanTargetType.TASK:
+            return owns_task(connection, self.context, target_id)
+        return owns_step(connection, self.context, target_id)
 
     def _connect(
         self,
@@ -124,6 +142,16 @@ class ReplanStore:
         decision: ReplanDecision,
     ) -> ReplanRecord:
         with self._connect() as connection:
+            if not self._owns_target(
+                connection,
+                decision.target_type,
+                decision.target_id,
+            ):
+                raise ValueError(
+                    "unknown replan target for current project: "
+                    f"{decision.target_type.value} {decision.target_id}"
+                )
+
             cursor = connection.execute(
                 """
                 INSERT INTO replan_events (
@@ -169,6 +197,13 @@ class ReplanStore:
         target_id: int,
     ) -> list[ReplanRecord]:
         with self._connect() as connection:
+            if not self._owns_target(
+                connection,
+                target_type,
+                target_id,
+            ):
+                return []
+
             rows = connection.execute(
                 """
                 SELECT *

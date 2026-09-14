@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import json
 import re
 import shutil
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from app.sandbox.paths import (
     PROJECT_ROOT,
@@ -19,6 +21,13 @@ from app.sandbox.limits import (
     DEFAULT_LIMITS,
     LimitExceeded,
 )
+from app.project_identity import ProjectIdentity
+from app.sandbox.gitignore import GitIgnoreMatcher
+from app.sandbox.project_path import ProjectPath
+from app.sandbox.protected_paths import ProtectedPathPolicy
+
+if TYPE_CHECKING:
+    from app.storage import ProjectStorage
 
 
 IGNORED_DIRECTORIES = frozenset(
@@ -76,21 +85,29 @@ PATCH_DENIED_NAME_MARKERS = (
 )
 
 
+class SandboxIdentityError(RuntimeError):
+    """Raised when sandbox metadata does not match its source project."""
+
+
+class SandboxResetError(RuntimeError):
+    """Raised when a sandbox reset cannot complete transactionally."""
+
+
 
 def _project_files(root: Path):
+    protected = ProtectedPathPolicy()
+    ignored = GitIgnoreMatcher.from_project(root)
+
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
 
         relative = path.relative_to(root)
 
-        if any(
-            part in IGNORED_DIRECTORIES
-            for part in relative.parts
-        ):
+        project_path = ProjectPath.parse(relative.as_posix())
+        if not protected.classify(project_path).included:
             continue
-
-        if path.suffix in IGNORED_SUFFIXES:
+        if ignored.is_ignored(project_path):
             continue
 
         yield path, relative
@@ -118,6 +135,16 @@ def _safe_label(label: str) -> str:
     cleaned = cleaned.strip("._")
 
     return (cleaned or "checkpoint")[:64]
+
+
+def _validate_session_id(session_id: str) -> str:
+    if (
+        not session_id
+        or _safe_label(session_id) != session_id
+        or len(session_id) > 64
+    ):
+        raise SandboxIdentityError("invalid sandbox session id")
+    return session_id
 
 
 def _copy_tree(
@@ -158,6 +185,9 @@ class SandboxWorkspace:
         baseline_root: Path,
         patch_root: Path,
         checkpoints_root: Path | None = None,
+        source_project_root: Path | None = None,
+        project_id: str | None = None,
+        metadata_path: Path | None = None,
         limits=DEFAULT_LIMITS,
     ) -> None:
         self.session_id = session_id
@@ -179,6 +209,17 @@ class SandboxWorkspace:
             )
         )
         self.limits = limits
+        self.source_project_root = (
+            Path(source_project_root).resolve()
+            if source_project_root is not None
+            else None
+        )
+        self.project_id = project_id
+        self.metadata_path = (
+            Path(metadata_path).resolve()
+            if metadata_path is not None
+            else self.workspace_root.parent / "session.json"
+        )
         self._active_checkpoint: str | None = None
 
     @classmethod
@@ -188,13 +229,15 @@ class SandboxWorkspace:
         project_root: str | Path | None = None,
         session_id: str | None = None,
         sandbox_root: str | Path | None = None,
+        identity: ProjectIdentity | None = None,
+        storage: ProjectStorage | None = None,
         limits=DEFAULT_LIMITS,
     ) -> "SandboxWorkspace":
         project_root = Path(
             project_root or PROJECT_ROOT
         ).resolve()
 
-        session_id = (
+        session_id = _validate_session_id(
             session_id
             or (
                 datetime.now(timezone.utc).strftime(
@@ -204,6 +247,24 @@ class SandboxWorkspace:
                 + uuid.uuid4().hex[:8]
             )
         )
+
+        if (identity is None) != (storage is None):
+            raise SandboxIdentityError(
+                "identity and storage must be provided together"
+            )
+
+        if identity is not None and storage is not None:
+            actual_identity = ProjectIdentity.from_source_root(project_root)
+            if actual_identity != identity or storage.identity != identity:
+                raise SandboxIdentityError(
+                    "sandbox identity does not match source project"
+                )
+            if sandbox_root is not None:
+                raise SandboxIdentityError(
+                    "bound sandbox cannot override its storage root"
+                )
+            storage.ensure_layout()
+            sandbox_root = storage.sandbox_root
 
         if sandbox_root is not None:
             sandbox_root = Path(sandbox_root)
@@ -234,6 +295,24 @@ class SandboxWorkspace:
         _copy_tree(project_root, baseline_root)
         _copy_tree(project_root, workspace_root)
 
+        metadata_path = workspace_root.parent / "session.json"
+        if identity is not None:
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "session_id": session_id,
+                        "project_id": identity.project_id,
+                        "canonical_source_root": str(
+                            identity.canonical_source_root
+                        ),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+
         return cls(
             session_id=session_id,
             workspace_root=workspace_root,
@@ -243,6 +322,17 @@ class SandboxWorkspace:
                 snapshots
                 / f"{session_id}__checkpoints"
             ),
+            source_project_root=(
+                identity.canonical_source_root
+                if identity is not None
+                else project_root
+            ),
+            project_id=(
+                identity.project_id
+                if identity is not None
+                else None
+            ),
+            metadata_path=metadata_path,
             limits=limits,
         )
 
@@ -252,6 +342,8 @@ class SandboxWorkspace:
         session_id: str,
         *,
         sandbox_root: str | Path | None = None,
+        identity: ProjectIdentity | None = None,
+        storage: ProjectStorage | None = None,
         limits=DEFAULT_LIMITS,
     ) -> "SandboxWorkspace | None":
         """
@@ -261,6 +353,24 @@ class SandboxWorkspace:
         checkpoints so it can restore the last committed state.
         Returns None when the session no longer exists.
         """
+
+        session_id = _validate_session_id(session_id)
+
+        if (identity is None) != (storage is None):
+            raise SandboxIdentityError(
+                "identity and storage must be provided together"
+            )
+
+        if identity is not None and storage is not None:
+            if storage.identity != identity:
+                raise SandboxIdentityError(
+                    "sandbox storage identity mismatch"
+                )
+            if sandbox_root is not None:
+                raise SandboxIdentityError(
+                    "bound sandbox cannot override its storage root"
+                )
+            sandbox_root = storage.sandbox_root
 
         if sandbox_root is not None:
             sandbox_root = Path(sandbox_root)
@@ -282,6 +392,31 @@ class SandboxWorkspace:
         if not workspace_root.exists():
             return None
 
+        metadata_path = workspace_root.parent / "session.json"
+
+        if identity is not None:
+            try:
+                metadata = json.loads(
+                    metadata_path.read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError) as error:
+                raise SandboxIdentityError(
+                    "sandbox identity metadata is missing or invalid"
+                ) from error
+
+            expected = {
+                "schema_version": 1,
+                "session_id": session_id,
+                "project_id": identity.project_id,
+                "canonical_source_root": str(
+                    identity.canonical_source_root
+                ),
+            }
+            if metadata != expected:
+                raise SandboxIdentityError(
+                    "sandbox identity metadata does not match project"
+                )
+
         return cls(
             session_id=session_id,
             workspace_root=workspace_root,
@@ -291,8 +426,89 @@ class SandboxWorkspace:
                 snapshots
                 / f"{session_id}__checkpoints"
             ),
+            source_project_root=(
+                identity.canonical_source_root
+                if identity is not None
+                else None
+            ),
+            project_id=(
+                identity.project_id
+                if identity is not None
+                else None
+            ),
+            metadata_path=metadata_path,
             limits=limits,
         )
+
+    def _replace_tree(
+        self,
+        source: Path,
+        destination: Path,
+    ) -> None:
+        source.replace(destination)
+
+    @staticmethod
+    def _remove_tree(path: Path) -> None:
+        if path.exists():
+            shutil.rmtree(path)
+
+    def _reset_from_source(self) -> None:
+        if self.source_project_root is None:
+            raise SandboxResetError("sandbox source project is unknown")
+
+        token = uuid.uuid4().hex
+        baseline_stage = self.baseline_root.parent / (
+            f".{self.baseline_root.name}.stage-{token}"
+        )
+        workspace_stage = self.workspace_root.parent / (
+            f".{self.workspace_root.name}.stage-{token}"
+        )
+        baseline_backup = self.baseline_root.parent / (
+            f".{self.baseline_root.name}.backup-{token}"
+        )
+        workspace_backup = self.workspace_root.parent / (
+            f".{self.workspace_root.name}.backup-{token}"
+        )
+        committed = False
+
+        try:
+            _copy_tree(self.source_project_root, baseline_stage)
+            _copy_tree(self.source_project_root, workspace_stage)
+
+            self.baseline_root.replace(baseline_backup)
+            self.workspace_root.replace(workspace_backup)
+
+            self._replace_tree(baseline_stage, self.baseline_root)
+            self._replace_tree(workspace_stage, self.workspace_root)
+
+            self._remove_tree(self.checkpoints_root)
+            self._active_checkpoint = None
+            committed = True
+        except Exception as error:
+            try:
+                self._remove_tree(self.baseline_root)
+                self._remove_tree(self.workspace_root)
+                if baseline_backup.exists():
+                    baseline_backup.replace(self.baseline_root)
+                if workspace_backup.exists():
+                    workspace_backup.replace(self.workspace_root)
+            except Exception as rollback_error:
+                raise SandboxResetError(
+                    "sandbox reset and rollback both failed"
+                ) from rollback_error
+            raise SandboxResetError("sandbox reset failed") from error
+        finally:
+            self._remove_tree(baseline_stage)
+            self._remove_tree(workspace_stage)
+            if committed:
+                self._remove_tree(baseline_backup)
+                self._remove_tree(workspace_backup)
+
+    def rebase_from_source(self) -> None:
+        self._reset_from_source()
+
+    def discard_and_recreate(self) -> None:
+        self._reset_from_source()
 
     # ==================================
     # TRANSACTIONAL CHECKPOINTS

@@ -6,12 +6,11 @@ from pathlib import Path
 from app.agent.coder.workspace import Workspace
 from app.agent.coder.executor import CodeExecutor
 from app.agent.runtime import AgentRuntime
+from app.project_identity import ProjectIdentity
 from app.context.builder import ContextBuilder
-from app.sandbox.paths import (
-    PROJECT_ROOT,
-    SANDBOX_PATCHES,
-)
+from app.sandbox.paths import PROJECT_ROOT
 from app.sandbox.workspace import SandboxWorkspace
+from app.tasks.store_context import StoreContext
 
 from helpers import (
     FakeLLM,
@@ -195,7 +194,7 @@ def test_done_never_auto_applies_patch(
 
     patch = Path(state.patch_path)
 
-    assert patch.parent == SANDBOX_PATCHES
+    assert patch.parent == runtime.project_storage.patches_root
     assert patch.exists()
 
     # host project untouched
@@ -297,7 +296,13 @@ def test_interrupted_run_is_detected_on_restart(tmp_path):
 
     database = tmp_path / "pc.db"
 
-    store = RuntimeStore(database)
+    identity = ProjectIdentity.from_source_root(PROJECT_ROOT)
+    context = StoreContext(
+        database_path=database,
+        project_id=identity.project_id,
+        canonical_source_root=str(identity.canonical_source_root),
+    )
+    store = RuntimeStore(context)
 
     run_id = store.start_run("half-done request")
 

@@ -12,17 +12,22 @@ from app.tasks.models import (
 from app.tasks.store import (
     DEFAULT_DATABASE_PATH,
 )
+from app.tasks.store_context import (
+    StoreContext,
+    owns_step,
+    owns_task,
+    split_store_binding,
+)
 
 
 class VerificationStore:
     def __init__(
         self,
-        database_path: Path | None = None,
+        database_path: StoreContext | str | Path | None = None,
     ) -> None:
-        self.database_path = (
-            Path(database_path)
-            if database_path is not None
-            else DEFAULT_DATABASE_PATH
+        self.database_path, self.context = split_store_binding(
+            database_path,
+            default_database_path=DEFAULT_DATABASE_PATH,
         )
 
         self.database_path.parent.mkdir(
@@ -211,6 +216,16 @@ class VerificationStore:
         )
 
         with self._connect() as connection:
+            target_owned = (
+                owns_task(connection, self.context, target_id)
+                if target_type is VerificationTargetType.TASK
+                else owns_step(connection, self.context, target_id)
+            )
+            if not target_owned:
+                raise ValueError(
+                    f"unknown {target_type.value.lower()}: {target_id}"
+                )
+
             cursor = connection.execute(
                 f"""
                 INSERT INTO verifications (
@@ -293,6 +308,9 @@ class VerificationStore:
         step_id: int,
     ) -> list[VerificationRecord]:
         with self._connect() as connection:
+            if not owns_step(connection, self.context, step_id):
+                return []
+
             rows = connection.execute(
                 """
                 SELECT *
@@ -315,6 +333,9 @@ class VerificationStore:
         task_id: int,
     ) -> list[VerificationRecord]:
         with self._connect() as connection:
+            if not owns_task(connection, self.context, task_id):
+                return []
+
             rows = connection.execute(
                 """
                 SELECT *

@@ -4,10 +4,7 @@ import importlib.util
 from pathlib import Path
 
 from app.agent.runtime import AgentRuntime
-from app.sandbox.paths import (
-    PROJECT_ROOT,
-    SANDBOX_PATCHES,
-)
+from app.sandbox.paths import PROJECT_ROOT
 from app.sandbox.runner import SandboxCommandRunner
 
 from helpers import (
@@ -152,7 +149,7 @@ def test_done_writes_patch_into_sandbox_patches(
     patch = Path(state.patch_path)
 
     assert patch.exists()
-    assert patch.parent == SANDBOX_PATCHES
+    assert patch.parent == runtime.project_storage.patches_root
     assert PROJECT_ROOT in patch.parents
 
     contents = patch.read_text(encoding="utf-8")

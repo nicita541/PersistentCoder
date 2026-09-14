@@ -17,6 +17,10 @@ class MemoryCandidate:
     replaces: str | None = None
 
 
+class MemoryScopeError(ValueError):
+    pass
+
+
 def _normalize(
     text: str,
 ) -> str:
@@ -534,20 +538,43 @@ class MemoryManager:
 
     def __init__(
         self,
-        store,
+        store=None,
+        *,
+        project_store=None,
+        global_store=None,
     ) -> None:
-        self.store = store
+        if project_store is None:
+            if store is None:
+                raise ValueError("MemoryManager requires a project store")
+            project_store = store
+        elif store is not None:
+            raise ValueError(
+                "pass either store or project_store, not both"
+            )
+
+        self.project_store = project_store
+        self.global_store = global_store
+        self.store = project_store
 
     def get_active_memories(
         self,
     ) -> list[dict[str, object]]:
-        return self.store.get_active_memories()
+        project_memories = self.project_store.get_active_memories()
+        if self.global_store is None:
+            return project_memories
+        return [
+            *self.global_store.get_active_memories(
+                memory_type="USER_RULE"
+            ),
+            *project_memories,
+        ]
 
     def save_candidate(
         self,
         candidate: MemoryCandidate,
         *,
         source: str = "USER",
+        global_rule: bool = False,
     ) -> int | None:
         from app.memory.conflicts import (
             find_memories_to_supersede,
@@ -556,7 +583,18 @@ class MemoryManager:
             find_decisions_to_merge,
         )
 
-        memories = self.store.get_active_memories()
+        if global_rule:
+            if candidate.memory_type != "USER_RULE":
+                raise MemoryScopeError(
+                    "only USER_RULE can be stored globally"
+                )
+            if self.global_store is None:
+                raise MemoryScopeError("global memory store is unavailable")
+            target_store = self.global_store
+        else:
+            target_store = self.project_store
+
+        memories = target_store.get_active_memories()
 
         if is_duplicate_memory(
             candidate,
@@ -564,7 +602,7 @@ class MemoryManager:
         ):
             return None
 
-        memory_id = self.store.add_memory(
+        memory_id = target_store.add_memory(
             memory_type=candidate.memory_type,
             content=candidate.content,
             why=candidate.why,
@@ -588,7 +626,7 @@ class MemoryManager:
         )
 
         if to_supersede:
-            self.store.supersede_memories(
+            target_store.supersede_memories(
                 memory_ids=sorted(to_supersede),
                 superseded_by=memory_id,
             )
@@ -600,6 +638,7 @@ class MemoryManager:
         text: str,
         *,
         source: str = "USER",
+        global_rule: bool = False,
     ) -> int | None:
         """
         Извлекает MemoryCandidate из текста и сохраняет её.
@@ -613,6 +652,7 @@ class MemoryManager:
         return self.save_candidate(
             candidate,
             source=source,
+            global_rule=global_rule,
         )
 
     def record_experience(
@@ -635,8 +675,8 @@ class MemoryManager:
             f"(план #{plan_id}) завершён: {outcome}."
         )
 
-        return self.store.add_memory(
-            memory_type="FACT",
+        return self.project_store.add_memory(
+            memory_type="EXPERIENCE",
             content=content,
             source=source,
             importance=40,

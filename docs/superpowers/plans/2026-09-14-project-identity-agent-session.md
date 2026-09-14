@@ -51,7 +51,7 @@
 - Consumes: framework `PROJECT_ROOT`, `DATA_ROOT`, and `SANDBOX_ROOT` constants.
 - Produces: `ProjectIdentity.from_source_root(source_root: str | Path) -> ProjectIdentity`; `ProjectStorage.for_identity(identity: ProjectIdentity) -> ProjectStorage`; `ProjectStorage.ensure_layout() -> None`.
 
-- [ ] **Step 1: Write failing identity and containment tests**
+- [x] **Step 1: Write failing identity and containment tests**
 
 ```python
 def test_project_identity_is_stable_for_equivalent_roots(tmp_path):
@@ -75,13 +75,13 @@ def test_project_storage_never_writes_under_target(tmp_path):
     assert storage.database_path == DATA_ROOT / "projects" / identity.project_id / "persistent_coder.db"
 ```
 
-- [ ] **Step 2: Run the tests and confirm the missing-module failure**
+- [x] **Step 2: Run the tests and confirm the missing-module failure**
 
 Run: `python -m pytest tests/test_project_identity.py -q`
 
 Expected: FAIL because `app.project_identity` and `app.storage` do not exist.
 
-- [ ] **Step 3: Implement pure identity and storage values**
+- [x] **Step 3: Implement pure identity and storage values**
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -117,13 +117,13 @@ class ProjectStorage:
 
 `ensure_layout()` must create only the database parent and the project sandbox subdirectories `sessions`, `snapshots`, `patches`, `logs`, and `tmp`. Add explicit `is_relative_to(PROJECT_ROOT)` guards before creating them.
 
-- [ ] **Step 4: Run focused tests**
+- [x] **Step 4: Run focused tests**
 
 Run: `python -m pytest tests/test_project_identity.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add app/project_identity.py app/storage.py app/sandbox/paths.py tests/test_project_identity.py
@@ -148,7 +148,7 @@ git commit -m "feat: add canonical project identity"
 - Consumes: `ProjectIdentity.project_id`, `ProjectStorage.database_path`.
 - Produces: `StoreContext(database_path: Path, project_id: str, canonical_source_root: str)`; all store constructors accept `context: StoreContext`; run and plan records expose `project_id`.
 
-- [ ] **Step 1: Write failing store-binding tests**
+- [x] **Step 1: Write failing store-binding tests**
 
 ```python
 def test_runtime_store_recovers_only_matching_project(tmp_path):
@@ -183,13 +183,13 @@ def test_active_plan_is_project_scoped(tmp_path):
     assert store_b.get_active_plan() is None
 ```
 
-- [ ] **Step 2: Run the focused tests and confirm constructor/schema failures**
+- [x] **Step 2: Run the focused tests and confirm constructor/schema failures**
 
 Run: `python -m pytest tests/test_project_store_isolation.py -q`
 
 Expected: FAIL because `StoreContext` and project columns do not exist.
 
-- [ ] **Step 3: Add idempotent schema migrations and project filters**
+- [x] **Step 3: Add idempotent schema migrations and project filters**
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -213,13 +213,13 @@ ALTER TABLE plans ADD COLUMN project_id TEXT;
 
 New inserts always populate the binding. `get_active_plan`, `get_running_runs`, `recover_interrupted`, event queries, and every lookup used by runtime recovery add `WHERE project_id = ?`. Rows with `NULL project_id` remain untouched and cannot match. Child task/step/attempt/replan/verification rows remain transitively owned by a bound plan or run, and their public lookup methods must validate the parent plan binding before returning data.
 
-- [ ] **Step 4: Update test fixtures and run store regressions**
+- [x] **Step 4: Update test fixtures and run store regressions**
 
 Run: `python -m pytest tests/test_project_store_isolation.py tests/test_task_store.py tests/test_task_attempts.py tests/test_task_steps.py tests/test_plan_versioning.py tests/security/test_crash_recovery.py -q`
 
 Expected: PASS, including migration of old nullable schemas without assigning legacy rows to the current project.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add app/tasks tests/conftest.py tests/test_project_store_isolation.py tests/security/test_crash_recovery.py
@@ -241,7 +241,7 @@ git commit -m "feat: scope task state by project"
 - Consumes: project `StoreContext`; `DATA_ROOT / "global" / "persistent_coder.db"`.
 - Produces: `MemoryScope.GLOBAL`, `MemoryScope.PROJECT`; `MemoryStore(database_path: Path, *, scope: MemoryScope, project_id: str | None = None)`; `MemoryManager.get_active_memories() -> list[dict[str, object]]` returns explicit global rules plus only the current project's records; `remember(..., global_rule: bool = False)`.
 
-- [ ] **Step 1: Write failing scope and migration tests**
+- [x] **Step 1: Write failing scope and migration tests**
 
 ```python
 def memory_manager(project_db: Path, project_id: str, global_db: Path) -> MemoryManager:
@@ -276,13 +276,13 @@ def test_only_explicit_user_rule_becomes_global(tmp_path):
         a.remember("В проекте используется SQLite.", global_rule=True)
 ```
 
-- [ ] **Step 2: Run the tests and confirm missing scope failures**
+- [x] **Step 2: Run the tests and confirm missing scope failures**
 
 Run: `python -m pytest tests/test_memory_project_scope.py -q`
 
 Expected: FAIL because global/project stores are not separated.
 
-- [ ] **Step 3: Implement explicit memory routing**
+- [x] **Step 3: Implement explicit memory routing**
 
 ```python
 class MemoryScope(str, Enum):
@@ -303,13 +303,13 @@ class MemoryManager:
 
 Add `scope` and nullable `project_id` columns idempotently. A global insert requires `memory_type == "USER_RULE"`, `scope == "GLOBAL"`, and `project_id IS NULL`; a project insert requires the manager's project ID. Old rows retain `scope = NULL` and are excluded from new retrieval. Duplicate/supersede/merge queries operate within one scope only.
 
-- [ ] **Step 4: Run memory and context regressions**
+- [x] **Step 4: Run memory and context regressions**
 
 Run: `python -m pytest tests/test_memory_project_scope.py tests/test_memory_store.py tests/test_memory_manager.py tests/test_memory_retrieval.py tests/test_memory_merge.py tests/test_memory_conflicts.py tests/test_context_selector.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add app/memory app/context/builder.py tests/test_memory_project_scope.py tests/test_memory_store.py tests/test_memory_retrieval.py
@@ -328,7 +328,7 @@ git commit -m "feat: isolate project memory"
 - Consumes: `ProjectIdentity`, `ProjectStorage.sandbox_root`.
 - Produces: `SandboxWorkspace.create(project_root, identity, storage, session_id=None)`; `SandboxWorkspace.open_session(identity, storage, session_id)`; workspace exposes `project_id` and canonical `source_project_root`.
 
-- [ ] **Step 1: Write failing namespace and mismatch tests**
+- [x] **Step 1: Write failing namespace and mismatch tests**
 
 ```python
 def project_case(tmp_path: Path, name: str):
@@ -373,13 +373,13 @@ def test_open_session_rejects_tampered_source_identity(tmp_path):
         )
 ```
 
-- [ ] **Step 2: Run the tests and confirm current global-path behavior fails**
+- [x] **Step 2: Run the tests and confirm current global-path behavior fails**
 
 Run: `python -m pytest tests/security/test_project_sandbox_isolation.py -q`
 
 Expected: FAIL because sandbox sessions currently live in global `sessions` and `snapshots` directories without identity metadata.
 
-- [ ] **Step 3: Add project-rooted paths and identity metadata**
+- [x] **Step 3: Add project-rooted paths and identity metadata**
 
 Store a UTF-8 JSON metadata file beside each session workspace:
 
@@ -394,13 +394,13 @@ Store a UTF-8 JSON metadata file beside each session workspace:
 
 `open_session` must resolve the project namespace first, validate `session_id` with `_safe_label`, load metadata, compare both ID and canonical root, and fail before reading a checkpoint on mismatch. Do not search other project namespaces for a matching session ID.
 
-- [ ] **Step 4: Run sandbox and crash-recovery tests**
+- [x] **Step 4: Run sandbox and crash-recovery tests**
 
 Run: `python -m pytest tests/security/test_project_sandbox_isolation.py tests/security/test_crash_recovery.py tests/security/test_transactions.py tests/security/test_sandbox_limits_and_patches.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add app/sandbox tests/security/test_project_sandbox_isolation.py tests/security/test_crash_recovery.py
@@ -420,7 +420,7 @@ git commit -m "feat: namespace sandbox sessions by project"
 - Consumes: `StoreContext`, `SandboxWorkspace.session_id`.
 - Produces: `SessionStatus`; `AgentSession`; `AgentSession.transition(target, *, patch_manifest_id=None)`; `SessionStore.create/get/update/list_dirty`.
 
-- [ ] **Step 1: Write failing transition and persistence tests**
+- [x] **Step 1: Write failing transition and persistence tests**
 
 ```python
 def make_session(status: SessionStatus = SessionStatus.CLEAN) -> AgentSession:
@@ -462,13 +462,13 @@ def test_session_store_is_project_scoped(tmp_path):
     assert SessionStore(context_b).get(session_id) is None
 ```
 
-- [ ] **Step 2: Run tests and confirm missing session types**
+- [x] **Step 2: Run tests and confirm missing session types**
 
 Run: `python -m pytest tests/agent/test_agent_session.py tests/test_session_store.py -q`
 
 Expected: FAIL because the session state machine and table do not exist.
 
-- [ ] **Step 3: Implement deterministic transitions and idempotent table creation**
+- [x] **Step 3: Implement deterministic transitions and idempotent table creation**
 
 ```python
 class SessionStatus(str, Enum):
@@ -499,13 +499,13 @@ ALLOWED_TRANSITIONS = {
 
 The `agent_sessions` table stores `id`, `project_id`, `canonical_source_root`, `sandbox_session_id`, `status`, nullable `active_run_id`, nullable `patch_manifest_id`, timestamps, and a monotonically increasing `version`. Updates use `WHERE id = ? AND project_id = ? AND version = ?` so stale writers fail closed.
 
-- [ ] **Step 4: Run session tests**
+- [x] **Step 4: Run session tests**
 
 Run: `python -m pytest tests/agent/test_agent_session.py tests/test_session_store.py -q`
 
 Expected: PASS, including illegal-transition and stale-version negative tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add app/agent/session.py app/tasks/session_store.py app/tasks/models.py tests/agent/test_agent_session.py tests/test_session_store.py
@@ -522,7 +522,7 @@ git commit -m "feat: persist agent session lifecycle"
 - Consumes: project-bound `SandboxWorkspace`.
 - Produces: `SandboxWorkspace.rebase_from_source() -> None`; `SandboxWorkspace.discard_and_recreate() -> None`; both preserve identity and session ID while replacing baseline/workspace atomically.
 
-- [ ] **Step 1: Write failing rebase/discard tests**
+- [x] **Step 1: Write failing rebase/discard tests**
 
 ```python
 def tree_digest(root: Path) -> dict[str, bytes]:
@@ -560,23 +560,23 @@ def test_failed_rebase_restores_previous_baseline_and_workspace(workspace, monke
     assert (tree_digest(workspace.baseline_root), tree_digest(workspace.workspace_root)) == before
 ```
 
-- [ ] **Step 2: Run tests and confirm methods are absent**
+- [x] **Step 2: Run tests and confirm methods are absent**
 
 Run: `python -m pytest tests/security/test_session_rebase_discard.py -q`
 
 Expected: FAIL with missing reset methods.
 
-- [ ] **Step 3: Implement staged replacement**
+- [x] **Step 3: Implement staged replacement**
 
 Build the replacement baseline and workspace under the same project sandbox filesystem using unique temporary directory names. Only after both copies succeed, rename the current trees to backups and promote both replacements. On any promotion failure, restore both backups. Remove backups after success. `discard_and_recreate()` delegates to the same transaction because both operations establish source as the new clean baseline; the session layer distinguishes their semantic outcome.
 
-- [ ] **Step 4: Run workspace regressions**
+- [x] **Step 4: Run workspace regressions**
 
 Run: `python -m pytest tests/security/test_session_rebase_discard.py tests/security/test_transactions.py tests/security/test_sandbox_limits_and_patches.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add app/sandbox/workspace.py tests/security/test_session_rebase_discard.py
@@ -597,7 +597,7 @@ git commit -m "feat: reset sandbox sessions atomically"
 - Consumes: all interfaces from Tasks 1-6.
 - Produces: `AgentRuntime.project_identity`; `AgentRuntime.project_storage`; `AgentRuntime.session`; `new_session(discard_dirty: bool = False)`, `discard_session()`, `rebase_session_after_apply()`; runtime run transitions.
 
-- [ ] **Step 1: Write failing composition tests**
+- [x] **Step 1: Write failing composition tests**
 
 ```python
 def test_runtime_derives_storage_before_opening_stores(tmp_path, fake_llm):
@@ -622,13 +622,13 @@ def test_new_session_requires_explicit_dirty_resolution(tmp_path, fake_llm):
     assert runtime.session.status is SessionStatus.CLEAN
 ```
 
-- [ ] **Step 2: Run tests and confirm current identity/session failures**
+- [x] **Step 2: Run tests and confirm current identity/session failures**
 
 Run: `python -m pytest tests/agent/test_runtime_project_session.py -q`
 
 Expected: FAIL because stores and sandbox are opened before any project/session binding.
 
-- [ ] **Step 3: Reorder runtime composition and wire transitions**
+- [x] **Step 3: Reorder runtime composition and wire transitions**
 
 Runtime initialization order must be:
 
@@ -647,13 +647,13 @@ self.session_store = SessionStore(self.store_context)
 
 Only after matching interrupted runs are recovered may runtime open or create the project's sandbox and session. `run()` atomically claims a CLEAN session as RUNNING, then transitions to `DIRTY_VERIFIED` on verified sandbox changes, `CLEAN` on verified no-op, or `DIRTY_FAILED` on failure/cancellation with retained reviewable changes. Direct apply transitions through `APPLIED` and then rebases to a new CLEAN session state. Do not let event persistence exceptions alter transitions.
 
-- [ ] **Step 4: Run runtime/controller regressions**
+- [x] **Step 4: Run runtime/controller regressions**
 
 Run: `python -m pytest tests/agent/test_runtime_project_session.py tests/agent/test_runtime.py tests/agent/test_controller.py tests/agent/test_agent_loop.py tests/test_cli_commands.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add app/agent/runtime.py app/agent/controller.py app/main.py tests/agent/test_runtime_project_session.py tests/agent/test_runtime.py tests/agent/test_controller.py
@@ -674,7 +674,7 @@ git commit -m "feat: integrate project sessions into runtime"
 - Consumes: completed Stage 1 public interfaces.
 - Produces: executable security evidence and user-facing storage/recovery documentation.
 
-- [ ] **Step 1: Write end-to-end negative-security tests**
+- [x] **Step 1: Write end-to-end negative-security tests**
 
 ```python
 from tests.helpers.legacy_sqlite import seed_legacy_memory, seed_legacy_run
@@ -753,17 +753,17 @@ def seed_legacy_memory(database: Path, memory_type: str, content: str) -> None:
         )
 ```
 
-- [ ] **Step 2: Run the security file and confirm any remaining leaks**
+- [x] **Step 2: Run the security file and confirm any remaining leaks**
 
 Run: `python -m pytest tests/security/test_cross_project_runtime_isolation.py -q`
 
 Expected before final fixes: at least one FAIL if a store, recovery path, or memory query still bypasses project binding.
 
-- [ ] **Step 3: Close the specific binding gaps and document behavior**
+- [x] **Step 3: Close the specific binding gaps and document behavior**
 
 For each failing assertion, route the operation through `StoreContext` or project-scoped workspace lookup. Do not add permissive fallback queries. Document the exact `data/projects/<project_id>` and `.sandbox/projects/<project_id>` locations, global-rule behavior, dirty-session states, and legacy exclusion policy in README.
 
-- [ ] **Step 4: Run the complete Stage 1 gate**
+- [x] **Step 4: Run the complete Stage 1 gate**
 
 Run:
 
@@ -774,7 +774,13 @@ python -m pytest tests/test_project_identity.py tests/test_project_store_isolati
 
 Expected: compilation succeeds and every listed test passes. Then run `python -m pytest -q -m "not real_llm"` once as the Stage 1 aggregate regression and record all failures before starting Stage 2.
 
-- [ ] **Step 5: Commit**
+Recorded 2026-09-14: the focused gate passed 52/52. The aggregate passed
+376 tests with 3 skips and one acknowledged worktree-only infrastructure
+failure: `test_host_venv_is_under_project` resolves the worktree `.venv`
+junction to the main checkout. The same invariant passes in the main checkout;
+no Stage 1 product test failed.
+
+- [x] **Step 5: Commit**
 
 ```powershell
 git add app tests README.md

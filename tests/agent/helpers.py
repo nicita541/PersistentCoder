@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
+from app.project_identity import ProjectIdentity
 from app.tasks.attempt_store import AttemptStore
 from app.tasks.models import (
     PlanDraft,
@@ -14,6 +16,7 @@ from app.tasks.store import PlanStore
 from app.tasks.verification_store import (
     VerificationStore,
 )
+from app.tasks.store_context import StoreContext
 
 
 class FakeLLM:
@@ -51,24 +54,33 @@ class FakeLLM:
 
 
 class StoreBundle:
-    def __init__(self, database_path) -> None:
+    def __init__(self, database_path, *, project_root=None) -> None:
         self.database_path = database_path
-        self.plan_store = PlanStore(database_path)
-        self.step_store = StepStore(database_path)
+        binding = database_path
+        if project_root is not None:
+            identity = ProjectIdentity.from_source_root(project_root)
+            binding = StoreContext(
+                database_path=Path(database_path),
+                project_id=identity.project_id,
+                canonical_source_root=str(identity.canonical_source_root),
+            )
+        self.plan_store = PlanStore(binding)
+        self.step_store = StepStore(binding)
         self.attempt_store = AttemptStore(
-            database_path
+            binding
         )
         self.verification_store = (
-            VerificationStore(database_path)
+            VerificationStore(binding)
         )
         self.replan_store = ReplanStore(
-            database_path
+            binding
         )
 
 
-def make_stores(tmp_path) -> StoreBundle:
+def make_stores(tmp_path, *, project_root=None) -> StoreBundle:
     return StoreBundle(
-        tmp_path / "persistent_coder.db"
+        tmp_path / "persistent_coder.db",
+        project_root=project_root,
     )
 
 

@@ -10,6 +10,7 @@ from app.sandbox.policy import (
     PathPolicy,
     PolicyViolation,
 )
+from app.sandbox.project_path import ProjectPath, ProjectPathError
 
 
 class FileToolsError(PolicyViolation):
@@ -204,7 +205,9 @@ class FileTools:
                 f"path escapes workspace: {path}"
             )
 
-        return candidate.relative_to(
-            self.root
-        ).as_posix()
+        relative = candidate.relative_to(self.root).as_posix()
+        try:
+            return ProjectPath.parse(relative).value
+        except ProjectPathError as error:
+            raise FileToolsError(str(error)) from error
 

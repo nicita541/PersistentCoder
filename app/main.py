@@ -125,6 +125,7 @@ def render_status(runtime) -> None:
         "attempt_id",
         "active_plan",
         "sandbox_session_id",
+        "session_status",
         "workspace",
         "patch",
         "interrupted_runs",

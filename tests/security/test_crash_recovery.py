@@ -38,7 +38,7 @@ def test_crash_rolls_back_sandbox_and_marks_attempt_blocked(
 ):
     project = _project(tmp_path / "project")
 
-    stores = make_stores(tmp_path)
+    stores = make_stores(tmp_path, project_root=project)
     _plan_id, task, step = seed_plan(stores)
 
     # ---------------- runtime #1 (the crash) ----------------
@@ -147,7 +147,7 @@ def test_crash_without_checkpoint_starts_a_fresh_sandbox(
 ):
     project = _project(tmp_path / "project")
 
-    stores = make_stores(tmp_path)
+    stores = make_stores(tmp_path, project_root=project)
     _plan_id, _task, _step = seed_plan(stores)
 
     crashed = _runtime(project, stores.database_path)
@@ -177,7 +177,7 @@ def test_resume_can_be_disabled_explicitly(
 ):
     project = _project(tmp_path / "project")
 
-    stores = make_stores(tmp_path)
+    stores = make_stores(tmp_path, project_root=project)
     _plan_id, task, step = seed_plan(stores)
 
     crashed = _runtime(project, stores.database_path)

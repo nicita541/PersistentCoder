@@ -26,7 +26,7 @@ from app.context.builder import ContextBuilder
 from app.context.selector import RepoContextSelector
 from app.memory.manager import MemoryManager
 from app.memory.retrieval import MemoryRetriever
-from app.memory.store import MemoryStore
+from app.memory.store import MemoryScope, MemoryStore
 from app.policy.injection import (
     enforce_system_policy,
 )
@@ -37,6 +37,8 @@ from app.tasks.replanner import Replanner
 from app.tasks.scheduler import TaskScheduler
 from app.tasks.step_store import StepStore
 from app.tasks.store import PlanStore
+from app.tasks.session_store import SessionStore
+from app.tasks.store_context import StoreContext
 from app.tasks.verification_store import (
     VerificationStore,
 )
@@ -48,9 +50,12 @@ from app.tasks.runtime_store import (
     RuntimeStore,
 )
 from app.agent.state import AgentPhase
+from app.agent.session import SessionStatus
+from app.project_identity import ProjectIdentity
+from app.storage import ProjectStorage
 from app.tools.file_tools import FileTools
 from app.tools.project_tools import ProjectTools
-from app.sandbox.paths import ensure_layout
+from app.sandbox.paths import DATA_ROOT, ensure_layout
 from app.sandbox.runner import SandboxCommandRunner
 from app.sandbox.dependencies import (
     DependencyResolver,
@@ -59,6 +64,10 @@ from app.sandbox.workspace import SandboxWorkspace
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+class DirtySessionError(RuntimeError):
+    pass
 
 
 def default_llm_factory():
@@ -105,54 +114,38 @@ class AgentRuntime:
     ) -> None:
         ensure_layout()
 
-                # ==================================
-        # SOURCE PROJECT IDENTITY
-        # ==================================
-
-        # The source project is the real project opened by the user.
-        #
-        # It is intentionally kept separate from workspace_root:
-        #
-        #   source_project_root
-        #       -> real host project
-        #
-        #   workspace_root
-        #       -> sandbox session copy
-        #
-        # Agents and Docker operate only on workspace_root.
-        # Only framework-controlled apply_patch() may write into
-        # source_project_root after verification PASS.
         if project_root is not None:
-            self.source_project_root = Path(
-                project_root
-            ).resolve()
-
+            source_project_root = Path(project_root)
         elif workspace_root is not None:
-            self.source_project_root = Path(
-                workspace_root
-            ).resolve()
-
+            source_project_root = Path(workspace_root)
         else:
-            self.source_project_root = (
-                PROJECT_ROOT.resolve()
-            )
+            source_project_root = PROJECT_ROOT
 
+        self.project_identity = ProjectIdentity.from_source_root(
+            source_project_root
+        )
+        self.source_project_root = (
+            self.project_identity.canonical_source_root
+        )
+        self.project_storage = ProjectStorage.for_identity(
+            self.project_identity
+        )
+        self.project_storage.ensure_layout()
         self.database_path = (
             Path(database_path)
             if database_path is not None
-            else None
+            else self.project_storage.database_path
+        )
+        self.store_context = StoreContext(
+            database_path=self.database_path,
+            project_id=self.project_identity.project_id,
+            canonical_source_root=str(self.source_project_root),
         )
 
         self.events = EventBus()
         self.last_patch_path: str | None = None
-
-        # Durable execution state + event log (project-local SQLite).
-        self.runtime_store = RuntimeStore(
-            self.database_path
-        )
-
-        # Fail closed on restart: any run left RUNNING by a crash is
-        # marked INTERRUPTED and never silently treated as DONE.
+        self.runtime_store = RuntimeStore(self.store_context)
+        self.session_store = SessionStore(self.store_context)
         self.interrupted_runs = (
             self.runtime_store.recover_interrupted()
         )
@@ -160,15 +153,6 @@ class AgentRuntime:
         self.current_run_id: int | None = None
         self.last_run_id: int | None = None
 
-        # ==================================
-        # CRASH RECOVERY (sandbox)
-        # ==================================
-
-        # A crashed attempt leaves the sandbox dirty. Restore every
-        # interrupted session to its last committed checkpoint BEFORE
-        # any tool is wired, and never auto-continue a half-written
-        # attempt. A restored session may be resumed instead of
-        # starting from a fresh copy.
         self.resumed_run_id: int | None = None
         self.resumed_session_id: str | None = None
         self.recovery: list[dict[str, object]] = []
@@ -189,6 +173,8 @@ class AgentRuntime:
                 self.sandbox_workspace = (
                     SandboxWorkspace.create(
                         project_root=self.workspace_root,
+                        identity=self.project_identity,
+                        storage=self.project_storage,
                     )
                 )
 
@@ -208,9 +194,22 @@ class AgentRuntime:
             self.session_id: str | None = (
                 self.sandbox_workspace.session_id
             )
+            self.session = (
+                self.session_store.get_by_sandbox_session_id(
+                    self.session_id
+                )
+            )
+            if self.session is None:
+                agent_session_id = self.session_store.create(
+                    sandbox_session_id=self.session_id
+                )
+                self.session = self.session_store.get(agent_session_id)
+                if self.session is None:
+                    raise RuntimeError("agent session was not created")
 
         else:
             self.session_id = None
+            self.session = None
 
         self.events.subscribe(self._persist_event)
 
@@ -281,21 +280,21 @@ class AgentRuntime:
         # ==================================
 
         self.plan_store = PlanStore(
-            self.database_path
+            self.store_context
         )
         self.step_store = StepStore(
-            self.database_path
+            self.store_context
         )
         self.attempt_store = AttemptStore(
-            self.database_path
+            self.store_context
         )
         self.verification_store = (
             VerificationStore(
-                self.database_path
+                self.store_context
             )
         )
         self.replan_store = ReplanStore(
-            self.database_path
+            self.store_context
         )
 
         self.scheduler = TaskScheduler(
@@ -325,10 +324,17 @@ class AgentRuntime:
         # ==================================
 
         self.memory_store = MemoryStore(
-            self.database_path
+            self.database_path,
+            scope=MemoryScope.PROJECT,
+            project_id=self.project_identity.project_id,
+        )
+        self.global_memory_store = MemoryStore(
+            DATA_ROOT / "global" / "persistent_coder.db",
+            scope=MemoryScope.GLOBAL,
         )
         self.memory = MemoryManager(
-            self.memory_store
+            project_store=self.memory_store,
+            global_store=self.global_memory_store,
         )
 
         # ==================================
@@ -530,7 +536,9 @@ class AgentRuntime:
                 try:
                     workspace = (
                         SandboxWorkspace.open_session(
-                            str(session_id)
+                            str(session_id),
+                            identity=self.project_identity,
+                            storage=self.project_storage,
                         )
                     )
 
@@ -669,21 +677,122 @@ class AgentRuntime:
 
         return blocked
 
+    def _save_session(self) -> None:
+        if self.session is not None:
+            self.session = self.session_store.update(self.session)
+
+    def _settle_session_after_run(self, *, succeeded: bool) -> None:
+        if self.session is None or self.sandbox_workspace is None:
+            return
+
+        changed = bool(self.sandbox_workspace.changed_files())
+        self.session.active_run_id = None
+        if changed:
+            target = (
+                SessionStatus.DIRTY_VERIFIED
+                if succeeded
+                else SessionStatus.DIRTY_FAILED
+            )
+        else:
+            target = SessionStatus.CLEAN
+        self.session.transition(target)
+        self._save_session()
+
+    def discard_session(self):
+        if self.session is None or self.sandbox_workspace is None:
+            raise DirtySessionError("no sandbox session")
+        if self.session.status is SessionStatus.RUNNING:
+            raise DirtySessionError("cannot discard a running session")
+
+        self.sandbox_workspace.discard_and_recreate()
+        if self.session.status is SessionStatus.APPLIED:
+            self.session.transition(SessionStatus.CLEAN)
+            self._save_session()
+        if self.session.status is not SessionStatus.DISCARDED:
+            self.session.transition(SessionStatus.DISCARDED)
+            self._save_session()
+        self.session.transition(SessionStatus.CLEAN)
+        self.session.active_run_id = None
+        self.session.patch_manifest_id = None
+        self._save_session()
+        self.last_patch_path = None
+        self.last_state = None
+        return self.session
+
+    def new_session(self, *, discard_dirty: bool = False):
+        if self.session is None or self.sandbox_workspace is None:
+            raise DirtySessionError("no sandbox session")
+        if self.session.status is SessionStatus.RUNNING:
+            raise DirtySessionError("cannot replace a running session")
+        if self.session.status in {
+            SessionStatus.DIRTY_VERIFIED,
+            SessionStatus.DIRTY_FAILED,
+        } and not discard_dirty:
+            raise DirtySessionError(
+                "dirty session requires explicit discard before new chat"
+            )
+
+        self.sandbox_workspace.discard_and_recreate()
+        if self.session.status is SessionStatus.APPLIED:
+            self.session.transition(SessionStatus.CLEAN)
+            self._save_session()
+        if self.session.status is not SessionStatus.DISCARDED:
+            self.session.transition(SessionStatus.DISCARDED)
+            self._save_session()
+
+        session_id = self.session_store.create(
+            sandbox_session_id=self.sandbox_workspace.session_id
+        )
+        session = self.session_store.get(session_id)
+        if session is None:
+            raise RuntimeError("new agent session was not created")
+        self.session = session
+        self.session_id = self.sandbox_workspace.session_id
+        self.last_patch_path = None
+        self.last_state = None
+        self.last_run_id = None
+        return session
+
+    def rebase_session_after_apply(self):
+        if self.session is None or self.sandbox_workspace is None:
+            raise DirtySessionError("no sandbox session")
+        if self.session.status is not SessionStatus.DIRTY_VERIFIED:
+            raise DirtySessionError(
+                "only a verified dirty session can be rebased after apply"
+            )
+
+        self.session.transition(SessionStatus.APPLIED)
+        self._save_session()
+        self.sandbox_workspace.rebase_from_source()
+        self.session.transition(SessionStatus.CLEAN)
+        self.session.patch_manifest_id = None
+        self._save_session()
+        self.last_patch_path = None
+        return self.session
+
     def run(self, request: str):
-        run_id = self.runtime_store.start_run(request)
+        if (
+            self.session is not None
+            and self.session.status is not SessionStatus.CLEAN
+        ):
+            raise DirtySessionError(
+                f"session is not clean: {self.session.status.value}"
+            )
+
+        run_id = self.runtime_store.start_run(
+            request,
+            sandbox_session_id=self.session_id,
+        )
         self.current_run_id = run_id
         self.last_run_id = run_id
         self.last_state = None
 
-        if self.sandbox_workspace is not None:
-            self.runtime_store.update_run(
-                run_id,
-                sandbox_session_id=(
-                    self.sandbox_workspace.session_id
-                ),
-            )
-
         try:
+            if self.session is not None:
+                self.session.transition(SessionStatus.RUNNING)
+                self.session.active_run_id = run_id
+                self._save_session()
+
             state = AgentLoop(self.controller).run(
                 request
             )
@@ -694,6 +803,7 @@ class AgentRuntime:
                 run_id,
                 RUN_INTERRUPTED,
             )
+            self._settle_session_after_run(succeeded=False)
             self.current_run_id = None
             raise
 
@@ -718,6 +828,9 @@ class AgentRuntime:
         )
 
         self.runtime_store.finish_run(run_id, status)
+        self._settle_session_after_run(
+            succeeded=state.phase is AgentPhase.DONE
+        )
         self.current_run_id = None
         self.last_state = state
 
@@ -766,6 +879,11 @@ class AgentRuntime:
             ),
             "sandbox": self.sandbox_status(),
             "sandbox_session_id": self.session_id,
+            "session_status": (
+                self.session.status.value
+                if self.session is not None
+                else None
+            ),
             "workspace": str(self.workspace_root),
             "source_project_root": str(
                 self.source_project_root
@@ -1139,6 +1257,11 @@ class AgentRuntime:
                 ),
             )
         )
+
+        # A successful direct apply establishes the source tree as the
+        # new clean baseline.  Keep the durable session transition in
+        # the same framework-owned path as manual rebases.
+        self.rebase_session_after_apply()
 
         return {
             "applied": applied,

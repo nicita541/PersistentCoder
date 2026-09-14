@@ -16,6 +16,11 @@ from app.tasks.models import (
     TaskRecord,
     TaskStatus,
 )
+from app.tasks.store_context import (
+    StoreContext,
+    owns_task,
+    split_store_binding,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -30,12 +35,11 @@ DEFAULT_DATABASE_PATH = (
 class PlanStore:
     def __init__(
         self,
-        database_path: Path | None = None,
+        database_path: StoreContext | str | Path | None = None,
     ) -> None:
-        self.database_path = (
-            Path(database_path)
-            if database_path is not None
-            else DEFAULT_DATABASE_PATH
+        self.database_path, self.context = split_store_binding(
+            database_path,
+            default_database_path=DEFAULT_DATABASE_PATH,
         )
 
         self.database_path.parent.mkdir(
@@ -94,6 +98,9 @@ class PlanStore:
                     version INTEGER
                         NOT NULL
                         DEFAULT 1,
+
+                    project_id TEXT,
+                    canonical_source_root TEXT,
 
                     user_request TEXT
                         NOT NULL,
@@ -295,6 +302,11 @@ class PlanStore:
             verification_status: str,
             verification_evidence: list[str],
     ) -> None:
+        if self.get_task(task_id) is None:
+            raise ValueError(
+                f"Unknown task for current project: {task_id}"
+            )
+
         with self._connect() as connection:
             result = connection.execute(
                 """
@@ -466,6 +478,17 @@ class PlanStore:
                 "plans",
             )
 
+            if "project_id" not in plan_columns:
+                connection.execute(
+                    "ALTER TABLE plans ADD COLUMN project_id TEXT"
+                )
+
+            if "canonical_source_root" not in plan_columns:
+                connection.execute(
+                    "ALTER TABLE plans "
+                    "ADD COLUMN canonical_source_root TEXT"
+                )
+
             if "replan_reason" not in plan_columns:
                 connection.execute(
                     """
@@ -481,6 +504,27 @@ class PlanStore:
                     ADD COLUMN replaces_plan_id INTEGER
                     """
                 )
+
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_plans_project_status
+                ON plans(project_id, status)
+                """
+            )
+
+    def _plan_scope(
+        self,
+    ) -> tuple[str, tuple[object, ...]]:
+        if self.context is None:
+            return "project_id IS NULL", ()
+
+        return (
+            "project_id = ? AND canonical_source_root = ?",
+            (
+                self.context.project_id,
+                self.context.canonical_source_root,
+            ),
+        )
 
     # ==========================================
     # JSON HELPERS
@@ -712,6 +756,11 @@ class PlanStore:
         plan_id: int,
         status: PlanStatus,
     ) -> None:
+        if self.get_plan(plan_id) is None:
+            raise ValueError(
+                f"Unknown plan for current project: {plan_id}"
+            )
+
         with self._connect() as connection:
             connection.execute(
                 """
@@ -732,6 +781,16 @@ class PlanStore:
         replaces_plan_id: int,
         reason: str,
     ) -> None:
+        if self.get_plan(plan_id) is None:
+            raise ValueError(
+                f"Unknown plan for current project: {plan_id}"
+            )
+        if self.get_plan(replaces_plan_id) is None:
+            raise ValueError(
+                "Unknown replaced plan for current project: "
+                f"{replaces_plan_id}"
+            )
+
         with self._connect() as connection:
             connection.execute(
                 """
@@ -758,6 +817,9 @@ class PlanStore:
         """
         version + replan_reason + replaces_plan_id of a plan.
         """
+
+        if self.get_plan(plan_id) is None:
+            return None
 
         with self._connect() as connection:
             row = connection.execute(
@@ -922,14 +984,26 @@ class PlanStore:
                 """
                 INSERT INTO plans (
                     version,
+                    project_id,
+                    canonical_source_root,
                     user_request,
                     global_goal,
                     status
                 )
-                VALUES (?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     1,
+                    (
+                        self.context.project_id
+                        if self.context is not None
+                        else None
+                    ),
+                    (
+                        self.context.canonical_source_root
+                        if self.context is not None
+                        else None
+                    ),
                     plan.user_request,
                     plan.global_goal,
                     PlanStatus.ACTIVE.value,
@@ -1087,12 +1161,15 @@ class PlanStore:
         self,
         plan_id: int,
     ) -> PlanRecord | None:
+        scope_sql, scope_parameters = self._plan_scope()
         with self._connect() as connection:
             row = connection.execute(
-                """
+                f"""
                 SELECT
                     id,
                     version,
+                    project_id,
+                    canonical_source_root,
                     user_request,
                     global_goal,
                     status,
@@ -1101,9 +1178,9 @@ class PlanStore:
 
                 FROM plans
 
-                WHERE id = ?
+                WHERE id = ? AND {scope_sql}
                 """,
-                (plan_id,),
+                (plan_id, *scope_parameters),
             ).fetchone()
 
         if row is None:
@@ -1115,6 +1192,16 @@ class PlanStore:
             ),
             version=int(
                 row["version"]
+            ),
+            project_id=(
+                str(row["project_id"])
+                if row["project_id"] is not None
+                else None
+            ),
+            canonical_source_root=(
+                str(row["canonical_source_root"])
+                if row["canonical_source_root"] is not None
+                else None
             ),
             user_request=str(
                 row["user_request"]
@@ -1136,12 +1223,15 @@ class PlanStore:
     def get_active_plan(
         self,
     ) -> PlanRecord | None:
+        scope_sql, scope_parameters = self._plan_scope()
         with self._connect() as connection:
             row = connection.execute(
-                """
+                f"""
                 SELECT
                     id,
                     version,
+                    project_id,
+                    canonical_source_root,
                     user_request,
                     global_goal,
                     status,
@@ -1150,12 +1240,13 @@ class PlanStore:
 
                 FROM plans
 
-                WHERE status = 'ACTIVE'
+                WHERE status = 'ACTIVE' AND {scope_sql}
 
                 ORDER BY id DESC
 
                 LIMIT 1
-                """
+                """,
+                scope_parameters,
             ).fetchone()
 
         if row is None:
@@ -1167,6 +1258,16 @@ class PlanStore:
             ),
             version=int(
                 row["version"]
+            ),
+            project_id=(
+                str(row["project_id"])
+                if row["project_id"] is not None
+                else None
+            ),
+            canonical_source_root=(
+                str(row["canonical_source_root"])
+                if row["canonical_source_root"] is not None
+                else None
             ),
             user_request=str(
                 row["user_request"]
@@ -1194,6 +1295,9 @@ class PlanStore:
         task_id: int,
     ) -> list[int]:
         with self._connect() as connection:
+            if not owns_task(connection, self.context, task_id):
+                return []
+
             rows = connection.execute(
                 """
                 SELECT
@@ -1224,6 +1328,9 @@ class PlanStore:
         self,
         plan_id: int,
     ):
+        if self.get_plan(plan_id) is None:
+            return []
+
         tasks = (
             self._get_tasks_without_external_dependencies(
                 plan_id
@@ -1460,6 +1567,11 @@ class PlanStore:
         будет добавлена в Planner v0.3+.
         """
 
+        if self.get_task(task_id) is None:
+            raise ValueError(
+                f"Unknown task for current project: {task_id}"
+            )
+
         with self._connect() as connection:
             if (
                 status
@@ -1545,6 +1657,11 @@ class PlanStore:
         verification_status: str,
         verification_evidence: list[str],
     ) -> None:
+        if self.get_task(task_id) is None:
+            raise ValueError(
+                f"Unknown task for current project: {task_id}"
+            )
+
         with self._connect() as connection:
             connection.execute(
                 """
