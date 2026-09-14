@@ -365,6 +365,15 @@ class ContextBuilder:
             for criterion in criteria
         ) or "- (не заданы)"
 
+        active_change_paths = getattr(
+            step if step is not None else task,
+            "change_paths",
+            [],
+        )
+        change_paths_text = "\n".join(
+            f"- {path}" for path in active_change_paths
+        ) or "- (none; persistent file changes are forbidden)"
+
         step_text = ""
 
         if step is not None:
@@ -392,6 +401,8 @@ class ContextBuilder:
             f"{step_text}"
             "\nSUCCESS CRITERIA:\n"
             f"{criteria_text}\n"
+            "\nEXACT ALLOWED CHANGE PATHS:\n"
+            f"{change_paths_text}\n"
             f"{feedback_text}\n"
             f"{project_context}\n\n"
             f"{ACTION_PROTOCOL}"

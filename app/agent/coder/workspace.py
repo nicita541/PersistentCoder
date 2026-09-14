@@ -72,6 +72,12 @@ class Workspace:
             content,
         )
 
+    def delete(
+        self,
+        path: str,
+    ) -> bool:
+        return self.files.delete(path)
+
     def list_files(
         self,
         pattern: str = "**/*",

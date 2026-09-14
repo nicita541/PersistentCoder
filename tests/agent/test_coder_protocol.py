@@ -359,3 +359,30 @@ def test_absolute_path_is_still_blocked(tmp_path):
 
     assert result.ok is False
     assert not Path(r"C:\outside.txt").exists()
+
+
+def test_delete_entry_must_not_include_content(tmp_path):
+    (tmp_path / "out.txt").write_text("keep", encoding="utf-8")
+    llm = FakeLLM(
+        [
+            json.dumps({"action": "read", "path": "out.txt"}),
+            json.dumps(
+                {
+                    "action": "edit",
+                    "files": [
+                        {
+                            "path": "out.txt",
+                            "operation": "delete",
+                            "content": "unexpected",
+                        }
+                    ],
+                }
+            ),
+        ]
+    )
+
+    result = _agent(tmp_path, llm).execute(FakeTask())
+
+    assert result.ok is False
+    assert "delete entry must not include content" in result.failure_reason
+    assert (tmp_path / "out.txt").exists()

@@ -389,6 +389,9 @@ class TaskDecomposer:
         "src/calculator.py) may be produced by EXACTLY ONE "
         "task; never let two tasks produce the same file "
         "path and never split a single file across tasks\n"
+        "- change_paths lists every exact project-relative file the task may "
+        "write or delete; it must not contain directories or globs, and every "
+        "path must belong to exactly one task\n"
         "- each task may include an ordered \"steps\" array "
         "(title, description, requires, produces, "
         "success_criteria); steps are meaningful "
@@ -479,6 +482,7 @@ class TaskDecomposer:
                     '"description": "Implement the module.", '
                     '"priority": 80, "requires": [], '
                     '"produces": ["sandbox_agent_test/calculator.py"], '
+                    '"change_paths": ["sandbox_agent_test/calculator.py"], '
                     '"external_dependencies": [], '
                     '"success_criteria": ["calculator.py exists"]}, '
                     '{"key": "tests", "title": "Test calculator", '
@@ -486,6 +490,7 @@ class TaskDecomposer:
                     '"priority": 70, '
                     '"requires": ["sandbox_agent_test/calculator.py"], '
                     '"produces": ["sandbox_agent_test/test_calculator.py"], '
+                    '"change_paths": ["sandbox_agent_test/test_calculator.py"], '
                     '"external_dependencies": ["pytest"], '
                     '"success_criteria": ["tests pass"]}]}\n\n'
                     "IMPORTANT: every value in requires MUST appear "
@@ -501,6 +506,7 @@ class TaskDecomposer:
                     '      "priority": 50,\n'
                     '      "requires": ["internal resource"],\n'
                     '      "produces": ["internal resource"],\n'
+                    '      "change_paths": ["src/exact_file.py"],\n'
                     '      "external_dependencies": ["flask"],\n'
                     '      "success_criteria": ["verifiable result"]\n'
                     "    }\n"

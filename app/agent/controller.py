@@ -12,6 +12,7 @@ from app.tasks.models import (
     StepStatus,
     TaskStatus,
 )
+from app.tasks.change_scope import AllowedChangeSet
 
 
 class AgentControllerError(RuntimeError):
@@ -226,6 +227,10 @@ class AgentController:
                 step=step,
                 plan_id=state.plan_id,
                 feedback=feedback,
+                allowed_changes=AllowedChangeSet(
+                    task.change_paths,
+                    step.change_paths if step is not None else None,
+                ),
             )
 
         except Exception as error:

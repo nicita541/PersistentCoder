@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.agent.state import ExecutionResult
+from app.tasks.change_scope import AllowedChangeSet
 
 
 class CodingAgent:
@@ -21,10 +22,12 @@ class CodingAgent:
         step=None,
         plan_id: int | None = None,
         feedback: str | None = None,
+        allowed_changes: AllowedChangeSet | None = None,
     ) -> ExecutionResult:
         return self.executor.execute(
             task,
             step=step,
             feedback=feedback,
+            allowed_changes=allowed_changes,
         )
 

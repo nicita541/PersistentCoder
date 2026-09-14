@@ -14,9 +14,10 @@ from app.sandbox.limits import (
 from app.sandbox.policy import (
     CommandPolicy,
     PolicyViolation,
-    is_absolute_path,
 )
 from app.context.builder import ACTION_PROTOCOL
+from app.sandbox.project_path import ProjectPath, ProjectPathError
+from app.tasks.change_scope import AllowedChangeSet, ChangeScopeError
 
 
 class CodeExecutorError(RuntimeError):
@@ -143,9 +144,8 @@ class CodeExecutor:
         # Optional progress/timing sink (Agent Layer event bus).
         self.on_event = on_event
 
-        # Paths the agent itself created during this session. These
-        # are already "known" and do not require an explicit read
-        # before a later attempt may rewrite them.
+        # Kept as shared runtime bookkeeping for compatibility and
+        # reporting only. It never bypasses current-attempt reads.
         self.known_files = (
             known_files
             if known_files is not None
@@ -256,6 +256,7 @@ class CodeExecutor:
         *,
         step=None,
         feedback: str | None = None,
+        allowed_changes: AllowedChangeSet | None = None,
     ) -> ExecutionResult:
         observed: dict[str, str] = {}
         transcript: list[str] = []
@@ -431,6 +432,7 @@ class CodeExecutor:
                 error = self._validate_envelope(
                     proposal,
                     observed,
+                    allowed_changes,
                 )
 
                 if error is not None:
@@ -636,16 +638,6 @@ class CodeExecutor:
 
         return normalized
 
-    def _normalize(
-        self,
-        path: str,
-    ) -> str:
-        return (
-            path.replace("\\", "/")
-            .strip()
-            .lstrip("./")
-        )
-
     def _observe(
         self,
         proposal: dict[str, object],
@@ -693,7 +685,12 @@ class CodeExecutor:
             except Exception as exc:
                 return False, f"READ ERROR {path}: {exc}"
 
-            observed[self._normalize(path)] = content
+            try:
+                key = ProjectPath.parse(path).comparison_key
+            except ProjectPathError as error:
+                return False, f"READ ERROR {path}: {error}"
+
+            observed[key] = content
 
             return True, (
                 f"FILE {path}:\n"
@@ -734,6 +731,7 @@ class CodeExecutor:
         self,
         proposal: dict[str, object],
         observed: dict[str, str],
+        allowed_changes: AllowedChangeSet | None,
     ) -> str | None:
         """
         Fully validate the action envelope BEFORE writing anything.
@@ -760,12 +758,13 @@ class CodeExecutor:
                 None,
             )
 
+            seen_paths: set[str] = set()
+
             for entry in files:
                 if not isinstance(entry, dict):
                     return "each file entry must be an object"
 
                 path = entry.get("path")
-                content = entry.get("content", "")
 
                 if (
                     not isinstance(path, str)
@@ -773,48 +772,73 @@ class CodeExecutor:
                 ):
                     return "file entry requires a path"
 
-                if is_absolute_path(path):
-                    return (
-                        "absolute paths are forbidden: "
-                        f"{path}"
-                    )
+                try:
+                    project_path = ProjectPath.parse(path)
+                except ProjectPathError as error:
+                    return str(error)
 
-                if not isinstance(content, str):
-                    return "file content must be a string"
+                if project_path.comparison_key in seen_paths:
+                    return f"duplicate file entry: {project_path.value}"
+                seen_paths.add(project_path.comparison_key)
 
-                if (
-                    len(content.encode("utf-8"))
-                    > self.limits.max_file_bytes
-                ):
-                    return (
-                        "file exceeds max_file_bytes: "
-                        f"{path}"
-                    )
+                operation = entry.get("operation", "write")
+                if operation not in {"write", "delete"}:
+                    return "file operation must be 'write' or 'delete'"
+
+                try:
+                    if allowed_changes is not None:
+                        if operation == "delete":
+                            allowed_changes.assert_can_delete(project_path.value)
+                        else:
+                            allowed_changes.assert_can_write(project_path.value)
+                except ChangeScopeError as error:
+                    return str(error)
+
+                if operation == "delete":
+                    if "content" in entry:
+                        return "delete entry must not include content"
+                    if files_tools is None or not hasattr(
+                        files_tools, "validate_delete"
+                    ):
+                        return "workspace cannot validate safe deletion"
+                    try:
+                        files_tools.validate_delete(project_path.value)
+                    except PolicyViolation as error:
+                        return str(error)
+                else:
+                    content = entry.get("content", "")
+                    if not isinstance(content, str):
+                        return "file content must be a string"
+
+                    if (
+                        len(content.encode("utf-8"))
+                        > self.limits.max_file_bytes
+                    ):
+                        return (
+                            "file exceeds max_file_bytes: "
+                            f"{project_path.value}"
+                        )
 
                 if files_tools is not None:
                     try:
-                        files_tools.policy.resolve(path)
+                        files_tools.policy.resolve(project_path.value)
 
                     except PolicyViolation as error:
                         return str(error)
 
                 # OBSERVE BEFORE EDIT: an existing file must have been
                 # read during this attempt before it is modified.
-                if self._normalize(path) not in observed:
+                if project_path.comparison_key not in observed:
                     try:
-                        exists = self.workspace.exists(path)
+                        exists = self.workspace.exists(project_path.value)
 
                     except Exception as error:
                         return str(error)
 
-                    if (
-                        exists
-                        and self._normalize(path)
-                        not in self.known_files
-                    ):
+                    if exists:
                         return (
                             "observe-before-edit violated: "
-                            f"must read {path} before editing"
+                            f"must read {project_path.value} before editing"
                         )
 
         if commands is not None:
@@ -884,6 +908,9 @@ class CodeExecutor:
                     evidence=["invalid_files"],
                 )
 
+            backups: dict[str, tuple[str, bool, str | None]] = {}
+            applied: list[str] = []
+
             for entry in files:
                 if not isinstance(entry, dict):
                     return ExecutionResult(
@@ -901,6 +928,7 @@ class CodeExecutor:
                     )
 
                 path = entry.get("path")
+                operation = entry.get("operation", "write")
                 content = entry.get("content", "")
 
                 if (
@@ -918,7 +946,7 @@ class CodeExecutor:
                         ],
                     )
 
-                if not isinstance(content, str):
+                if operation == "write" and not isinstance(content, str):
                     return ExecutionResult(
                         ok=False,
                         summary=(
@@ -933,55 +961,54 @@ class CodeExecutor:
                         ],
                     )
 
-                raw_path = path.strip()
+                raw_path = ProjectPath.parse(path).value
+                key = ProjectPath.parse(raw_path).comparison_key
 
-                if is_absolute_path(raw_path):
-                    return ExecutionResult(
-                        ok=False,
-                        summary=(
-                            "absolute workspace paths "
-                            "are forbidden"
-                        ),
-                        failure_reason=(
-                            "absolute path in action "
-                            "envelope"
-                        ),
-                        evidence=[
-                            f"blocked_path:{raw_path}"
-                        ],
+                if key not in backups:
+                    existed = self.workspace.exists(raw_path)
+                    old_content = (
+                        self.workspace.read(raw_path) if existed else None
                     )
+                    backups[key] = (raw_path, existed, old_content)
 
                 try:
-                    written = self.workspace.write(
-                        raw_path,
-                        content,
-                    )
+                    if operation == "delete":
+                        self.workspace.delete(raw_path)
+                        relative = raw_path
+                        evidence.append(f"deleted {relative}")
+                    else:
+                        written = self.workspace.write(raw_path, content)
+                        relative = self.workspace.relative(written)
+                        evidence.append(f"wrote {relative}")
+                    applied.append(key)
 
-                except PolicyViolation as error:
+                except Exception as error:
+                    rollback_errors: list[str] = []
+                    for applied_key in reversed(applied):
+                        backup_path, existed, old_content = backups[applied_key]
+                        try:
+                            if existed:
+                                self.workspace.write(backup_path, old_content or "")
+                            elif self.workspace.exists(backup_path):
+                                self.workspace.delete(backup_path)
+                        except Exception as rollback_error:
+                            rollback_errors.append(str(rollback_error))
                     return ExecutionResult(
                         ok=False,
-                        summary=(
-                            "path rejected by sandbox "
-                            "policy"
+                        summary="file change transaction failed",
+                        failure_reason=(
+                            str(error)
+                            + (
+                                "; rollback errors: " + "; ".join(rollback_errors)
+                                if rollback_errors
+                                else ""
+                            )
                         ),
-                        failure_reason=str(error),
-                        evidence=[
-                            f"blocked_path:{raw_path}"
-                        ],
+                        evidence=[f"file_transaction_failed:{raw_path}"],
+                        read_files=list(read_files or []),
                     )
 
-                relative = self.workspace.relative(
-                    written
-                )
-
-                self.known_files.add(
-                    self._normalize(raw_path)
-                )
-
                 artifacts.append(relative)
-                evidence.append(
-                    f"wrote {relative}"
-                )
 
 
         # --------------------------------------

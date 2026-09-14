@@ -46,7 +46,25 @@ class FakeLLM:
             return self.responses.pop(0)
 
         if self.default is not None:
-            return self.default
+            response = self.default
+            # Runtime fixtures model the protocol faithfully: when a
+            # canned coder response uses the historical artifact.txt
+            # placeholder, bind it to the exact scope shown in the prompt.
+            try:
+                payload = json.loads(response)
+                user_text = "\n".join(
+                    str(message.get("content", "")) for message in messages
+                )
+                marker = "EXACT ALLOWED CHANGE PATHS:\n- "
+                if marker in user_text:
+                    allowed = user_text.split(marker, 1)[1].splitlines()[0]
+                    for entry in payload.get("files", []):
+                        if entry.get("path") == "artifact.txt":
+                            entry["path"] = allowed
+                    response = json.dumps(payload)
+            except (AttributeError, TypeError, ValueError):
+                pass
+            return response
 
         raise AssertionError(
             "FakeLLM has no response"
@@ -183,8 +201,9 @@ def tasks_response() -> str:
                         "database connection"
                     ],
                     "success_criteria": [
-                        "artifact.txt exists"
+                        "database.txt exists"
                     ],
+                    "change_paths": ["database.txt"],
                 },
                 {
                     "key": "models",
@@ -199,8 +218,9 @@ def tasks_response() -> str:
                         "Note model",
                     ],
                     "success_criteria": [
-                        "artifact.txt exists"
+                        "models.txt exists"
                     ],
+                    "change_paths": ["models.txt"],
                 },
                 {
                     "key": "auth",
@@ -212,8 +232,9 @@ def tasks_response() -> str:
                         "authentication service"
                     ],
                     "success_criteria": [
-                        "artifact.txt exists"
+                        "auth.txt exists"
                     ],
+                    "change_paths": ["auth.txt"],
                 },
                 {
                     "key": "notes_api",
@@ -228,6 +249,7 @@ def tasks_response() -> str:
                     "success_criteria": [
                         "artifact.txt exists"
                     ],
+                    "change_paths": ["artifact.txt"],
                 },
             ]
         },

@@ -122,6 +122,11 @@ class TaskBuilder:
                 )
             )
 
+            change_paths = optional_string_list(
+                raw_task,
+                "change_paths",
+            )
+
             result.append(
                 TaskDraft(
                     key=key,
@@ -136,6 +141,7 @@ class TaskBuilder:
                     external_dependencies=(
                         external_dependencies
                     ),
+                    change_paths=change_paths,
                 )
             )
 
@@ -354,6 +360,10 @@ class TaskBuilder:
                             "produces",
                         ),
                         success_criteria=criteria,
+                        change_paths=optional_string_list(
+                            raw_step,
+                            "change_paths",
+                        ),
                     )
                 )
 

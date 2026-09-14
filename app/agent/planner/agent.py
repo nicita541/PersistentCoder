@@ -365,6 +365,7 @@ class PlannerAgent:
                         requires=list(task.requires),
                         produces=list(task.produces),
                         success_criteria=criteria,
+                        change_paths=list(task.change_paths),
                     )
                 ]
 
