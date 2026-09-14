@@ -62,16 +62,16 @@ installation; no silent compatibility path that bypasses the new boundary.
 - `ProtectedPathPolicy.classify(ProjectPath) -> inclusion decision/reason`
 - `GitIgnoreMatcher.from_project(root).is_ignored(path, is_dir)`
 
-- [ ] Write failing tests proving `.git`, caches, `.env`, `.env.*` except
+- [x] Write failing tests proving `.git`, caches, `.env`, `.env.*` except
   `.env.example`, private keys/certificates and credential files are excluded;
   normal target `data/` and `models/` are retained; project `.gitignore` rules
   and negations are honored; `.github` is retained.
-- [ ] Implement deterministic path-component/name policy with explicit reasons
+- [x] Implement deterministic path-component/name policy with explicit reasons
   and a bounded repository-local `.gitignore` matcher (no global git config).
-- [ ] Remove name-only `data/models/.vscode/.idea` exclusions from target
+- [x] Remove name-only `data/models/.vscode/.idea` exclusions from target
   snapshots while retaining framework metadata/cache protections.
-- [ ] Run snapshot-policy and existing patch-safety tests.
-- [ ] Commit: `feat: define protected snapshot paths`.
+- [x] Run snapshot-policy and existing patch-safety tests.
+- [x] Commit: `feat: define protected snapshot paths`.
 
 ### Task 3: Create a bounded `SnapshotManifest`
 

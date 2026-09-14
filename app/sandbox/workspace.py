@@ -22,6 +22,9 @@ from app.sandbox.limits import (
     LimitExceeded,
 )
 from app.project_identity import ProjectIdentity
+from app.sandbox.gitignore import GitIgnoreMatcher
+from app.sandbox.project_path import ProjectPath
+from app.sandbox.protected_paths import ProtectedPathPolicy
 
 if TYPE_CHECKING:
     from app.storage import ProjectStorage
@@ -92,19 +95,19 @@ class SandboxResetError(RuntimeError):
 
 
 def _project_files(root: Path):
+    protected = ProtectedPathPolicy()
+    ignored = GitIgnoreMatcher.from_project(root)
+
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
 
         relative = path.relative_to(root)
 
-        if any(
-            part in IGNORED_DIRECTORIES
-            for part in relative.parts
-        ):
+        project_path = ProjectPath.parse(relative.as_posix())
+        if not protected.classify(project_path).included:
             continue
-
-        if path.suffix in IGNORED_SUFFIXES:
+        if ignored.is_ignored(project_path):
             continue
 
         yield path, relative
