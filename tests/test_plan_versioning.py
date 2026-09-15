@@ -157,6 +157,11 @@ class _RoutingLLM:
         if "Dependency Builder" in text:
             return dependencies_response()
 
+        marker = "EXACT ALLOWED CHANGE PATHS:\n- "
+        if marker in text:
+            path = text.split(marker, 1)[1].splitlines()[0]
+            return coder_envelope(path=path)
+
         return coder_envelope()
 
 

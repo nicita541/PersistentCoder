@@ -12,6 +12,7 @@ from app.agent.verifier.criterion import (
 from app.agent.verifier.evidence import (
     EvidenceCollector,
 )
+from app.agent.verifier.structured import StructuredVerifier
 from app.tasks.models import TaskStatus
 
 
@@ -60,6 +61,10 @@ class VerificationAgent:
                 command_runner=command_runner,
             )
         )
+        self.structured = StructuredVerifier(
+            workspace=workspace,
+            command_runner=command_runner,
+        )
 
     def _collect_evidence(
         self,
@@ -107,6 +112,13 @@ class VerificationAgent:
 
         return criteria
 
+    @staticmethod
+    def _specs_for(task, step):
+        specs = list(getattr(step, "verification_specs", []) or [])
+        if not specs:
+            specs = list(getattr(task, "verification_specs", []) or [])
+        return specs
+
     def _verify(
         self,
         *,
@@ -143,6 +155,7 @@ class VerificationAgent:
                 evidence=evidence,
             )
 
+        specs = self._specs_for(task, step)
         criteria = self._criteria_for(task, step)
 
         # Authoritative pytest scope: the test files this attempt
@@ -155,7 +168,7 @@ class VerificationAgent:
             if is_test_file(artifact)
         ]
 
-        if not criteria:
+        if not specs and not criteria:
             return VerificationResult(
                 ok=False,
                 status="FAIL",
@@ -165,10 +178,15 @@ class VerificationAgent:
                 evidence=evidence,
             )
 
-        results: list[CriterionResult] = [
-            self.criteria.evaluate(criterion)
-            for criterion in criteria
-        ]
+        if specs:
+            results: list[CriterionResult] = self.structured.verify_all(specs)
+        else:
+            # Direct/legacy callers keep fail-closed compatibility; all new
+            # persisted runtime plans carry structured specs.
+            results = [
+                self.criteria.evaluate(criterion)
+                for criterion in criteria
+            ]
 
         failures = [
             item
@@ -256,6 +274,12 @@ class VerificationAgent:
                 ),
             )
 
+        elif result.status == "BLOCKED":
+            self.verifier.block_step(
+                step.id,
+                reason=result.reason or "verification blocked",
+                evidence=result.evidence or ["verification_blocked"],
+            )
         else:
             self.verifier.fail_step(
                 step.id,
@@ -294,6 +318,12 @@ class VerificationAgent:
                 ),
             )
 
+        elif result.status == "BLOCKED":
+            self.verifier.block_task(
+                task.id,
+                reason=result.reason or "verification blocked",
+                evidence=result.evidence or ["verification_blocked"],
+            )
         else:
             self.verifier.fail_task(
                 task.id,

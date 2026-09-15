@@ -11,6 +11,10 @@ from app.tasks.store_context import (
     StoreContext,
     split_store_binding,
 )
+from app.agent.event_sanitizer import sanitize_event_payload
+
+
+_UNSET = object()
 
 
 RUNNING = "RUNNING"
@@ -253,13 +257,13 @@ class RuntimeStore:
         self,
         run_id: int,
         *,
-        phase: str | None = None,
-        plan_id: int | None = None,
-        task_id: int | None = None,
-        step_id: int | None = None,
-        attempt_id: int | None = None,
-        sandbox_session_id: str | None = None,
-        checkpoint_id: str | None = None,
+        phase: str | None | object = _UNSET,
+        plan_id: int | None | object = _UNSET,
+        task_id: int | None | object = _UNSET,
+        step_id: int | None | object = _UNSET,
+        attempt_id: int | None | object = _UNSET,
+        sandbox_session_id: str | None | object = _UNSET,
+        checkpoint_id: str | None | object = _UNSET,
     ) -> None:
         fields: dict[str, object] = {}
 
@@ -272,7 +276,7 @@ class RuntimeStore:
             ("sandbox_session_id", sandbox_session_id),
             ("checkpoint_id", checkpoint_id),
         ):
-            if value is not None:
+            if value is not _UNSET:
                 fields[name] = value
 
         if not fields:
@@ -445,10 +449,14 @@ class RuntimeStore:
         if self.get_run(run_id) is None:
             raise ValueError(f"Unknown run for current project: {run_id}")
 
-        serialized = json.dumps(
-            payload or {},
-            ensure_ascii=False,
-        )[:2000]
+        safe_payload = sanitize_event_payload(payload or {})
+        serialized = json.dumps(safe_payload, ensure_ascii=False)
+        if len(serialized.encode("utf-8")) > 2000:
+            safe_payload = {
+                "truncated": True,
+                "event_summary": str(safe_payload)[:1200],
+            }
+            serialized = json.dumps(safe_payload, ensure_ascii=False)
 
         with self._connect() as connection:
             project_id = (

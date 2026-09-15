@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from app.sandbox.project_path import ProjectPath, ProjectPathError
 
 
 # ==========================================
@@ -71,12 +72,11 @@ class RepoContext:
 def _normalize_path(
     raw: str,
 ) -> str:
-    return (
-        raw.strip()
-        .strip("\"'`")
-        .replace("\\", "/")
-        .lstrip("./")
-    )
+    cleaned = raw.strip().strip("\"'`")
+    try:
+        return ProjectPath.parse(cleaned).value
+    except ProjectPathError:
+        return ""
 
 
 class RepoContextSelector:

@@ -51,11 +51,11 @@ class RepairStrategySelector:
         step_attempts: int,
         task_attempts: int,
     ) -> str:
+        if task_attempts >= self.max_task_attempts:
+            return GIVE_UP
+
         if step_attempts < self.max_step_attempts:
             return RETRY_STEP
 
-        if task_attempts < self.max_task_attempts:
-            return REPLAN_TASK
-
-        return GIVE_UP
+        return REPLAN_TASK
 

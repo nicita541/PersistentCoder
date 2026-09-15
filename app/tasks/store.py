@@ -8,6 +8,10 @@ from pathlib import Path
 from app.tasks.dependencies import (
     validate_task_graph,
 )
+from app.tasks.change_scope import (
+    canonicalize_change_paths,
+    validate_unique_task_paths,
+)
 from app.tasks.models import (
     PlanDraft,
     PlanRecord,
@@ -21,6 +25,7 @@ from app.tasks.store_context import (
     owns_task,
     split_store_binding,
 )
+from app.tasks.verification_spec import VerificationSpec, parse_verification_specs
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -159,6 +164,14 @@ class PlanStore:
                         DEFAULT '[]',
 
                     success_criteria_json TEXT
+                        NOT NULL
+                        DEFAULT '[]',
+
+                    change_paths_json TEXT
+                        NOT NULL
+                        DEFAULT '[]',
+
+                    verification_specs_json TEXT
                         NOT NULL
                         DEFAULT '[]',
 
@@ -483,6 +496,18 @@ class PlanStore:
                     "ALTER TABLE plans ADD COLUMN project_id TEXT"
                 )
 
+            if "change_paths_json" not in task_columns:
+                connection.execute(
+                    "ALTER TABLE tasks ADD COLUMN change_paths_json "
+                    "TEXT NOT NULL DEFAULT '[]'"
+                )
+
+            if "verification_specs_json" not in task_columns:
+                connection.execute(
+                    "ALTER TABLE tasks ADD COLUMN verification_specs_json "
+                    "TEXT NOT NULL DEFAULT '[]'"
+                )
+
             if "canonical_source_root" not in plan_columns:
                 connection.execute(
                     "ALTER TABLE plans "
@@ -538,6 +563,17 @@ class PlanStore:
             value,
             ensure_ascii=False,
         )
+
+    @staticmethod
+    def _dump_specs(value: list[VerificationSpec]) -> str:
+        return json.dumps(
+            [spec.to_dict() for spec in value],
+            ensure_ascii=False,
+        )
+
+    @staticmethod
+    def _load_specs(value: str) -> list[VerificationSpec]:
+        return parse_verification_specs(json.loads(value))
 
     @staticmethod
     def _load_list(
@@ -647,9 +683,13 @@ class PlanStore:
                 replace(
                     task,
                     key=resolved_key,
+                    change_paths=canonicalize_change_paths(
+                        task.change_paths
+                    ),
                 )
             )
 
+        validate_unique_task_paths(prepared)
         return prepared
 
     # ==========================================
@@ -1042,12 +1082,16 @@ class PlanStore:
                         requires_json,
                         produces_json,
                         success_criteria_json,
+                        change_paths_json,
+                        verification_specs_json,
                         current_step,
                         attempt_count,
                         result_artifacts_json,
                         verification_evidence_json
                     )
                     VALUES (
+                        ?,
+                        ?,
                         ?,
                         ?,
                         ?,
@@ -1081,6 +1125,10 @@ class PlanStore:
                         self._dump_list(
                             task.success_criteria
                         ),
+                        self._dump_list(
+                            task.change_paths
+                        ),
+                        self._dump_specs(task.verification_specs),
                     ),
                 )
 
@@ -1390,6 +1438,8 @@ class PlanStore:
                     requires_json,
                     produces_json,
                     success_criteria_json,
+                    change_paths_json,
+                    verification_specs_json,
                     current_step,
                     attempt_count,
                     result_summary,
@@ -1464,6 +1514,12 @@ class PlanStore:
                                 "success_criteria_json"
                             ]
                         )
+                    ),
+                    change_paths=self._load_list(
+                        row["change_paths_json"]
+                    ),
+                    verification_specs=self._load_specs(
+                        row["verification_specs_json"]
                     ),
                     current_step=current_step,
                     attempt_count=int(

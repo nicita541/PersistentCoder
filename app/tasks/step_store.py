@@ -4,6 +4,11 @@ import json
 import sqlite3
 from pathlib import Path
 
+from app.tasks.change_scope import (
+    AllowedChangeSet,
+    ChangeScopeError,
+    canonicalize_change_paths,
+)
 from app.tasks.models import (
     StepDraft,
     StepRecord,
@@ -18,6 +23,7 @@ from app.tasks.store_context import (
     owns_task,
     split_store_binding,
 )
+from app.tasks.verification_spec import VerificationSpec, parse_verification_specs
 
 
 class StepStoreError(
@@ -42,6 +48,7 @@ class StepStore:
         )
 
         self._initialize_database()
+        self._ensure_change_paths_column()
 
     def _connect(
         self,
@@ -98,6 +105,14 @@ class StepStore:
                         NOT NULL
                         DEFAULT '[]',
 
+                    change_paths_json TEXT
+                        NOT NULL
+                        DEFAULT '[]',
+
+                    verification_specs_json TEXT
+                        NOT NULL
+                        DEFAULT '[]',
+
                     attempt_count INTEGER
                         NOT NULL
                         DEFAULT 0,
@@ -148,6 +163,25 @@ class StepStore:
                 """
             )
 
+    def _ensure_change_paths_column(self) -> None:
+        with self._connect() as connection:
+            columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(steps)"
+                ).fetchall()
+            }
+            if "change_paths_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE steps ADD COLUMN change_paths_json "
+                    "TEXT NOT NULL DEFAULT '[]'"
+                )
+            if "verification_specs_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE steps ADD COLUMN verification_specs_json "
+                    "TEXT NOT NULL DEFAULT '[]'"
+                )
+
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS
@@ -164,6 +198,17 @@ class StepStore:
             value,
             ensure_ascii=False,
         )
+
+    @staticmethod
+    def _dump_specs(value: list[VerificationSpec]) -> str:
+        return json.dumps(
+            [spec.to_dict() for spec in value],
+            ensure_ascii=False,
+        )
+
+    @staticmethod
+    def _load_specs(value: str) -> list[VerificationSpec]:
+        return parse_verification_specs(json.loads(value))
 
     @staticmethod
     def _load_list(
@@ -205,6 +250,12 @@ class StepStore:
                     f"unknown task: {task_id}"
                 )
 
+            task_row = connection.execute(
+                "SELECT change_paths_json FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            task_paths = self._load_list(task_row["change_paths_json"])
+
             existing = connection.execute(
                 """
                 SELECT COUNT(*) AS count
@@ -228,6 +279,14 @@ class StepStore:
                 steps,
                 start=1,
             ):
+                try:
+                    step_paths = canonicalize_change_paths(
+                        step.change_paths
+                    )
+                    AllowedChangeSet(task_paths, step_paths)
+                except ChangeScopeError as error:
+                    raise StepStoreError(str(error)) from error
+
                 cursor = connection.execute(
                     """
                     INSERT INTO steps (
@@ -239,11 +298,15 @@ class StepStore:
                         requires_json,
                         produces_json,
                         success_criteria_json,
+                        change_paths_json,
+                        verification_specs_json,
                         attempt_count,
                         result_artifacts_json,
                         verification_evidence_json
                     )
                     VALUES (
+                        ?,
+                        ?,
                         ?,
                         ?,
                         ?,
@@ -272,6 +335,8 @@ class StepStore:
                         self._dump_list(
                             step.success_criteria
                         ),
+                        self._dump_list(step_paths),
+                        self._dump_specs(step.verification_specs),
                     ),
                 )
 
@@ -280,6 +345,73 @@ class StepStore:
                 )
 
             return created_ids
+
+    def supersede_unfinished_and_create(
+        self,
+        task_id: int,
+        steps: list[StepDraft],
+    ) -> list[int]:
+        """Atomically replace only unfinished executable Step structure."""
+
+        if not steps:
+            raise StepStoreError("replacement steps are required")
+        with self._connect() as connection:
+            if not owns_task(connection, self.context, task_id):
+                raise StepStoreError(f"unknown task: {task_id}")
+            task_row = connection.execute(
+                "SELECT change_paths_json FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            task_paths = self._load_list(task_row["change_paths_json"])
+            maximum = connection.execute(
+                "SELECT COALESCE(MAX(position), 0) AS value FROM steps WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            start = int(maximum["value"])
+            connection.execute(
+                """
+                UPDATE steps
+                SET status = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE task_id = ? AND status != ?
+                """,
+                (StepStatus.SUPERSEDED.value, task_id, StepStatus.DONE.value),
+            )
+            ids: list[int] = []
+            for offset, step in enumerate(steps, start=1):
+                try:
+                    step_paths = canonicalize_change_paths(step.change_paths)
+                    AllowedChangeSet(task_paths, step_paths)
+                except ChangeScopeError as error:
+                    raise StepStoreError(str(error)) from error
+                cursor = connection.execute(
+                    """
+                    INSERT INTO steps (
+                        task_id, position, title, description, status,
+                        requires_json, produces_json, success_criteria_json,
+                        change_paths_json, verification_specs_json,
+                        attempt_count, result_artifacts_json,
+                        verification_evidence_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '[]', '[]')
+                    """,
+                    (
+                        task_id,
+                        start + offset,
+                        step.title,
+                        step.description,
+                        StepStatus.PENDING.value,
+                        self._dump_list(step.requires),
+                        self._dump_list(step.produces),
+                        self._dump_list(step.success_criteria),
+                        self._dump_list(step_paths),
+                        self._dump_specs(step.verification_specs),
+                    ),
+                )
+                ids.append(int(cursor.lastrowid))
+            connection.execute(
+                "UPDATE tasks SET current_step = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (task_id,),
+            )
+            return ids
 
     def _row_to_step(
         self,
@@ -316,6 +448,12 @@ class StepStore:
                         "success_criteria_json"
                     ]
                 )
+            ),
+            change_paths=self._load_list(
+                row["change_paths_json"]
+            ),
+            verification_specs=self._load_specs(
+                row["verification_specs_json"]
             ),
             attempt_count=int(
                 row["attempt_count"]

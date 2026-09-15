@@ -29,6 +29,11 @@ class SandboxLimits:
     max_workspace_bytes: int = 64_000_000
     max_patch_bytes: int = 4_000_000
 
+    # Initial/checkpoint snapshots
+    max_snapshot_files: int = 20_000
+    max_snapshot_bytes: int = 256_000_000
+    max_snapshot_file_bytes: int = 8_000_000
+
     # Reads / observe loop
     max_read_bytes: int = 200_000
     max_files_read: int = 40
@@ -38,6 +43,7 @@ class SandboxLimits:
     # Commands
     max_output_bytes: int = 64_000
     command_timeout: int = 180
+    max_command_workspace_bytes: int = 64_000_000
 
 
 DEFAULT_LIMITS = SandboxLimits()

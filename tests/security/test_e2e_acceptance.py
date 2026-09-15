@@ -98,6 +98,25 @@ def _plan_responses() -> list[str]:
                         "sandbox_agent_test/calculator.py"
                     ],
                     "external_dependencies": [],
+                    "change_paths": [
+                        "sandbox_agent_test/__init__.py",
+                        "sandbox_agent_test/calculator.py",
+                        "sandbox_agent_test/test_calculator.py",
+                    ],
+                    "verification_specs": [
+                        {
+                            "kind": "FILE_EXISTS",
+                            "target": "sandbox_agent_test/__init__.py",
+                        },
+                        {
+                            "kind": "PY_COMPILE",
+                            "target": "sandbox_agent_test/calculator.py",
+                        },
+                        {
+                            "kind": "PYTEST",
+                            "target": "sandbox_agent_test/test_calculator.py",
+                        },
+                    ],
                     "success_criteria": [
                         "sandbox_agent_test/"
                         "test_calculator.py tests pass"
@@ -115,33 +134,44 @@ def _plan_responses() -> list[str]:
     return [goal, tasks, dependencies]
 
 
-def _coder_envelope() -> str:
-    return json.dumps(
-        {
-            "files": [
-                {
-                    "path": (
-                        "sandbox_agent_test/__init__.py"
-                    ),
-                    "content": "",
-                },
-                {
-                    "path": (
-                        "sandbox_agent_test/calculator.py"
-                    ),
-                    "content": CALCULATOR,
-                },
-                {
-                    "path": (
-                        "sandbox_agent_test/"
-                        "test_calculator.py"
-                    ),
-                    "content": CALCULATOR_TEST,
-                },
-            ],
-            "commands": ["python -m pytest -q"],
-        }
-    )
+def _scoped_coder_envelopes(
+    calculator: str = CALCULATOR,
+) -> list[str]:
+    return [
+        json.dumps(
+            {
+                "files": [
+                    {
+                        "path": "sandbox_agent_test/__init__.py",
+                        "content": "",
+                    }
+                ],
+                "commands": [],
+            }
+        ),
+        json.dumps(
+            {
+                "files": [
+                    {
+                        "path": "sandbox_agent_test/calculator.py",
+                        "content": calculator,
+                    }
+                ],
+                "commands": [],
+            }
+        ),
+        json.dumps(
+            {
+                "files": [
+                    {
+                        "path": "sandbox_agent_test/test_calculator.py",
+                        "content": CALCULATOR_TEST,
+                    }
+                ],
+                "commands": [],
+            }
+        ),
+    ]
 
 
 @pytest.mark.skipif(
@@ -157,8 +187,7 @@ def test_e2e_calculator_creates_sandbox_only(tmp_path):
     )
 
     llm = FakeLLM(
-        _plan_responses(),
-        default=_coder_envelope(),
+        _plan_responses() + _scoped_coder_envelopes(),
     )
 
     runtime = AgentRuntime(
@@ -213,42 +242,13 @@ def test_e2e_calculator_creates_sandbox_only(tmp_path):
 
 
 BROKEN_CALCULATOR = (
-    "def add(a, b):\n"
+    "def add(a, b)\n"
     "    return a - b\n"
     "\n"
     "\n"
     "def subtract(a, b):\n"
     "    return a - b\n"
 )
-
-
-def _broken_envelope() -> str:
-    return json.dumps(
-        {
-            "files": [
-                {
-                    "path": (
-                        "sandbox_agent_test/__init__.py"
-                    ),
-                    "content": "",
-                },
-                {
-                    "path": (
-                        "sandbox_agent_test/calculator.py"
-                    ),
-                    "content": BROKEN_CALCULATOR,
-                },
-                {
-                    "path": (
-                        "sandbox_agent_test/"
-                        "test_calculator.py"
-                    ),
-                    "content": CALCULATOR_TEST,
-                },
-            ],
-            "commands": ["python -m pytest -q"],
-        }
-    )
 
 
 @pytest.mark.skipif(
@@ -267,7 +267,12 @@ def test_e2e_repair_changes_approach_and_passes(
 
     llm = FakeLLM(
         _plan_responses()
-        + [_broken_envelope(), _coder_envelope()]
+        + [
+            _scoped_coder_envelopes()[0],
+            _scoped_coder_envelopes(BROKEN_CALCULATOR)[1],
+            _scoped_coder_envelopes()[1],
+            _scoped_coder_envelopes()[2],
+        ]
     )
 
     runtime = AgentRuntime(
@@ -291,7 +296,12 @@ def test_e2e_repair_changes_approach_and_passes(
         state.plan_id
     )[0]
 
-    step = runtime.step_store.get_steps(task.id)[0]
+    step = next(
+        candidate
+        for candidate in runtime.step_store.get_steps(task.id)
+        if candidate.change_paths
+        == ["sandbox_agent_test/calculator.py"]
+    )
 
     attempts = runtime.attempt_store.get_step_attempts(
         step.id

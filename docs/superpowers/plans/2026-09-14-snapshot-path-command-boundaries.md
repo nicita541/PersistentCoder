@@ -86,19 +86,19 @@ installation; no silent compatibility path that bypasses the new boundary.
 - `SnapshotManifest.build(source_root, limits, policy) -> SnapshotManifest`
 - `SnapshotManifest.materialize(destination)`
 
-- [ ] Write failing tests for normal files, single-file size, total bytes, file
+- [x] Write failing tests for normal files, single-file size, total bytes, file
   count, secret exclusion, symlink file/dir refusal, and Windows reparse-point
   refusal. Assert the scan completes and validates all entries before copying.
-- [ ] Add `max_snapshot_files`, `max_snapshot_bytes`, and
+- [x] Add `max_snapshot_files`, `max_snapshot_bytes`, and
   `max_snapshot_file_bytes` framework limits.
-- [ ] Implement an `os.scandir(..., follow_symlinks=False)` walk that rejects
+- [x] Implement an `os.scandir(..., follow_symlinks=False)` walk that rejects
   every symlink/reparse entry before reading targets, hashes only regular files,
   and materializes only after the complete manifest passes.
-- [ ] Replace `_copy_tree` in create/reset/checkpoint paths. Baseline and
+- [x] Replace `_copy_tree` in create/reset/checkpoint paths. Baseline and
   workspace must be materialized independently from the exact same manifest;
   expose initial manifest digest in session metadata.
-- [ ] Run snapshot, reset, isolation, transaction, and sandbox-limit suites.
-- [ ] Commit: `feat: vet sandbox snapshots before copying`.
+- [x] Run snapshot, reset, isolation, transaction, and sandbox-limit suites.
+- [x] Commit: `feat: vet sandbox snapshots before copying`.
 
 ### Task 4: Make Docker command workspaces ephemeral
 
@@ -116,17 +116,17 @@ installation; no silent compatibility path that bypasses the new boundary.
 - `CancellationToken.cancel()` / `.cancelled`; runner returns code 130 when
   cancelled and terminates an active container/process without host fallback.
 
-- [ ] Update argv/hardening tests first; add integration evidence that a command
+- [x] Update argv/hardening tests first; add integration evidence that a command
   can create a file for its own test process but cannot change source or the
   persistent sandbox.
-- [ ] Add tmpfs-size and cancellation limits/hooks while preserving network
+- [x] Add tmpfs-size and cancellation limits/hooks while preserving network
   none, cap-drop ALL, no-new-privileges, PIDs, memory, CPU, non-root user,
   timeout/output bounds, and docker-socket denial.
-- [ ] Use a fixed framework shell wrapper (`cp -a /input/. /workspace/ && ...`)
+- [x] Use a fixed framework shell wrapper (`cp -a /input/. /workspace/ && ...`)
   inside the container; the model controls only the already validated command.
-- [ ] Run unit security tests and Docker integration tests when the daemon/image
+- [x] Run unit security tests and Docker integration tests when the daemon/image
   is available; otherwise record explicit skips, never a host fallback.
-- [ ] Commit: `feat: isolate command writes in ephemeral tmpfs`.
+- [x] Commit: `feat: isolate command writes in ephemeral tmpfs`.
 
 ### Task 5: Add exact `AllowedChangeSet`
 
@@ -143,16 +143,16 @@ installation; no silent compatibility path that bypasses the new boundary.
 - `assert_can_read`, `assert_can_write`, and `assert_can_delete` return the
   canonical `ProjectPath` or raise `ChangeScopeError`.
 
-- [ ] Write tests for exact ownership, no same-directory exception, Step subset,
+- [x] Write tests for exact ownership, no same-directory exception, Step subset,
   Windows comparison keys, duplicate normalized producers, and cross-task
   ownership conflicts.
-- [ ] Implement the value object and persist canonical declared Task/Step paths
+- [x] Implement the value object and persist canonical declared Task/Step paths
   in backward-compatible nullable JSON columns. Legacy missing scope is empty,
   not unrestricted.
-- [ ] Reject conflicting producers before plan persistence and reject a Step
+- [x] Reject conflicting producers before plan persistence and reject a Step
   scope outside its Task.
-- [ ] Run task model/store/step/dependency/versioning regressions.
-- [ ] Commit: `feat: enforce exact task change scopes`.
+- [x] Run task model/store/step/dependency/versioning regressions.
+- [x] Commit: `feat: enforce exact task change scopes`.
 
 ### Task 6: Enforce current-attempt reads and exact delete
 

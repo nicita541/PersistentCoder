@@ -7,6 +7,7 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+from packaging.requirements import InvalidRequirement, Requirement
 
 from app.sandbox.paths import (
     SANDBOX_IMAGE,
@@ -93,10 +94,44 @@ def _sanitize_requirement(
     ):
         return None
 
-    if not _REQUIREMENT_RE.match(line):
+    try:
+        requirement = Requirement(line)
+    except InvalidRequirement:
+        return None
+
+    if requirement.url is not None:
         return None
 
     return line
+
+
+def _poetry_requirement(name: str, value: object) -> str | None:
+    if isinstance(value, dict):
+        value = value.get("version", "*")
+    if not isinstance(value, str):
+        return None
+    constraint = value.strip()
+    if not constraint or constraint == "*":
+        return name
+    if constraint.startswith("^"):
+        version = constraint[1:]
+        parts = version.split(".")
+        try:
+            major = int(parts[0])
+        except ValueError:
+            return None
+        if major > 0:
+            upper = f"{major + 1}.0"
+        elif len(parts) > 1:
+            upper = f"0.{int(parts[1]) + 1}"
+        else:
+            return None
+        return f"{name}>={version},<{upper}"
+    if constraint.startswith("~") and not constraint.startswith("~="):
+        return f"{name}~={constraint[1:]}"
+    if constraint[0].isdigit():
+        return f"{name}=={constraint}"
+    return f"{name}{constraint}"
 
 
 @dataclass(frozen=True)
@@ -204,9 +239,11 @@ def _read_pyproject(
     )
 
     if isinstance(poetry, dict):
-        for name in poetry:
+        for name, constraint in poetry.items():
             if str(name).casefold() != "python":
-                values.append(str(name))
+                requirement = _poetry_requirement(str(name), constraint)
+                if requirement:
+                    values.append(requirement)
 
     return values
 
@@ -385,9 +422,9 @@ class DependencyResolver:
             f"FROM {self.base_image}\n"
             "USER root\n"
             "COPY requirements.txt /tmp/requirements.txt\n"
-            "RUN python -m pip install --no-cache-dir\n"
-            "        --disable-pip-version-check\n"
-            "        -r /tmp/requirements.txt\n"
+            "RUN python -m pip install --no-cache-dir \\\n"
+            "    --disable-pip-version-check \\\n"
+            "    -r /tmp/requirements.txt \\\n"
             "    && rm -f /tmp/requirements.txt\n"
             "USER 1000:1000\n"
             "WORKDIR /workspace\n"

@@ -528,3 +528,27 @@ def test_planner_builds_real_steps_per_task(tmp_path):
     ]
 
 
+def test_task_decomposer_receives_bounded_real_repo_context(tmp_path):
+    from types import SimpleNamespace
+
+    stores = make_stores(tmp_path)
+    llm = FakeLLM(
+        [goal_response(), tasks_response(), dependencies_response()]
+    )
+    planner = PlannerAgent(
+        llm,
+        stores.plan_store,
+        step_store=stores.step_store,
+        repo_selector=SimpleNamespace(
+            select=lambda **_kwargs: SimpleNamespace(
+                text="REPOSITORY FILE: src/existing.py\nVALUE = 1"
+            )
+        ),
+    )
+
+    planner.plan("Modify src/existing.py")
+
+    decomposer_prompt = "\n".join(
+        str(message.get("content", "")) for message in llm.calls[1]
+    )
+    assert "REPOSITORY FILE: src/existing.py" in decomposer_prompt

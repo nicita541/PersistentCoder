@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+from app.agent.events import AgentEvent
 from app.agent.runtime import AgentRuntime
 from app.sandbox.paths import PROJECT_ROOT
 from app.sandbox.runner import SandboxCommandRunner
@@ -98,6 +99,41 @@ def test_runtime_run_completes_plan(tmp_path):
     assert state.phase.value == "DONE"
     assert state.completion == "DONE"
     assert (tmp_path / "artifact.txt").exists()
+    assert runtime.last_run_id is not None
+    run = runtime.runtime_store.get_run(runtime.last_run_id)
+    assert run is not None
+    assert run["phase"] == "DONE"
+    assert run["task_id"] is None
+    assert run["step_id"] is None
+    assert run["attempt_id"] is None
+    assert run["checkpoint_id"] is None
+    assert runtime.plan_store.get_plan(state.plan_id).status.value == "DONE"
+
+
+def test_partial_event_preserves_existing_run_cursor(tmp_path):
+    runtime = _runtime(tmp_path, FakeLLM())
+    run_id = runtime.runtime_store.start_run("build")
+    runtime.current_run_id = run_id
+    runtime.runtime_store.update_run(
+        run_id,
+        plan_id=11,
+        task_id=22,
+        step_id=33,
+        attempt_id=44,
+        checkpoint_id="attempt-4",
+    )
+
+    runtime._persist_event(
+        AgentEvent("file_read", {"path": "sample.py"})
+    )
+
+    run = runtime.runtime_store.get_run(run_id)
+    assert run is not None
+    assert run["plan_id"] == 11
+    assert run["task_id"] == 22
+    assert run["step_id"] == 33
+    assert run["attempt_id"] == 44
+    assert run["checkpoint_id"] == "attempt-4"
 
 
 def test_production_workspace_has_no_host_command_runner(

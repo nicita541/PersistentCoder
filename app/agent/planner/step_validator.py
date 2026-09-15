@@ -7,6 +7,7 @@ from app.agent.verifier.criterion import (
     classify_criterion,
 )
 from app.tasks.models import StepDraft, TaskDraft
+from app.tasks.change_scope import AllowedChangeSet, ChangeScopeError
 
 
 _FILE_TOKEN_RE = re.compile(
@@ -113,6 +114,20 @@ class StepValidator:
                 )
 
             titles[title] = index
+
+            if task.change_paths:
+                if len(step.change_paths) != 1:
+                    errors.append(
+                        f"task '{key}' step '{step.title}' must own exactly one file"
+                    )
+                try:
+                    AllowedChangeSet(task.change_paths, step.change_paths)
+                except ChangeScopeError as error:
+                    errors.append(str(error))
+                if not step.verification_specs:
+                    errors.append(
+                        f"task '{key}' step '{step.title}' has no verification_specs"
+                    )
 
             if not list(step.success_criteria):
                 errors.append(

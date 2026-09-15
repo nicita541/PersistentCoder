@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.agent.repair.strategies import GIVE_UP
+from app.agent.repair.strategies import GIVE_UP, REPLAN_TASK
 from app.agent.state import (
     AgentPhase,
     AgentState,
@@ -9,9 +9,11 @@ from app.agent.state import (
 )
 from app.tasks.models import (
     AttemptStatus,
+    StepDraft,
     StepStatus,
     TaskStatus,
 )
+from app.tasks.change_scope import AllowedChangeSet
 
 
 class AgentControllerError(RuntimeError):
@@ -47,6 +49,7 @@ class AgentController:
         attempt_store=None,
         max_step_attempts: int = 2,
         max_task_attempts: int = 3,
+        dependency_plan=None,
     ) -> None:
         self.planner = planner
         self.coder = coder
@@ -59,6 +62,7 @@ class AgentController:
         self.events = events
         self.sandbox_workspace = sandbox_workspace
         self.attempt_store = attempt_store
+        self.dependency_plan = dependency_plan
         self._attempt_seq = 0
         self.max_step_attempts = (
             max_step_attempts
@@ -205,6 +209,24 @@ class AgentController:
     # EXECUTE
     # ======================================
 
+    @staticmethod
+    def _repair_feedback(repair: RepairState) -> str:
+        context = repair.context or {}
+        lines = [
+            "STRUCTURED REPAIR CONTEXT",
+            f"scope: {context.get('scope', repair.scope or '')}",
+            f"failure_class: {context.get('failure_class', '')}",
+            f"root_cause: {context.get('root_cause', repair.reason or '')}",
+            f"previous_approach: {context.get('previous_approach', repair.approach or '')}",
+            "required_different_approach: "
+            + str(context.get("required_different_approach", repair.strategy or "")),
+        ]
+        files = context.get("files_to_inspect", [])
+        checks = context.get("verification_plan", [])
+        lines.append("files_to_inspect: " + ", ".join(str(item) for item in files))
+        lines.append("verification_plan: " + "; ".join(str(item) for item in checks))
+        return "\n".join(lines)[:4000]
+
     def execute(
         self,
         state: AgentState,
@@ -212,10 +234,39 @@ class AgentController:
         task = self._require_task(state)
         step = self._active_step(state)
 
+        if (
+            task.external_dependencies
+            and self.dependency_plan is not None
+            and self.dependency_plan.status == "BLOCKED"
+        ):
+            reason = "BLOCKED_DEPENDENCY: " + str(self.dependency_plan.reason)
+            self.plan_store.update_task_status(task.id, TaskStatus.BLOCKED)
+            if step is not None:
+                self.step_store.update_step_status(step.id, StepStatus.BLOCKED)
+            state.execution = ExecutionResult(
+                ok=False,
+                summary="dependency environment unavailable",
+                failure_reason=reason,
+                evidence=["blocked_dependency"],
+            )
+            state.repair = RepairState(
+                required=False,
+                action="BLOCKED_DEPENDENCY",
+                scope="TASK",
+                reason=reason,
+            )
+            state.phase = AgentPhase.FAILED
+            state.completion = "FAILED"
+            self._emit(
+                "dependency_blocked",
+                {"task_id": task.id, "reason": reason[:400]},
+            )
+            return state
+
         self._begin_attempt(state, task, step)
 
         feedback = (
-            state.repair.reason
+            self._repair_feedback(state.repair)
             if state.repair.required
             else None
         )
@@ -226,6 +277,10 @@ class AgentController:
                 step=step,
                 plan_id=state.plan_id,
                 feedback=feedback,
+                allowed_changes=AllowedChangeSet(
+                    task.change_paths,
+                    step.change_paths if step is not None else None,
+                ),
             )
 
         except Exception as error:
@@ -396,25 +451,27 @@ class AgentController:
         step_attempts = step_cache
 
         if self.attempt_store is not None:
-            stored_task = len(
-                self.attempt_store.get_task_attempts(
-                    task.id
-                )
+            stored_task = sum(
+                attempt.status in {AttemptStatus.FAILED, AttemptStatus.BLOCKED}
+                for attempt in self.attempt_store.get_task_attempts(task.id)
             )
 
             if self.step_store is not None:
                 for sibling in (
                     self.step_store.get_steps(task.id)
                 ):
-                    stored_task += len(
-                        self.attempt_store
-                        .get_step_attempts(sibling.id)
+                    stored_task += sum(
+                        attempt.status
+                        in {AttemptStatus.FAILED, AttemptStatus.BLOCKED}
+                        for attempt in self.attempt_store.get_step_attempts(
+                            sibling.id
+                        )
                     )
 
             stored_step = (
-                len(
-                    self.attempt_store
-                    .get_step_attempts(step.id)
+                sum(
+                    attempt.status in {AttemptStatus.FAILED, AttemptStatus.BLOCKED}
+                    for attempt in self.attempt_store.get_step_attempts(step.id)
                 )
                 if step is not None
                 else 0
@@ -444,9 +501,22 @@ class AgentController:
             strategy=outcome.strategy,
             reason=outcome.reason,
             approach=(
-                outcome.approach.new_approach
+                outcome.approach.fingerprint
                 if outcome.approach is not None
                 else outcome.strategy
+            ),
+            context=(
+                {
+                    "scope": outcome.approach.scope,
+                    "failure_class": outcome.approach.failure_class,
+                    "root_cause": outcome.approach.root_cause,
+                    "previous_approach": outcome.approach.fingerprint,
+                    "required_different_approach": outcome.approach.new_approach,
+                    "files_to_inspect": outcome.approach.files_to_inspect,
+                    "verification_plan": outcome.approach.verification_plan,
+                }
+                if outcome.approach is not None
+                else {}
             ),
         )
 
@@ -468,6 +538,61 @@ class AgentController:
 
             self._settle(state)
             return state
+
+        if outcome.action == REPLAN_TASK and self.step_store is not None:
+            accepted = {
+                path.casefold()
+                for existing in self.step_store.get_steps(task.id)
+                if existing.status is StepStatus.DONE
+                for path in existing.change_paths
+            }
+            replacements = []
+            for path in task.change_paths:
+                if path.casefold() in accepted:
+                    continue
+                specs = [
+                    spec
+                    for spec in task.verification_specs
+                    if spec.target == path
+                ]
+                replacements.append(
+                    StepDraft(
+                        title=f"Repair {path}",
+                        description=(
+                            f"Use a materially different approach for {path}: "
+                            f"{state.repair.context.get('required_different_approach', '')}"
+                        ),
+                        requires=list(task.requires),
+                        produces=[path],
+                        success_criteria=list(task.success_criteria),
+                        change_paths=[path],
+                        verification_specs=specs,
+                    )
+                )
+            if replacements:
+                replacement_ids = (
+                    self.step_store.supersede_unfinished_and_create(
+                        task.id, replacements
+                    )
+                )
+                state.active_step_id = replacement_ids[0]
+                self.step_store.update_step_status(
+                    state.active_step_id, StepStatus.IN_PROGRESS
+                )
+                self.step_store.set_current_step(
+                    task_id=task.id,
+                    step_id=state.active_step_id,
+                )
+                state.phase = AgentPhase.EXECUTING
+                self._emit(
+                    "task_replanned",
+                    {
+                        "task_id": task.id,
+                        "replacement_steps": replacement_ids,
+                        "reason": outcome.reason[:400],
+                    },
+                )
+                return state
 
         if step is not None:
             current = self.step_store.get_step(
@@ -731,10 +856,16 @@ class AgentController:
         if self.step_store is None:
             return None
 
+        executable = {
+            StepStatus.PENDING,
+            StepStatus.READY,
+            StepStatus.IN_PROGRESS,
+        }
+
         for step in self.step_store.get_steps(
             task_id
         ):
-            if step.status is not StepStatus.DONE:
+            if step.status in executable:
                 return step
 
         return None
@@ -746,10 +877,16 @@ class AgentController:
         if self.step_store is None:
             return None
 
+        executable = {
+            StepStatus.PENDING,
+            StepStatus.READY,
+            StepStatus.IN_PROGRESS,
+        }
+
         for step in self.step_store.get_steps(
             task_id
         ):
-            if step.status is StepStatus.DONE:
+            if step.status not in executable:
                 continue
 
             if (

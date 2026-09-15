@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from app.sandbox.project_path import ProjectPath, ProjectPathError
 
 from app.agent.state import CriterionResult
 
@@ -169,11 +170,10 @@ class CriterionEvaluator:
         if not match:
             return None
 
-        return (
-            match.group(0)
-            .replace("\\", "/")
-            .lstrip("./")
-        )
+        try:
+            return ProjectPath.parse(match.group(0)).value
+        except ProjectPathError:
+            return None
 
     @staticmethod
     def _has(
@@ -388,9 +388,10 @@ class CriterionEvaluator:
         """
 
         for raw in _FILE_TOKEN_RE.findall(text):
-            token = (
-                raw.replace("\\", "/").lstrip("./")
-            )
+            try:
+                token = ProjectPath.parse(raw).value
+            except ProjectPathError:
+                continue
 
             if not token.endswith(".py"):
                 continue
@@ -412,7 +413,10 @@ class CriterionEvaluator:
         """
 
         for target in self.test_targets:
-            token = str(target).replace("\\", "/").lstrip("./")
+            try:
+                token = ProjectPath.parse(target).value
+            except ProjectPathError:
+                continue
 
             if not is_test_file(token):
                 continue

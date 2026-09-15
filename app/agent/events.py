@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable
+from app.agent.event_sanitizer import sanitize_event_payload
 
 
 @dataclass
@@ -29,7 +30,10 @@ class EventBus:
     (UI, логгеры, тесты) подписываются.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_events: int = 1000) -> None:
+        if max_events < 1:
+            raise ValueError("max_events must be positive")
+        self.max_events = max_events
         self._handlers: list[EventHandler] = []
         self.events: list[AgentEvent] = []
 
@@ -46,12 +50,17 @@ class EventBus:
     ) -> AgentEvent:
         event = AgentEvent(
             name=name,
-            payload=dict(payload or {}),
+            payload=dict(sanitize_event_payload(payload or {})),
         )
 
         self.events.append(event)
+        if len(self.events) > self.max_events:
+            del self.events[: len(self.events) - self.max_events]
 
         for handler in self._handlers:
-            handler(event)
+            try:
+                handler(event)
+            except Exception:
+                continue
 
         return event

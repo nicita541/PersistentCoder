@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import stat
 from pathlib import Path
 
 from app.sandbox.limits import (
@@ -158,19 +159,50 @@ class FileTools:
         self,
         path: str | Path,
     ) -> bool:
-        target = self._resolve(path)
-
-        if not target.exists():
-            return False
-
-        if target.is_dir():
-            raise FileToolsError(
-                f"refusing to delete directory: {path}"
-            )
+        target = self.validate_delete(path)
 
         target.unlink()
 
         return True
+
+    def validate_delete(
+        self,
+        path: str | Path,
+    ) -> Path:
+        """Return one safe, existing regular-file deletion target."""
+
+        try:
+            project_path = ProjectPath.parse(path)
+        except ProjectPathError as error:
+            raise FileToolsError(str(error)) from error
+
+        # Inspect the lexical directory entry before resolve(): resolving
+        # first would hide a symlink/reparse point behind its target.
+        lexical = self.root.joinpath(*project_path.value.split("/"))
+
+        try:
+            metadata = lexical.lstat()
+        except FileNotFoundError as error:
+            raise FileToolsError(
+                f"file does not exist: {project_path.value}"
+            ) from error
+
+        attributes = int(getattr(metadata, "st_file_attributes", 0))
+        if stat.S_ISLNK(metadata.st_mode) or attributes & 0x400:
+            raise FileToolsError(
+                "refusing to delete link or reparse point: "
+                f"{project_path.value}"
+            )
+
+        target = self._resolve(project_path.value)
+
+        if not target.is_file():
+            raise FileToolsError(
+                "refusing to delete anything except one regular file: "
+                f"{project_path.value}"
+            )
+
+        return target
 
     def list_files(
         self,

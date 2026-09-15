@@ -62,6 +62,7 @@ class PlannerAgent:
         contract_builder=None,
         dependency_builder=None,
         step_validator=None,
+        repo_selector=None,
     ) -> None:
         if max_repair_attempts < 0:
             raise ValueError(
@@ -82,6 +83,7 @@ class PlannerAgent:
         self.use_llm_dependencies = (
             use_llm_dependencies
         )
+        self.repo_selector = repo_selector
 
         self.goal_analyzer = (
             goal_analyzer
@@ -145,6 +147,12 @@ class PlannerAgent:
             request
         )
 
+        repo_context = ""
+        if self.repo_selector is not None:
+            repo_context = self.repo_selector.select(
+                extra=request
+            ).text
+
         # --------------------------------------
         # PLAN-LEVEL BOUNDED REPAIR
         #
@@ -177,6 +185,7 @@ class PlannerAgent:
                 previous_components=(
                     previous_components
                 ),
+                repo_context=repo_context,
             )
 
             try:
@@ -365,6 +374,8 @@ class PlannerAgent:
                         requires=list(task.requires),
                         produces=list(task.produces),
                         success_criteria=criteria,
+                        change_paths=list(task.change_paths),
+                        verification_specs=list(task.verification_specs),
                     )
                 ]
 

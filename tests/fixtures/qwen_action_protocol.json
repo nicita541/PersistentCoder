@@ -1,0 +1,20 @@
+[
+  {
+    "name": "known_alias",
+    "raw": "{\"action\":\"create_update_files\",\"files\":[{\"path\":\"src/app.py\",\"content\":\"VALUE = 1\\n\"}]}",
+    "expected_action": "edit",
+    "expected_path": "src/app.py"
+  },
+  {
+    "name": "fenced_alias",
+    "raw": "```json\n{\"action\":\"write_files\",\"files\":{\"src/app.py\":\"VALUE = 2\\n\"}}\n```",
+    "expected_action": "edit",
+    "expected_path": "src/app.py"
+  },
+  {
+    "name": "triple_quoted_content",
+    "raw": "{\"action\":\"create_or_update_files\",\"files\":[{\"path\":\"src/app.py\",\"content\":\"\"\"def value():\n    return 3\n\"\"\"}]}",
+    "expected_action": "edit",
+    "expected_path": "src/app.py"
+  }
+]

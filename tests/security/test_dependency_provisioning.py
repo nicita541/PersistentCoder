@@ -308,3 +308,37 @@ def test_dependency_image_keeps_runtime_hardening(tmp_path):
     assert str(project) not in joined
     assert "docker.sock" not in joined
     assert "-e " not in joined
+
+
+def test_poetry_constraints_preserve_versions(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(
+        "[tool.poetry.dependencies]\n"
+        'python = "^3.12"\n'
+        'requests = "^2.31"\n'
+        'click = "8.1.7"\n',
+        encoding="utf-8",
+    )
+
+    spec = DependencyResolver(
+        cache_root=tmp_path / "deps",
+        image_available=lambda _image: False,
+    ).detect(project)
+
+    assert spec is not None
+    assert "requests>=2.31,<3.0" in spec.requirements
+    assert "click==8.1.7" in spec.requirements
+
+
+def test_generated_dependency_dockerfile_has_valid_run_continuations(tmp_path):
+    resolver = DependencyResolver(cache_root=tmp_path / "deps")
+    project = _project(tmp_path / "project", "pytest==8.0.0\n")
+    spec = resolver.detect(project)
+    assert spec is not None
+
+    dockerfile = resolver.dockerfile_text(spec)
+
+    assert "RUN python -m pip install --no-cache-dir \\\n" in dockerfile
+    assert "    --disable-pip-version-check \\\n" in dockerfile
+    assert "    -r /tmp/requirements.txt \\\n" in dockerfile

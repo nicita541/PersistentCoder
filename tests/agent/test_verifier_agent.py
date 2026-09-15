@@ -152,8 +152,11 @@ def test_rejects_fake_success_without_evidence(
 
     assert (
         stores.step_store.get_step(step_id).status
-        is StepStatus.IN_PROGRESS
+        is StepStatus.BLOCKED
     )
+
+    persisted = stores.verification_store.get_step_verifications(step_id)[-1]
+    assert persisted.status.value == "BLOCKED"
 
 
 def test_rejects_failed_command(tmp_path):

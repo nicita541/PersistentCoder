@@ -31,7 +31,7 @@ from app.policy.injection import (
     enforce_system_policy,
 )
 from app.tasks.attempt_store import AttemptStore
-from app.tasks.models import AttemptStatus
+from app.tasks.models import AttemptStatus, PlanStatus
 from app.tasks.replan_store import ReplanStore
 from app.tasks.replanner import Replanner
 from app.tasks.scheduler import TaskScheduler
@@ -372,6 +372,7 @@ class AgentRuntime:
             use_llm_dependencies=(
                 use_llm_dependencies
             ),
+            repo_selector=self.repo_selector,
         )
 
         self.workspace = Workspace(
@@ -480,6 +481,7 @@ class AgentRuntime:
             attempt_store=self.attempt_store,
             max_step_attempts=max_step_attempts,
             max_task_attempts=max_task_attempts,
+            dependency_plan=self.dependency_plan,
         )
 
         # Last finished AgentState (CLI: /status, /patch, /apply).
@@ -825,6 +827,24 @@ class AgentRuntime:
             RUN_DONE
             if state.phase is AgentPhase.DONE
             else RUN_FAILED
+        )
+
+        if state.plan_id is not None:
+            self.plan_store.set_plan_status(
+                state.plan_id,
+                PlanStatus.DONE
+                if state.phase is AgentPhase.DONE
+                else PlanStatus.FAILED,
+            )
+
+        self.runtime_store.update_run(
+            run_id,
+            phase=state.phase.value,
+            plan_id=state.plan_id,
+            task_id=None,
+            step_id=None,
+            attempt_id=None,
+            checkpoint_id=None,
         )
 
         self.runtime_store.finish_run(run_id, status)
@@ -1312,26 +1332,28 @@ class AgentRuntime:
                 int(time.time() * 1000),
             )
 
+            cursor: dict[str, object] = {}
+            for payload_key, cursor_key in (
+                ("plan_id", "plan_id"),
+                ("task_id", "task_id"),
+                ("step_id", "step_id"),
+                ("attempt_id", "attempt_id"),
+                ("checkpoint", "checkpoint_id"),
+            ):
+                if payload_key in payload:
+                    cursor[cursor_key] = payload[payload_key]
+
+            if event.name in (
+                "plan",
+                "execute",
+                "verify",
+                "repair",
+            ):
+                cursor["phase"] = event.name.upper()
+
             self.runtime_store.update_run(
                 run_id,
-                plan_id=payload.get("plan_id"),
-                task_id=payload.get("task_id"),
-                step_id=payload.get("step_id"),
-                attempt_id=payload.get("attempt_id"),
-                checkpoint_id=payload.get(
-                    "checkpoint"
-                ),
-                phase=(
-                    event.name.upper()
-                    if event.name
-                    in (
-                        "plan",
-                        "execute",
-                        "verify",
-                        "repair",
-                    )
-                    else None
-                ),
+                **cursor,
             )
 
             self.runtime_store.log_event(

@@ -110,3 +110,62 @@ def test_controller_uses_injected_dependencies(
         runtime.controller.verifier
         is runtime.verification_agent
     )
+
+
+def test_blocked_dependency_gates_task_without_calling_coder(tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    task_payload = json.loads(tasks_response())
+    task_payload["tasks"][0]["external_dependencies"] = ["requests"]
+    llm = FakeLLM(
+        [goal_response(), json.dumps(task_payload), dependencies_response()],
+        default=coder_envelope(),
+    )
+    runtime = _runtime(tmp_path, llm)
+    state = runtime.controller.observe("Build")
+    runtime.controller.plan(state)
+    runtime.controller.advance(state)
+    calls_before = len(llm.calls)
+    runtime.controller.dependency_plan = SimpleNamespace(
+        status="BLOCKED", reason="build disabled"
+    )
+
+    runtime.controller.execute(state)
+
+    task = runtime.plan_store.get_task(state.active_task_id)
+    assert state.phase.value == "FAILED"
+    assert task.status.value == "BLOCKED"
+    assert "BLOCKED_DEPENDENCY" in state.execution.failure_reason
+    assert len(llm.calls) == calls_before
+
+
+def test_failed_attempt_passes_structured_different_approach_to_next_prompt(
+    tmp_path,
+):
+    llm = FakeLLM(
+        [
+            goal_response(),
+            tasks_response(),
+            dependencies_response(),
+            "invalid",
+            "invalid",
+            "invalid",
+        ],
+        default=coder_envelope(),
+    )
+    runtime = _runtime(tmp_path, llm)
+
+    state = runtime.run("Build")
+
+    assert state.phase.value == "DONE"
+    prompts = [
+        "\n".join(str(message.get("content", "")) for message in call)
+        for call in llm.calls
+    ]
+    repair_prompts = [
+        prompt for prompt in prompts if "STRUCTURED REPAIR CONTEXT" in prompt
+    ]
+    assert repair_prompts
+    assert "required_different_approach:" in repair_prompts[0]
+    assert "root_cause:" in repair_prompts[0]

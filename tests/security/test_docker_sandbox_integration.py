@@ -99,13 +99,18 @@ def test_command_arguments_are_hardened(tmp_path):
         for argument in args
     )
 
-    mount = args[args.index("-v") + 1]
+    mount = args[args.index("--mount") + 1]
 
     assert mount == (
-        f"{sandbox_root}:/workspace:rw"
+        f"type=bind,source={sandbox_root},target=/input,readonly"
     )
+    assert "--tmpfs" in args
+    tmpfs = args[args.index("--tmpfs") + 1]
+    assert tmpfs.startswith("/workspace:rw,size=")
     assert str(sandbox_root) != str(PROJECT_ROOT)
-    assert mount != f"{PROJECT_ROOT}:/workspace:rw"
+    assert mount != (
+        f"type=bind,source={PROJECT_ROOT},target=/input,readonly"
+    )
 
 
     flags = runner.hardening_flags()
@@ -113,6 +118,8 @@ def test_command_arguments_are_hardened(tmp_path):
     assert flags["privileged"] is False
     assert flags["mount_docker_socket"] is False
     assert flags["mount_project_root"] is False
+    assert flags["mount"].endswith("/input:ro")
+    assert flags["workspace"] == "tmpfs"
 
 
 def test_refuses_to_mount_host_project_root():
@@ -178,3 +185,22 @@ def test_docker_sandbox_runs_pytest_and_keeps_host_unchanged(
     after = _git_status()
 
     assert before == after
+
+
+@pytest.mark.skipif(
+    not DOCKER_AVAILABLE,
+    reason="Docker daemon is not running",
+)
+def test_command_writes_are_ephemeral(runner):
+    persistent = runner.sandbox_root / "value.txt"
+    persistent.write_text("persistent", encoding="utf-8")
+
+    result = runner.run(
+        "printf changed > value.txt; "
+        "printf temporary > generated.txt; "
+        "test -f generated.txt"
+    )
+
+    assert result.ok, result.stderr
+    assert persistent.read_text(encoding="utf-8") == "persistent"
+    assert not (runner.sandbox_root / "generated.txt").exists()

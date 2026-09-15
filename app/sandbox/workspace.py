@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import difflib
-import hashlib
 import json
 import re
 import shutil
@@ -22,32 +21,11 @@ from app.sandbox.limits import (
     LimitExceeded,
 )
 from app.project_identity import ProjectIdentity
-from app.sandbox.gitignore import GitIgnoreMatcher
-from app.sandbox.project_path import ProjectPath
-from app.sandbox.protected_paths import ProtectedPathPolicy
+from app.sandbox.snapshot import SnapshotManifest
 
 if TYPE_CHECKING:
     from app.storage import ProjectStorage
 
-
-IGNORED_DIRECTORIES = frozenset(
-    {
-        ".git",
-        ".venv",
-        "venv",
-        "models",
-        "data",
-        ".sandbox",
-        "__pycache__",
-        ".pytest_cache",
-        ".mypy_cache",
-        "node_modules",
-        ".idea",
-        ".vscode",
-    }
-)
-
-IGNORED_SUFFIXES = (".pyc", ".pyo")
 
 # Patch safety: never emit these into a patch file.
 PATCH_DENIED_PARTS = frozenset(
@@ -94,38 +72,6 @@ class SandboxResetError(RuntimeError):
 
 
 
-def _project_files(root: Path):
-    protected = ProtectedPathPolicy()
-    ignored = GitIgnoreMatcher.from_project(root)
-
-    for path in sorted(root.rglob("*")):
-        if not path.is_file():
-            continue
-
-        relative = path.relative_to(root)
-
-        project_path = ProjectPath.parse(relative.as_posix())
-        if not protected.classify(project_path).included:
-            continue
-        if ignored.is_ignored(project_path):
-            continue
-
-        yield path, relative
-
-
-def _hash_file(path: Path) -> str:
-    digest = hashlib.sha256()
-
-    with path.open("rb") as handle:
-        for chunk in iter(
-            lambda: handle.read(65536),
-            b"",
-        ):
-            digest.update(chunk)
-
-    return digest.hexdigest()
-
-
 def _safe_label(label: str) -> str:
     cleaned = "".join(
         ch if (ch.isalnum() or ch in "-_.") else "_"
@@ -145,21 +91,6 @@ def _validate_session_id(session_id: str) -> str:
     ):
         raise SandboxIdentityError("invalid sandbox session id")
     return session_id
-
-
-def _copy_tree(
-    source: Path,
-    destination: Path,
-) -> None:
-    for path, relative in _project_files(source):
-        target = destination / relative
-
-        target.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        shutil.copy2(path, target)
 
 
 class SandboxWorkspace:
@@ -292,26 +223,27 @@ class SandboxWorkspace:
             if directory.exists():
                 shutil.rmtree(directory)
 
-        _copy_tree(project_root, baseline_root)
-        _copy_tree(project_root, workspace_root)
+        manifest = SnapshotManifest.build(project_root, limits=limits)
+        manifest.materialize(baseline_root)
+        manifest.materialize(workspace_root)
 
         metadata_path = workspace_root.parent / "session.json"
-        if identity is not None:
-            metadata_path.write_text(
-                json.dumps(
-                    {
-                        "schema_version": 1,
-                        "session_id": session_id,
-                        "project_id": identity.project_id,
-                        "canonical_source_root": str(
-                            identity.canonical_source_root
-                        ),
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ),
-                encoding="utf-8",
-            )
+        metadata_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "session_id": session_id,
+                    "project_id": identity.project_id if identity else None,
+                    "canonical_source_root": str(
+                        identity.canonical_source_root if identity else project_root
+                    ),
+                    "snapshot_manifest_sha256": manifest.sha256,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
 
         return cls(
             session_id=session_id,
@@ -405,14 +337,16 @@ class SandboxWorkspace:
                 ) from error
 
             expected = {
-                "schema_version": 1,
                 "session_id": session_id,
                 "project_id": identity.project_id,
                 "canonical_source_root": str(
                     identity.canonical_source_root
                 ),
             }
-            if metadata != expected:
+            if (
+                metadata.get("schema_version") not in {1, 2}
+                or any(metadata.get(key) != value for key, value in expected.items())
+            ):
                 raise SandboxIdentityError(
                     "sandbox identity metadata does not match project"
                 )
@@ -456,24 +390,23 @@ class SandboxWorkspace:
         if self.source_project_root is None:
             raise SandboxResetError("sandbox source project is unknown")
 
-        token = uuid.uuid4().hex
-        baseline_stage = self.baseline_root.parent / (
-            f".{self.baseline_root.name}.stage-{token}"
-        )
-        workspace_stage = self.workspace_root.parent / (
-            f".{self.workspace_root.name}.stage-{token}"
-        )
-        baseline_backup = self.baseline_root.parent / (
-            f".{self.baseline_root.name}.backup-{token}"
-        )
-        workspace_backup = self.workspace_root.parent / (
-            f".{self.workspace_root.name}.backup-{token}"
-        )
+        # Keep temporary names shorter than the destination names.  Deep
+        # project namespaces otherwise hit legacy Windows path limits while
+        # the final workspace itself remains valid.
+        token = uuid.uuid4().hex[:8]
+        baseline_stage = self.baseline_root.parent / f"s-{token}"
+        workspace_stage = self.workspace_root.parent / f"r-{token}"
+        baseline_backup = self.baseline_root.parent / f"b-{token}"
+        workspace_backup = self.workspace_root.parent / f"q-{token}"
         committed = False
 
         try:
-            _copy_tree(self.source_project_root, baseline_stage)
-            _copy_tree(self.source_project_root, workspace_stage)
+            manifest = SnapshotManifest.build(
+                self.source_project_root,
+                limits=self.limits,
+            )
+            manifest.materialize(baseline_stage)
+            manifest.materialize(workspace_stage)
 
             self.baseline_root.replace(baseline_backup)
             self.workspace_root.replace(workspace_backup)
@@ -483,6 +416,7 @@ class SandboxWorkspace:
 
             self._remove_tree(self.checkpoints_root)
             self._active_checkpoint = None
+            self._write_metadata(manifest.sha256)
             committed = True
         except Exception as error:
             try:
@@ -510,6 +444,25 @@ class SandboxWorkspace:
     def discard_and_recreate(self) -> None:
         self._reset_from_source()
 
+    def _write_metadata(self, manifest_sha256: str) -> None:
+        payload = {
+            "schema_version": 2,
+            "session_id": self.session_id,
+            "project_id": self.project_id,
+            "canonical_source_root": (
+                str(self.source_project_root)
+                if self.source_project_root is not None
+                else None
+            ),
+            "snapshot_manifest_sha256": manifest_sha256,
+        }
+        temporary = self.metadata_path.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+        temporary.replace(self.metadata_path)
+
     # ==================================
     # TRANSACTIONAL CHECKPOINTS
     # ==================================
@@ -536,7 +489,10 @@ class SandboxWorkspace:
         if target.exists():
             shutil.rmtree(target)
 
-        _copy_tree(self.workspace_root, target)
+        SnapshotManifest.build(
+            self.workspace_root,
+            limits=self.limits,
+        ).materialize(target)
 
         self._active_checkpoint = label
 
@@ -566,16 +522,18 @@ class SandboxWorkspace:
         if not source.exists():
             return False
 
-        # Wipe current workspace, then restore the checkpoint.
-        for child in list(
-            self.workspace_root.iterdir()
-        ):
+        # Validate and hash the complete checkpoint before changing the
+        # workspace. Checkpoints live in framework-owned storage and are not
+        # writable by the model; direct materialization also avoids Windows
+        # directory-rename failures when a recently exited container still
+        # holds a transient handle on the workspace directory itself.
+        manifest = SnapshotManifest.build(source, limits=self.limits)
+        for child in list(self.workspace_root.iterdir()):
             if child.is_dir():
                 shutil.rmtree(child)
             else:
                 child.unlink()
-
-        _copy_tree(source, self.workspace_root)
+        manifest.materialize(self.workspace_root)
 
         return True
 
@@ -719,11 +677,10 @@ class SandboxWorkspace:
         self,
         root: Path,
     ) -> dict[str, str]:
+        manifest = SnapshotManifest.build(root, limits=self.limits)
         return {
-            relative.as_posix(): _hash_file(path)
-            for path, relative in _project_files(
-                root
-            )
+            entry.path.value: entry.sha256
+            for entry in manifest.entries
         }
 
     def changed_files(self) -> list[str]:
