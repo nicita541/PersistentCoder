@@ -118,6 +118,22 @@ def test_parent_traversal_is_blocked(tmp_path):
         tools.read_text("../../etc/passwd")
 
 
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "../*",
+        "../../**/*",
+        r"C:\\*",
+        "/tmp/*",
+        "dir/file:stream",
+        "CON/**",
+    ],
+)
+def test_list_files_cannot_glob_outside_workspace(tmp_path, pattern):
+    with pytest.raises(FileToolsError):
+        FileTools(tmp_path).list_files(pattern)
+
+
 def test_absolute_path_rejected_even_inside_root(
     tmp_path,
 ):

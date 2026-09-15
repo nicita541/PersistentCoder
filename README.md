@@ -78,6 +78,28 @@ baseline и workspace транзакционно.
 - Команда модели получает read-only `/input` и отдельный tmpfs `/workspace` в
   Docker без сети, host socket и host environment. Записи команды исчезают после
   контейнера; persistent-изменения выполняет только `FileTools`.
+- Framework-проверки (`py_compile`, import и pytest) передаются контейнеру как
+  массив argv. Имена файлов с shell-метасимволами остаются одним аргументом и не
+  интерпретируются shell.
+- Вывод контейнера читается потоково. Runtime удерживает не больше заданного
+  лимита, завершает команду при output flood и ограничивает число одновременно
+  исполняемых команд. Timeout, cancellation, tmpfs, memory, CPU и PID limits
+  возвращают проверяемый отказ без запуска на host.
+
+## Доверенная верификация
+
+Каждый `VerificationResult` отделён от перехода Task/Step и содержит неизменяемый
+`VerificationContext`: SHA-256 текущего workspace snapshot, канонических
+`verification_specs` и framework-owned окружения контейнера. Контекст сохраняется
+в истории проверок. PASS считается актуальным только пока совпадают все три
+fingerprint; изменение исходника, `pytest.ini`/`pyproject.toml`, спецификации или
+образа делает evidence устаревшим.
+
+Отсутствующий Docker/image, исчерпанная ёмкость, timeout и output limit дают
+`BLOCKED`, а не ложный FAIL/PASS. Код pytest 5 (`no tests collected`) остаётся
+FAIL. Dependency manifests читаются целиком как строгий UTF-8: oversized,
+malformed, nested `-r`, unsafe URL/path declarations, `setup.py` и превышение
+числа зависимостей блокируют environment без усечения или fallback в `NONE`.
 
 ## Проверка
 
@@ -87,7 +109,6 @@ baseline и workspace транзакционно.
 ```
 
 Полный MVP развивается по последовательным планам в
-`docs/superpowers/plans/`; проектная идентичность и lifecycle сессии являются
-первым завершённым фундаментальным этапом. Границы snapshot/path/command и
-точные области изменений составляют второй этап; следующие планы закрывают
-planner/verification/repair, apply backend и VSIX release.
+`docs/superpowers/plans/`. Stage 1 задаёт durable runtime authority. Stage 2
+закрепляет доверенную, revision-bound верификацию и resource boundaries. Stage 3
+добавит immutable apply manifest и журналируемую публикацию в source.

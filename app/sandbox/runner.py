@@ -57,6 +57,10 @@ _CONTAINER_WRAPPER = (
     'set -eu; cp -a /input/. /workspace/; '
     'cd "$1"; exec sh -lc "$2"'
 )
+_ARGV_WRAPPER = (
+    'set -eu; cp -a /input/. /workspace/; '
+    'cd "$1"; shift; exec "$@"'
+)
 
 
 class CancellationToken:
@@ -129,6 +133,9 @@ class SandboxCommandRunner:
         )
         self._cached_availability: bool | None = (
             None
+        )
+        self._admission = threading.BoundedSemaphore(
+            value=max(1, int(self.limits.max_concurrent_commands))
         )
 
 
@@ -261,6 +268,7 @@ class SandboxCommandRunner:
             "network": "none",
             "cap_drop": ["ALL"],
             "security_opt": ["no-new-privileges"],
+            "root_filesystem": "read-only",
             "pids_limit": self.pids_limit,
             "memory": self.memory,
             "cpus": self.cpus,
@@ -341,6 +349,12 @@ class SandboxCommandRunner:
             "uid=1000,gid=1000,mode=1770"
         )
 
+        tmpfs_tmp = (
+            "/tmp:rw,size="
+            f"{self.limits.max_command_tmp_bytes},"
+            "uid=1000,gid=1000,mode=1777"
+        )
+
         return [
             self.docker,
             "run",
@@ -351,9 +365,12 @@ class SandboxCommandRunner:
             "ALL",
             "--security-opt",
             "no-new-privileges",
+            "--read-only",
             "--pids-limit",
             str(self.pids_limit),
             "--memory",
+            self.memory,
+            "--memory-swap",
             self.memory,
             "--cpus",
             self.cpus,
@@ -363,6 +380,8 @@ class SandboxCommandRunner:
             mount,
             "--tmpfs",
             tmpfs,
+            "--tmpfs",
+            tmpfs_tmp,
             "-w",
             "/workspace",
             self.image,
@@ -374,9 +393,144 @@ class SandboxCommandRunner:
             command,
         ]
 
+    def argv_arguments(
+        self,
+        argv: list[str] | tuple[str, ...],
+        *,
+        cwd: str | Path | None = None,
+    ) -> list[str]:
+        if not argv or any(not isinstance(item, str) or "\x00" in item for item in argv):
+            raise PolicyViolation("framework argv must contain non-NUL strings")
+        base = self.command_arguments("true", cwd=cwd)
+        script_index = base.index("-lc") + 1
+        workdir = base[-2]
+        return [
+            *base[:script_index],
+            _ARGV_WRAPPER,
+            "persistentcoder",
+            workdir,
+            *argv,
+        ]
+
+    def environment_identity(self) -> dict[str, object]:
+        return {
+            "image": self.image,
+            "network": "none",
+            "memory": self.memory,
+            "cpus": self.cpus,
+            "pids_limit": self.pids_limit,
+            "user": self.user,
+            "workspace_bytes": self.limits.max_command_workspace_bytes,
+            "tmp_bytes": self.limits.max_command_tmp_bytes,
+            "output_bytes": self.limits.max_output_bytes,
+            "timeout_seconds": self.timeout,
+            "max_concurrent_commands": self.limits.max_concurrent_commands,
+        }
+
+    def verification_environment(
+        self,
+    ) -> tuple[bool, str, dict[str, object]]:
+        identity = self.environment_identity()
+        if not self._admission.acquire(blocking=False):
+            return False, "sandbox command capacity exhausted", {
+                **identity,
+                "image_id": None,
+            }
+        try:
+            return self._verification_environment_with_admission(identity)
+        finally:
+            self._admission.release()
+
+    def _verification_environment_with_admission(
+        self,
+        identity: dict[str, object],
+    ) -> tuple[bool, str, dict[str, object]]:
+        if not self.daemon_available():
+            return False, "Docker daemon is unavailable", {
+                **identity,
+                "image_id": None,
+            }
+        if not self.ensure_image():
+            return False, "sandbox image is unavailable", {
+                **identity,
+                "image_id": None,
+            }
+        try:
+            completed = subprocess.run(
+                [
+                    self.docker,
+                    "image",
+                    "inspect",
+                    "--format",
+                    "{{.Id}}",
+                    self.image,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            return False, f"sandbox image identity unavailable: {error}", {
+                **identity,
+                "image_id": None,
+            }
+        image_id = completed.stdout.strip() if completed.returncode == 0 else ""
+        if not image_id:
+            return False, "sandbox image identity unavailable", {
+                **identity,
+                "image_id": None,
+            }
+        return True, "available", {
+            **identity,
+            "image_id": image_id,
+        }
+
     # ==================================
     # RUN
     # ==================================
+
+    def _run_in_container(
+        self,
+        *,
+        command_label: str,
+        arguments: list[str],
+        cancellation_token: CancellationToken | None,
+        on_output: Callable[[str, str], None] | None,
+    ) -> CommandResult:
+        if not self._admission.acquire(blocking=False):
+            return CommandResult(
+                command=command_label,
+                returncode=125,
+                stderr="sandbox command capacity exhausted",
+            )
+        try:
+            if not self.daemon_available():
+                return CommandResult(
+                    command=command_label,
+                    returncode=127,
+                    stderr=(
+                        "sandbox unavailable: Docker daemon is a prerequisite; "
+                        "refusing to execute on host"
+                    ),
+                )
+            if not self.ensure_image():
+                return CommandResult(
+                    command=command_label,
+                    returncode=126,
+                    stderr=(
+                        f"sandbox image unavailable: {self.image} could not be "
+                        "built or found"
+                    ),
+                )
+            return self._execute(
+                arguments,
+                command_label=command_label,
+                cancellation_token=cancellation_token,
+                on_output=on_output,
+                admission_held=True,
+            )
+        finally:
+            self._admission.release()
 
     def run(
         self,
@@ -384,6 +538,7 @@ class SandboxCommandRunner:
         *,
         cwd: str | Path | None = None,
         cancellation_token: CancellationToken | None = None,
+        on_output: Callable[[str, str], None] | None = None,
     ) -> CommandResult:
         validated = self.policy.validate(command)
 
@@ -395,34 +550,54 @@ class SandboxCommandRunner:
                 stderr="command cancelled before start",
             )
 
-        if not self.daemon_available():
-            return CommandResult(
-                command=validated,
-                returncode=127,
-                stdout="",
-                stderr=(
-                    "sandbox unavailable: "
-                    "Docker daemon is a prerequisite; "
-                    "refusing to execute on host"
-                ),
-            )
-
-        if not self.ensure_image():
-            return CommandResult(
-                command=validated,
-                returncode=126,
-                stdout="",
-                stderr=(
-                    "sandbox image unavailable: "
-                    f"{self.image} could not be "
-                    "built or found"
-                ),
-            )
-
         arguments = self.command_arguments(
             validated,
             cwd=cwd,
         )
+
+        return self._run_in_container(
+            command_label=validated,
+            arguments=arguments,
+            cancellation_token=cancellation_token,
+            on_output=on_output,
+        )
+
+    def run_argv(
+        self,
+        argv: list[str] | tuple[str, ...],
+        *,
+        cwd: str | Path | None = None,
+        cancellation_token: CancellationToken | None = None,
+        on_output: Callable[[str, str], None] | None = None,
+    ) -> CommandResult:
+        command = [str(item) for item in argv]
+        label = " ".join(command)
+        if cancellation_token is not None and cancellation_token.cancelled:
+            return CommandResult(command=label, returncode=130, stderr="command cancelled before start")
+        arguments = self.argv_arguments(command, cwd=cwd)
+        return self._run_in_container(
+            command_label=label,
+            arguments=arguments,
+            cancellation_token=cancellation_token,
+            on_output=on_output,
+        )
+
+    def _execute(
+        self,
+        arguments: list[str],
+        *,
+        command_label: str,
+        cancellation_token: CancellationToken | None,
+        on_output: Callable[[str, str], None] | None,
+        admission_held: bool = False,
+    ) -> CommandResult:
+        release_admission = not admission_held
+        if release_admission and not self._admission.acquire(blocking=False):
+            return CommandResult(
+                command=command_label,
+                returncode=125,
+                stderr="sandbox command capacity exhausted",
+            )
 
         container_name = "persistentcoder-" + uuid.uuid4().hex[:12]
         arguments[arguments.index("run") + 1 : arguments.index("run") + 1] = [
@@ -431,48 +606,155 @@ class SandboxCommandRunner:
         ]
 
         try:
-            process = subprocess.Popen(
-                arguments,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-        except OSError as error:
-            return CommandResult(
-                command=validated,
-                returncode=125,
-                stderr=f"sandbox process failed to start: {error}",
-            )
+            try:
+                process = subprocess.Popen(
+                    arguments,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=False,
+                )
+            except OSError as error:
+                return CommandResult(
+                    command=command_label,
+                    returncode=125,
+                    stderr=f"sandbox process failed to start: {error}",
+                )
 
+            # Compatibility for simple process doubles; real subprocess pipes
+            # always take the bounded streaming path below.
+            if not hasattr(process, "stdout") or not hasattr(process, "stderr"):
+                return self._communicate_compat(
+                    process, container_name, command_label, cancellation_token
+                )
+
+            retained = {"stdout": bytearray(), "stderr": bytearray()}
+            total = 0
+            retained_total = 0
+            lock = threading.Lock()
+            flooded = threading.Event()
+            limit = max(1, int(self.limits.max_output_bytes))
+
+            def drain(name: str, stream) -> None:
+                nonlocal total, retained_total
+                while True:
+                    chunk = stream.read(4096)
+                    if not chunk:
+                        return
+                    if isinstance(chunk, str):
+                        chunk = chunk.encode("utf-8", errors="replace")
+                    with lock:
+                        total += len(chunk)
+                        room = max(0, limit - retained_total)
+                        kept = chunk[:room]
+                        retained[name].extend(kept)
+                        retained_total += len(kept)
+                        if kept and on_output is not None:
+                            try:
+                                on_output(
+                                    name,
+                                    kept.decode("utf-8", errors="replace"),
+                                )
+                            except Exception:
+                                pass
+                        if total > limit:
+                            flooded.set()
+
+            readers = [
+                threading.Thread(target=drain, args=("stdout", process.stdout), daemon=True),
+                threading.Thread(target=drain, args=("stderr", process.stderr), daemon=True),
+            ]
+            for reader in readers:
+                reader.start()
+
+            deadline = time.monotonic() + self.timeout
+            forced: tuple[int, str] | None = None
+            while process.poll() is None:
+                if flooded.is_set():
+                    forced = (122, "command output exceeded max_output_bytes")
+                    break
+                if cancellation_token is not None and cancellation_token.cancelled:
+                    forced = (130, "command cancelled")
+                    break
+                if time.monotonic() >= deadline:
+                    forced = (124, f"timeout after {self.timeout}s")
+                    break
+                time.sleep(0.02)
+
+            if forced is not None:
+                self._stop_container(container_name, process)
+            for reader in readers:
+                reader.join(timeout=2)
+
+            if forced is None and flooded.is_set():
+                forced = (122, "command output exceeded max_output_bytes")
+
+            stdout = retained["stdout"].decode("utf-8", errors="replace")
+            stderr = retained["stderr"].decode("utf-8", errors="replace")
+            if forced is not None:
+                code, reason = forced
+                return CommandResult(
+                    command=command_label,
+                    returncode=code,
+                    stdout=stdout,
+                    stderr=(stderr + ("\n" if stderr else "") + reason),
+                )
+            return self._completed_result(
+                command=command_label,
+                returncode=int(process.returncode),
+                stdout=stdout,
+                stderr=stderr,
+            )
+        finally:
+            if release_admission:
+                self._admission.release()
+
+    def _communicate_compat(self, process, container_name, command_label, cancellation_token):
         deadline = time.monotonic() + self.timeout
         while True:
             try:
                 stdout, stderr = process.communicate(timeout=0.1)
-                break
+                return self._completed_result(
+                    command=command_label,
+                    returncode=int(process.returncode or 0),
+                    stdout=self._truncate(stdout or ""),
+                    stderr=self._truncate(stderr or ""),
+                )
             except subprocess.TimeoutExpired:
                 if cancellation_token is not None and cancellation_token.cancelled:
                     self._stop_container(container_name, process)
-                    return CommandResult(
-                        command=validated,
-                        returncode=130,
-                        stderr="command cancelled",
-                    )
+                    return CommandResult(command=command_label, returncode=130, stderr="command cancelled")
                 if time.monotonic() >= deadline:
                     self._stop_container(container_name, process)
-                    return CommandResult(
-                        command=validated,
-                        returncode=124,
-                        stderr=(
-                            "timeout after "
-                            f"{self.timeout}s"
-                        ),
-                    )
+                    return CommandResult(command=command_label, returncode=124, stderr=f"timeout after {self.timeout}s")
 
+    @staticmethod
+    def _completed_result(
+        *,
+        command: str,
+        returncode: int,
+        stdout: str,
+        stderr: str,
+    ) -> CommandResult:
+        combined = f"{stdout}\n{stderr}".casefold()
+        markers = (
+            "no space left on device",
+            "cannot allocate memory",
+            "out of memory",
+            "memory limit exceeded",
+        )
+        if returncode == 137 or any(marker in combined for marker in markers):
+            detail = (
+                "sandbox memory limit exceeded"
+                if returncode == 137
+                else "sandbox disk or memory limit exceeded"
+            )
+            stderr = stderr + ("\n" if stderr else "") + detail
+            returncode = 125
         return CommandResult(
-            command=validated,
-            returncode=process.returncode,
-            stdout=self._truncate(stdout or ""),
-            stderr=self._truncate(stderr or ""),
+            command=command,
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
         )
 
     def _stop_container(

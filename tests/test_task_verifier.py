@@ -21,6 +21,12 @@ from app.tasks.verifier import (
     VerificationError,
     Verifier,
 )
+from app.tasks.verification_context import VerificationContext
+from app.tasks.unit_of_work import RuntimeUnitOfWork
+
+
+def _trusted_context() -> VerificationContext:
+    return VerificationContext("workspace", "spec", "environment")
 
 
 def _create_running_task(
@@ -120,6 +126,21 @@ def _make_verifier(
             verification_store
         ),
     )
+
+
+def test_verifier_rejects_state_authority_bound_to_another_database(tmp_path):
+    plan_store, step_store, verification_store, _task_id = _create_running_task(
+        tmp_path / "planner.db"
+    )
+    other_authority = RuntimeUnitOfWork(tmp_path / "other.db")
+
+    with pytest.raises(VerificationError, match="authority.*database and scope"):
+        Verifier(
+            plan_store=plan_store,
+            step_store=step_store,
+            verification_store=verification_store,
+            state_authority=other_authority,
+        )
 
 
 def test_verification_status_values():
@@ -235,6 +256,7 @@ def test_pass_step_marks_step_done(
 
     verifier.pass_step(
         step.id,
+        context=_trusted_context(),
         evidence=[
             "4 tests passed",
         ],
@@ -364,6 +386,7 @@ def test_step_must_be_verifying_before_pass(
     ):
         verifier.pass_step(
             step.id,
+            context=_trusted_context(),
             evidence=[
                 "fake pass",
             ],
@@ -411,7 +434,17 @@ def test_verification_requires_evidence(
     ):
         verifier.pass_step(
             step.id,
+            context=_trusted_context(),
             evidence=[],
+        )
+
+    with pytest.raises(
+        VerificationError,
+        match="revision-bound",
+    ):
+        verifier.pass_step(
+            step.id,
+            evidence=["unbound pass"],
         )
 
 
@@ -464,6 +497,7 @@ def test_failed_then_passed_verifications_are_both_kept(
 
     verifier.pass_step(
         step.id,
+        context=_trusted_context(),
         evidence=[
             "test passed",
         ],
@@ -617,6 +651,7 @@ def test_pass_task_marks_task_done(
 
     verifier.pass_task(
         task_id,
+        context=_trusted_context(),
         evidence=[
             "auth integration passed",
             "12 tests passed",
@@ -738,6 +773,7 @@ def test_verification_history_survives_restart(
 
     verifier.pass_step(
         step.id,
+        context=_trusted_context(),
         evidence=[
             "verification passed",
         ],

@@ -4,12 +4,15 @@ from app.tasks.models import (
     StepStatus,
     TaskStatus,
     VerificationStatus,
+    VerificationTargetType,
 )
 from app.tasks.step_store import StepStore
 from app.tasks.store import PlanStore
 from app.tasks.verification_store import (
     VerificationStore,
 )
+from app.tasks.verification_context import VerificationContext
+from app.tasks.unit_of_work import RuntimeUnitOfWork
 
 
 class VerificationError(
@@ -25,12 +28,39 @@ class Verifier:
         plan_store: PlanStore,
         step_store: StepStore,
         verification_store: VerificationStore,
+        state_authority=None,
     ) -> None:
         self.plan_store = plan_store
         self.step_store = step_store
         self.verification_store = (
             verification_store
         )
+        store_paths = {
+            store.database_path.resolve()
+            for store in (plan_store, step_store, verification_store)
+        }
+        store_contexts = {
+            store.context
+            for store in (plan_store, step_store, verification_store)
+        }
+        if len(store_paths) != 1 or len(store_contexts) != 1:
+            raise VerificationError(
+                "verification stores must share one database and scope"
+            )
+        authority = state_authority or RuntimeUnitOfWork(
+            verification_store.context or verification_store.database_path
+        )
+        authority_path = getattr(authority, "database_path", None)
+        authority_context = getattr(authority, "context", None)
+        if (
+            authority_path is None
+            or authority_path.resolve() != next(iter(store_paths))
+            or authority_context != next(iter(store_contexts))
+        ):
+            raise VerificationError(
+                "verification authority must share the store database and scope"
+            )
+        self.state_authority = authority
 
     @staticmethod
     def _require_evidence(
@@ -47,6 +77,16 @@ class Verifier:
                 "verification evidence "
                 "is required"
             )
+
+    @staticmethod
+    def _require_trusted_context(
+        context: VerificationContext | None,
+    ) -> VerificationContext:
+        if context is None:
+            raise VerificationError(
+                "PASS requires revision-bound verification context"
+            )
+        return context
 
     # ==========================================
     # STEP VERIFICATION
@@ -84,6 +124,7 @@ class Verifier:
         step_id: int,
         *,
         evidence: list[str],
+        context: VerificationContext | None = None,
     ) -> None:
         self._require_evidence(
             evidence
@@ -107,22 +148,17 @@ class Verifier:
                 "before PASS"
             )
 
-        self.verification_store.record_step(
-            step_id,
-            status=VerificationStatus.PASS,
-            evidence=evidence,
-        )
+        context = self._require_trusted_context(context)
 
-        self.step_store.set_step_verification(
-            step_id,
-            verification_status="PASS",
-            verification_evidence=evidence,
-            failure_reason=None,
-        )
-
-        self.step_store.update_step_status(
-            step_id,
-            StepStatus.DONE,
+        self.state_authority.finish_verification(
+                target_type=VerificationTargetType.STEP,
+                target_id=step_id,
+                verification_status="PASS",
+                evidence=evidence,
+                reason=None,
+                context=context,
+                target_status=StepStatus.DONE.value,
+                failure_reason=None,
         )
 
     def fail_step(
@@ -131,6 +167,7 @@ class Verifier:
         *,
         reason: str,
         evidence: list[str],
+        context: VerificationContext | None = None,
     ) -> None:
         self._require_evidence(
             evidence
@@ -160,23 +197,15 @@ class Verifier:
                 "before FAIL"
             )
 
-        self.verification_store.record_step(
-            step_id,
-            status=VerificationStatus.FAIL,
-            evidence=evidence,
-            reason=reason,
-        )
-
-        self.step_store.set_step_verification(
-            step_id,
-            verification_status="FAIL",
-            verification_evidence=evidence,
-            failure_reason=reason,
-        )
-
-        self.step_store.update_step_status(
-            step_id,
-            StepStatus.IN_PROGRESS,
+        self.state_authority.finish_verification(
+                target_type=VerificationTargetType.STEP,
+                target_id=step_id,
+                verification_status="FAIL",
+                evidence=evidence,
+                reason=reason,
+                context=context,
+                target_status=StepStatus.IN_PROGRESS.value,
+                failure_reason=reason,
         )
 
     def block_step(
@@ -185,24 +214,22 @@ class Verifier:
         *,
         reason: str,
         evidence: list[str],
+        context: VerificationContext | None = None,
     ) -> None:
         self._require_evidence(evidence)
         step = self.step_store.get_step(step_id)
         if step is None or step.status is not StepStatus.VERIFYING:
             raise VerificationError("step must be VERIFYING before BLOCKED")
-        self.verification_store.record_step(
-            step_id,
-            status=VerificationStatus.BLOCKED,
-            evidence=evidence,
-            reason=reason,
+        self.state_authority.finish_verification(
+                target_type=VerificationTargetType.STEP,
+                target_id=step_id,
+                verification_status="BLOCKED",
+                evidence=evidence,
+                reason=reason,
+                context=context,
+                target_status=StepStatus.BLOCKED.value,
+                failure_reason=reason,
         )
-        self.step_store.set_step_verification(
-            step_id,
-            verification_status="BLOCKED",
-            verification_evidence=evidence,
-            failure_reason=reason,
-        )
-        self.step_store.update_step_status(step_id, StepStatus.BLOCKED)
 
     # ==========================================
     # TASK VERIFICATION
@@ -264,6 +291,7 @@ class Verifier:
         task_id: int,
         *,
         evidence: list[str],
+        context: VerificationContext | None = None,
     ) -> None:
         self._require_evidence(
             evidence
@@ -287,21 +315,16 @@ class Verifier:
                 "before PASS"
             )
 
-        self.verification_store.record_task(
-            task_id,
-            status=VerificationStatus.PASS,
-            evidence=evidence,
-        )
+        context = self._require_trusted_context(context)
 
-        self.plan_store.set_task_verification(
-            task_id,
-            verification_status="PASS",
-            verification_evidence=evidence,
-        )
-
-        self.plan_store.update_task_status(
-            task_id,
-            TaskStatus.DONE,
+        self.state_authority.finish_verification(
+                target_type=VerificationTargetType.TASK,
+                target_id=task_id,
+                verification_status="PASS",
+                evidence=evidence,
+                reason=None,
+                context=context,
+                target_status=TaskStatus.DONE.value,
         )
 
     def fail_task(
@@ -310,6 +333,7 @@ class Verifier:
         *,
         reason: str,
         evidence: list[str],
+        context: VerificationContext | None = None,
     ) -> None:
         self._require_evidence(
             evidence
@@ -339,22 +363,14 @@ class Verifier:
                 "before FAIL"
             )
 
-        self.verification_store.record_task(
-            task_id,
-            status=VerificationStatus.FAIL,
-            evidence=evidence,
-            reason=reason,
-        )
-
-        self.plan_store.set_task_verification(
-            task_id,
-            verification_status="FAIL",
-            verification_evidence=evidence,
-        )
-
-        self.plan_store.update_task_status(
-            task_id,
-            TaskStatus.IN_PROGRESS,
+        self.state_authority.finish_verification(
+                target_type=VerificationTargetType.TASK,
+                target_id=task_id,
+                verification_status="FAIL",
+                evidence=evidence,
+                reason=reason,
+                context=context,
+                target_status=TaskStatus.IN_PROGRESS.value,
         )
 
     def block_task(
@@ -363,20 +379,18 @@ class Verifier:
         *,
         reason: str,
         evidence: list[str],
+        context: VerificationContext | None = None,
     ) -> None:
         self._require_evidence(evidence)
         task = self.plan_store.get_task(task_id)
         if task is None or task.status is not TaskStatus.VERIFYING:
             raise VerificationError("task must be VERIFYING before BLOCKED")
-        self.verification_store.record_task(
-            task_id,
-            status=VerificationStatus.BLOCKED,
-            evidence=evidence,
-            reason=reason,
+        self.state_authority.finish_verification(
+                target_type=VerificationTargetType.TASK,
+                target_id=task_id,
+                verification_status="BLOCKED",
+                evidence=evidence,
+                reason=reason,
+                context=context,
+                target_status=TaskStatus.BLOCKED.value,
         )
-        self.plan_store.set_task_verification(
-            task_id,
-            verification_status="BLOCKED",
-            verification_evidence=evidence,
-        )
-        self.plan_store.update_task_status(task_id, TaskStatus.BLOCKED)

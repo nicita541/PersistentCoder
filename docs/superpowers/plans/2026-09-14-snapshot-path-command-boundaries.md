@@ -1,5 +1,10 @@
 # Snapshot, Path, and Command Boundaries Implementation Plan
 
+> Superseded for the current architecture by
+> `2026-09-15-trusted-verification-sandbox-limits.md`. The checked work below
+> remains historical implementation evidence; unchecked release bookkeeping is
+> not the definition of the current Stage 2 gate.
+
 > **Execution note:** Implement this plan task-by-task with TDD and review each
 > checkpoint before continuing.
 

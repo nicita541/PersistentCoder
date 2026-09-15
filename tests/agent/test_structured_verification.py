@@ -51,12 +51,41 @@ def test_python_symbol_and_signature_use_ast(tmp_path):
                 VerificationKind.PY_SIGNATURE,
                 "pkg/mod.py",
                 symbol="Calculator.add",
-                expected_signature=["self", "left", "right"],
+                expected_signature=["self", "left", "right=0"],
             ),
         ]
     )
 
     assert all(result.status == "PASS" for result in results)
+
+
+def test_signature_contract_includes_kinds_defaults_and_variadics(tmp_path):
+    (tmp_path / "api.py").write_text(
+        "def run(first, /, second=2, *args, flag=True, **kwargs):\n"
+        "    return first\n",
+        encoding="utf-8",
+    )
+    exact = VerificationSpec(
+        VerificationKind.PY_SIGNATURE,
+        "api.py",
+        symbol="run",
+        expected_signature=[
+            "first", "/", "second=2", "*args", "flag=True", "**kwargs"
+        ],
+    )
+    incomplete = VerificationSpec(
+        VerificationKind.PY_SIGNATURE,
+        "api.py",
+        symbol="run",
+        expected_signature=["first", "second"],
+    )
+
+    exact_result, incomplete_result = _verifier(tmp_path).verify_all(
+        [exact, incomplete]
+    )
+
+    assert exact_result.status == "PASS"
+    assert incomplete_result.status == "FAIL"
 
 
 def test_missing_ast_symbol_fails_even_when_file_exists(tmp_path):
@@ -87,7 +116,10 @@ def test_nested_import_uses_full_module_name(tmp_path):
     )[0]
 
     assert result.status == "PASS"
-    assert runner.commands == ['python -c "import pkg.sub.mod"']
+    assert runner.argv_commands == [
+        ["python", "-c", "import pkg.sub.mod"]
+    ]
+    assert runner.commands == []
 
 
 def test_all_explicit_pytest_targets_run_together(tmp_path):
@@ -103,12 +135,12 @@ def test_all_explicit_pytest_targets_run_together(tmp_path):
     )
 
     assert all(result.status == "PASS" for result in results)
-    assert runner.commands == [
-        "python -m pytest -q test_a.py test_b.py"
-    ]
+    assert runner.argv_commands == [[
+        "python", "-m", "pytest", "-q", "test_a.py", "test_b.py"
+    ]]
 
 
-def test_python_compile_quotes_shell_metacharacters_in_target(tmp_path):
+def test_python_compile_passes_shell_metacharacters_as_one_argv_item(tmp_path):
     runner = RecordingCommandRunner(stdout="ok")
 
     result = _verifier(tmp_path, runner).verify_all(
@@ -121,9 +153,9 @@ def test_python_compile_quotes_shell_metacharacters_in_target(tmp_path):
     )[0]
 
     assert result.status == "PASS"
-    assert runner.commands == [
-        "python -m py_compile 'sample.py; touch PWNED'"
-    ]
+    assert runner.argv_commands == [[
+        "python", "-m", "py_compile", "sample.py; touch PWNED"
+    ]]
 
 
 def test_pytest_without_target_is_blocked_unless_full_suite_explicit(tmp_path):
@@ -134,7 +166,32 @@ def test_pytest_without_target_is_blocked_unless_full_suite_explicit(tmp_path):
     )[0]
 
     assert result.status == "BLOCKED"
-    assert runner.commands == []
+    assert runner.argv_commands == []
+
+
+def test_missing_sandbox_environment_is_blocked(tmp_path):
+    runner = RecordingCommandRunner(
+        returncode=127,
+        stderr="sandbox unavailable: Docker daemon is a prerequisite",
+    )
+    (tmp_path / "app.py").write_text("VALUE = 1\n")
+
+    result = _verifier(tmp_path, runner).verify_all([
+        VerificationSpec(VerificationKind.PY_COMPILE, "app.py")
+    ])[0]
+
+    assert result.status == "BLOCKED"
+    assert "sandbox unavailable" in result.reason
+
+
+def test_pytest_no_tests_collected_is_not_a_pass(tmp_path):
+    runner = RecordingCommandRunner(returncode=5, stdout="no tests ran")
+
+    result = _verifier(tmp_path, runner).verify_all([
+        VerificationSpec(VerificationKind.PYTEST, full_suite_allowed=True)
+    ])[0]
+
+    assert result.status == "FAIL"
 
 
 def test_verification_specs_round_trip_through_task_and_step_stores(tmp_path):

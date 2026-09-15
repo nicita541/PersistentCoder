@@ -11,7 +11,7 @@ from app.sandbox.policy import (
     PathPolicy,
     PolicyViolation,
 )
-from app.sandbox.project_path import ProjectPath, ProjectPathError
+from app.sandbox.project_path import ProjectGlob, ProjectPath, ProjectPathError
 
 
 class FileToolsError(PolicyViolation):
@@ -208,12 +208,14 @@ class FileTools:
         self,
         pattern: str = "**/*",
     ) -> list[str]:
+        try:
+            project_glob = ProjectGlob.parse(pattern)
+        except ProjectPathError as error:
+            raise FileToolsError(str(error)) from error
         return sorted(
-            candidate.relative_to(
-                self.root
-            ).as_posix()
+            self.relative(candidate)
             for candidate in self.root.glob(
-                pattern
+                project_glob.value
             )
             if candidate.is_file()
         )

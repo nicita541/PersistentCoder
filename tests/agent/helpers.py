@@ -329,6 +329,7 @@ class RecordingCommandRunner:
         self.stdout = stdout
         self.stderr = stderr
         self.commands: list[str] = []
+        self.argv_commands: list[list[str]] = []
 
     def run(
         self,
@@ -344,6 +345,18 @@ class RecordingCommandRunner:
 
         return CommandResult(
             command=command,
+            returncode=self.returncode,
+            stdout=self.stdout,
+            stderr=self.stderr,
+        )
+
+    def run_argv(self, argv, *, cwd=None):
+        from app.tools.terminal_tools import CommandResult
+
+        command = [str(item) for item in argv]
+        self.argv_commands.append(command)
+        return CommandResult(
+            command=" ".join(command),
             returncode=self.returncode,
             stdout=self.stdout,
             stderr=self.stderr,

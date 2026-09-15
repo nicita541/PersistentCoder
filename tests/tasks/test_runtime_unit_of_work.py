@@ -9,7 +9,13 @@ from app.project_identity import ProjectIdentity
 from app.tasks.runtime_store import RuntimeStore
 from app.tasks.session_store import SessionStore
 from app.agent.session import SessionStatus
-from app.tasks.models import PlanStatus
+from app.tasks.models import (
+    PlanStatus,
+    StepStatus,
+    TaskStatus,
+    VerificationTargetType,
+)
+from app.tasks.verification_context import VerificationContext
 from app.tasks.store_context import StoreContext
 from app.tasks.unit_of_work import (
     ConcurrentWriterError,
@@ -47,12 +53,45 @@ def test_migrations_are_ordered_and_idempotent(tmp_path):
             )
         }
 
-    assert versions == [(1,), (2,), (3,)]
+    assert versions == [(1,), (2,), (3,), (4,)]
     assert {
         "agent_state_snapshots",
         "budget_ledger",
         "file_operation_journal",
+        "verifications",
     } <= tables
+
+
+def test_verification_context_column_is_migrated_atomically(tmp_path):
+    context = _context(tmp_path)
+    with sqlite3.connect(context.database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE verifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER,
+                step_id INTEGER,
+                status TEXT NOT NULL,
+                reason TEXT,
+                evidence_json TEXT NOT NULL DEFAULT '[]',
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+    RuntimeUnitOfWork(context)
+
+    with sqlite3.connect(context.database_path) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(verifications)")
+        }
+        migration = connection.execute(
+            "SELECT name FROM schema_migrations WHERE version = 4"
+        ).fetchone()
+
+    assert "context_json" in columns
+    assert migration == ("revision-bound verification context",)
 
 
 def test_state_transition_updates_cursor_and_snapshot_atomically(tmp_path):
@@ -241,3 +280,38 @@ def test_run_and_session_start_roll_back_together_on_session_conflict(tmp_path):
 
     assert RuntimeStore(context).get_running_runs() == []
     assert session_store.get(session_id).status is SessionStatus.CLEAN
+
+
+def test_verification_record_and_step_transition_roll_back_together(tmp_path):
+    from helpers import make_stores, seed_plan
+
+    project = tmp_path / "project"
+    project.mkdir()
+    stores = make_stores(tmp_path, project_root=project)
+    _plan_id, task, step = seed_plan(stores)
+    stores.plan_store.update_task_status(task.id, TaskStatus.IN_PROGRESS)
+    stores.step_store.update_step_status(step.id, StepStatus.IN_PROGRESS)
+    stores.step_store.update_step_status(step.id, StepStatus.VERIFYING)
+    authority = RuntimeUnitOfWork(stores.plan_store.context)
+    with sqlite3.connect(stores.database_path) as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_verified_step
+            BEFORE UPDATE ON steps
+            BEGIN SELECT RAISE(FAIL, 'step transition rejected'); END
+            """
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="step transition rejected"):
+        authority.finish_verification(
+            target_type=VerificationTargetType.STEP,
+            target_id=step.id,
+            verification_status="PASS",
+            evidence=["verified"],
+            reason=None,
+            context=VerificationContext("workspace", "spec", "environment"),
+            target_status=StepStatus.DONE.value,
+        )
+
+    assert stores.step_store.get_step(step.id).status is StepStatus.VERIFYING
+    assert stores.verification_store.get_step_verifications(step.id) == []

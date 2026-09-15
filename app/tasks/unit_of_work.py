@@ -5,12 +5,19 @@ import sqlite3
 from contextlib import contextmanager
 from dataclasses import asdict
 from enum import Enum
+from pathlib import Path
 from typing import Iterator
 
 from app.agent.state import AgentState
 from app.agent.session import SessionStatus
 from app.tasks.migrations import migrate
-from app.tasks.models import AttemptStatus, AttemptTargetType, PlanStatus
+from app.tasks.models import (
+    AttemptStatus,
+    AttemptTargetType,
+    PlanStatus,
+    VerificationTargetType,
+)
+from app.tasks.verification_context import VerificationContext
 from app.tasks.store_context import StoreContext, owns_plan, owns_step, owns_task
 
 
@@ -31,11 +38,16 @@ def _json_default(value: object) -> object:
 class RuntimeUnitOfWork:
     """Project-scoped authority for mandatory durable transitions."""
 
-    def __init__(self, context: StoreContext, *, timeout: float = 5.0) -> None:
-        if not isinstance(context, StoreContext):
-            raise TypeError("RuntimeUnitOfWork requires a StoreContext")
-        self.context = context
-        self.database_path = context.database_path
+    def __init__(
+        self,
+        context: StoreContext | str | Path,
+        *,
+        timeout: float = 5.0,
+    ) -> None:
+        self.context = context if isinstance(context, StoreContext) else None
+        self.database_path = (
+            context.database_path if isinstance(context, StoreContext) else Path(context)
+        )
         self.timeout = timeout
         migrate(self.database_path, timeout=timeout)
 
@@ -70,6 +82,8 @@ class RuntimeUnitOfWork:
             connection.close()
 
     def _require_run(self, connection: sqlite3.Connection, run_id: int) -> None:
+        if self.context is None:
+            raise StateAuthorityError("runtime transitions require a StoreContext")
         row = connection.execute(
             """
             SELECT id FROM agent_runs
@@ -95,6 +109,123 @@ class RuntimeUnitOfWork:
         ).fetchone()
         if status is None or str(status["status"]) != "RUNNING":
             raise StateAuthorityError(f"run {run_id} is not active")
+
+    def finish_verification(
+        self,
+        *,
+        target_type: VerificationTargetType,
+        target_id: int,
+        verification_status: str,
+        evidence: list[str],
+        reason: str | None,
+        context: VerificationContext | None,
+        target_status: str,
+        failure_reason: str | None = None,
+    ) -> int:
+        """Persist evidence and its Task/Step transition atomically."""
+
+        if verification_status == "PASS" and context is None:
+            raise StateAuthorityError(
+                "PASS requires revision-bound verification context"
+            )
+
+        evidence_json = json.dumps(evidence, ensure_ascii=False)
+        context_json = (
+            json.dumps(context.to_dict(), sort_keys=True)
+            if context is not None
+            else None
+        )
+        with self.transaction() as connection:
+            if target_type is VerificationTargetType.TASK:
+                if not owns_task(connection, self.context, target_id):
+                    raise StateAuthorityError(f"unknown task: {target_id}")
+                row = connection.execute(
+                    "SELECT status FROM tasks WHERE id = ?", (target_id,)
+                ).fetchone()
+                if row is None or str(row["status"]) != "VERIFYING":
+                    raise StateAuthorityError(
+                        "task must be VERIFYING before verification completion"
+                    )
+                cursor = connection.execute(
+                    """
+                    INSERT INTO verifications (
+                        task_id, status, reason, evidence_json, context_json
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        target_id,
+                        verification_status,
+                        reason,
+                        evidence_json,
+                        context_json,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE tasks
+                    SET status = ?, verification_status = ?,
+                        verification_evidence_json = ?,
+                        finished_at = CASE
+                            WHEN ? = 'DONE' THEN CURRENT_TIMESTAMP
+                            ELSE finished_at
+                        END,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        target_status,
+                        verification_status,
+                        evidence_json,
+                        target_status,
+                        target_id,
+                    ),
+                )
+            else:
+                if not owns_step(connection, self.context, target_id):
+                    raise StateAuthorityError(f"unknown step: {target_id}")
+                row = connection.execute(
+                    "SELECT status FROM steps WHERE id = ?", (target_id,)
+                ).fetchone()
+                if row is None or str(row["status"]) != "VERIFYING":
+                    raise StateAuthorityError(
+                        "step must be VERIFYING before verification completion"
+                    )
+                cursor = connection.execute(
+                    """
+                    INSERT INTO verifications (
+                        step_id, status, reason, evidence_json, context_json
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        target_id,
+                        verification_status,
+                        reason,
+                        evidence_json,
+                        context_json,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE steps
+                    SET status = ?, verification_status = ?,
+                        verification_evidence_json = ?, failure_reason = ?,
+                        finished_at = CASE
+                            WHEN ? = 'DONE' THEN CURRENT_TIMESTAMP
+                            ELSE finished_at
+                        END,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        target_status,
+                        verification_status,
+                        evidence_json,
+                        failure_reason,
+                        target_status,
+                        target_id,
+                    ),
+                )
+            return int(cursor.lastrowid)
 
     def _insert_snapshot(
         self,

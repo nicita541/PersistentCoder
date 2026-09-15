@@ -357,6 +357,7 @@ class AgentRuntime:
             verification_store=(
                 self.verification_store
             ),
+            state_authority=self.state_authority,
         )
 
         self.replanner = Replanner(
@@ -1352,6 +1353,64 @@ class AgentRuntime:
                 "reason": (
                     "verification did not PASS; "
                     "nothing may be applied"
+                ),
+                "preview": preview,
+            }
+
+        context = getattr(verification, "context", None)
+        environment_ready, environment_reason, environment = (
+            self.command_runner.verification_environment()
+        )
+        environment = {
+            **environment,
+            "python": self.verification_agent.structured.python,
+        }
+        if not environment_ready:
+            return {
+                "applied": [],
+                "reason": (
+                    "verification environment unavailable: "
+                    f"{environment_reason}"
+                ),
+                "preview": preview,
+            }
+        task_id = getattr(state, "active_task_id", None)
+        tasks = []
+        if task_id is not None:
+            task = self.plan_store.get_task(int(task_id))
+            if task is not None:
+                tasks.append(task)
+        else:
+            plan_id = getattr(state, "plan_id", None)
+            if plan_id is not None:
+                tasks.extend(self.plan_store.get_tasks(int(plan_id)))
+
+        trusted = False
+        if context is not None:
+            for task in tasks:
+                records = self.verification_store.get_task_verifications(task.id)
+                durable = records[-1] if records else None
+                if (
+                    task.status.value == "DONE"
+                    and durable is not None
+                    and durable.context == context
+                    and self.verification_store.is_current(
+                        durable,
+                        self.workspace_root,
+                        specs=task.verification_specs,
+                        criteria=task.success_criteria,
+                        environment=environment,
+                    )
+                ):
+                    trusted = True
+                    break
+
+        if not trusted:
+            return {
+                "applied": [],
+                "reason": (
+                    "durable verification evidence is unbound or stale; "
+                    "run verification again"
                 ),
                 "preview": preview,
             }

@@ -204,3 +204,25 @@ def test_command_writes_are_ephemeral(runner):
     assert result.ok, result.stderr
     assert persistent.read_text(encoding="utf-8") == "persistent"
     assert not (runner.sandbox_root / "generated.txt").exists()
+
+
+@pytest.mark.skipif(
+    not DOCKER_AVAILABLE,
+    reason="Docker daemon is not running",
+)
+def test_framework_argv_is_literal_in_real_container(runner):
+    argument = "value; touch PWNED"
+
+    result = runner.run_argv(
+        ["python", "-c", "import sys; print(sys.argv[1])", argument]
+    )
+
+    assert result.ok, result.stderr
+    assert result.stdout.strip() == argument
+    assert not (runner.sandbox_root / "PWNED").exists()
+
+    root_mount = runner.run(
+        "awk '$2 == \"/\" {print $4}' /proc/mounts"
+    )
+    assert root_mount.ok, root_mount.stderr
+    assert "ro" in root_mount.stdout.strip().split(",")

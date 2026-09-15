@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import io
 
 import pytest
 
@@ -9,6 +10,7 @@ from app.sandbox.policy import (
     PolicyViolation,
 )
 from app.sandbox.runner import SandboxCommandRunner
+from app.sandbox.limits import SandboxLimits
 from app.sandbox.workspace import SandboxWorkspace
 
 
@@ -98,6 +100,149 @@ def test_command_policy_allows_relative_command():
         )
         == "https://example.com not-a-drive"
     )
+
+
+def test_framework_argv_keeps_metacharacters_literal(tmp_path):
+    runner = SandboxCommandRunner(sandbox_root=tmp_path)
+    argv = ["python", "-m", "py_compile", "x.py; touch PWNED"]
+
+    arguments = runner.argv_arguments(argv)
+
+    assert arguments[-4:] == argv
+    assert "x.py; touch PWNED" not in arguments[arguments.index("-lc") + 1]
+    assert "--read-only" in arguments
+    assert arguments[arguments.index("--memory-swap") + 1] == runner.memory
+    tmpfs_values = [
+        arguments[index + 1]
+        for index, value in enumerate(arguments)
+        if value == "--tmpfs"
+    ]
+    assert any(value.startswith("/workspace:rw,size=") for value in tmpfs_values)
+    assert any(value.startswith("/tmp:rw,size=") for value in tmpfs_values)
+
+
+def test_admission_control_refuses_excess_command_before_start(tmp_path, monkeypatch):
+    probes = {"daemon": 0, "image": 0}
+
+    def daemon_probe():
+        probes["daemon"] += 1
+        return True
+
+    runner = SandboxCommandRunner(
+        sandbox_root=tmp_path,
+        daemon_probe=daemon_probe,
+        limits=SandboxLimits(max_concurrent_commands=1),
+    )
+    def ensure_image():
+        probes["image"] += 1
+        return True
+
+    monkeypatch.setattr(runner, "ensure_image", ensure_image)
+    assert runner._admission.acquire(blocking=False)
+    try:
+        result = runner.run_argv(["python", "--version"])
+    finally:
+        runner._admission.release()
+
+    assert result.returncode == 125
+    assert "capacity" in result.stderr
+    assert probes == {"daemon": 0, "image": 0}
+
+
+def test_verification_environment_uses_command_admission_slot(tmp_path):
+    probes = {"daemon": 0}
+
+    def daemon_probe():
+        probes["daemon"] += 1
+        return True
+
+    runner = SandboxCommandRunner(
+        sandbox_root=tmp_path,
+        daemon_probe=daemon_probe,
+        limits=SandboxLimits(max_concurrent_commands=1),
+    )
+    assert runner._admission.acquire(blocking=False)
+    try:
+        ready, reason, environment = runner.verification_environment()
+    finally:
+        runner._admission.release()
+
+    assert not ready
+    assert "capacity" in reason
+    assert environment["image_id"] is None
+    assert probes == {"daemon": 0}
+
+
+def test_output_flood_is_killed_while_streaming(tmp_path, monkeypatch):
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = io.BytesIO(b"x" * 4096)
+            self.stderr = io.BytesIO()
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = 122
+
+        def communicate(self, timeout=None):
+            return b"", b""
+
+    process = FakeProcess()
+    runner = SandboxCommandRunner(
+        sandbox_root=tmp_path,
+        daemon_probe=lambda: True,
+        limits=SandboxLimits(max_output_bytes=32),
+    )
+    monkeypatch.setattr(runner, "ensure_image", lambda: True)
+    monkeypatch.setattr("app.sandbox.runner.subprocess.Popen", lambda *a, **k: process)
+    monkeypatch.setattr(
+        "app.sandbox.runner.subprocess.run",
+        lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""),
+    )
+
+    streamed = []
+    result = runner.run_argv(
+        ["python", "-c", "print('x' * 4096)"],
+        on_output=lambda stream, chunk: streamed.append((stream, chunk)),
+    )
+
+    assert result.returncode == 122
+    assert len(result.stdout.encode("utf-8")) <= 32
+    assert sum(
+        len(chunk.encode("utf-8")) for _stream, chunk in streamed
+    ) <= 32
+    assert "output exceeded" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stderr"),
+    [(137, ""), (1, "write failed: No space left on device")],
+)
+def test_container_resource_exhaustion_is_reported_as_blocked_code(
+    tmp_path, monkeypatch, returncode, stderr
+):
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = io.BytesIO()
+            self.stderr = io.BytesIO(stderr.encode())
+            self.returncode = returncode
+
+        def poll(self):
+            return self.returncode
+
+    runner = SandboxCommandRunner(
+        sandbox_root=tmp_path,
+        daemon_probe=lambda: True,
+    )
+    monkeypatch.setattr(runner, "ensure_image", lambda: True)
+    monkeypatch.setattr("app.sandbox.runner.subprocess.Popen", lambda *a, **k: FakeProcess())
+
+    result = runner.run_argv(["python", "check.py"])
+
+    assert result.returncode == 125
+    assert "limit exceeded" in result.stderr
 
 
 def test_sandbox_workspace_snapshot_patch_apply(

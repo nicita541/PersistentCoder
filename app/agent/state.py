@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from enum import Enum
+from app.tasks.verification_context import VerificationContext
 
 
 class AgentPhase(str, Enum):
@@ -158,6 +159,7 @@ class VerificationResult:
     criterion_results: list[CriterionResult] = field(
         default_factory=list
     )
+    context: VerificationContext | None = None
 
 
 @dataclass

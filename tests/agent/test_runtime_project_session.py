@@ -7,6 +7,13 @@ import pytest
 from app.agent.runtime import AgentRuntime, DirtySessionError
 from app.agent.state import AgentPhase, VerificationResult
 from app.agent.session import SessionStatus
+from app.tasks.verification_context import VerificationContext
+from app.tasks.models import (
+    PlanDraft,
+    TaskDraft,
+    TaskStatus,
+    VerificationStatus,
+)
 
 from helpers import (
     FakeLLM,
@@ -139,15 +146,49 @@ def test_apply_rebases_session_to_clean_source(
         encoding="utf-8",
     )
     runtime.last_patch_path = str(runtime.sandbox_workspace.write_patch())
+    environment = {
+        **runtime.command_runner.environment_identity(),
+        "image_id": "sha256:test-image",
+    }
+    runtime.command_runner.verification_environment = lambda: (
+        True,
+        "available",
+        environment,
+    )
+    verification_context = VerificationContext.capture(
+        runtime.workspace_root,
+        specs=[],
+        environment={
+            **environment,
+            "python": runtime.verification_agent.structured.python,
+        },
+    )
+    plan_id = runtime.plan_store.create_plan(
+        PlanDraft(
+            user_request="apply",
+            global_goal="apply",
+            tasks=[TaskDraft(title="apply", description="apply")],
+        )
+    )
+    task = runtime.plan_store.get_tasks(plan_id)[0]
+    runtime.plan_store.update_task_status(task.id, TaskStatus.DONE)
+    runtime.verification_store.record_task(
+        task.id,
+        status=VerificationStatus.PASS,
+        evidence=["verified"],
+        context=verification_context,
+    )
     runtime.last_state = type(
         "VerifiedState",
         (),
         {
             "phase": AgentPhase.DONE,
+            "active_task_id": task.id,
             "verification": VerificationResult(
                 ok=True,
                 status="PASS",
                 reason="verified",
+                context=verification_context,
             ),
         },
     )()

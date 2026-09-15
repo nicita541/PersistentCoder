@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from app.sandbox.project_path import ProjectPath, ProjectPathError
+from app.sandbox.project_path import ProjectGlob, ProjectPath, ProjectPathError
 
 
 @pytest.mark.parametrize(
@@ -60,3 +60,30 @@ def test_project_path_comparison_matches_host_ownership_rules() -> None:
         assert upper.comparison_key == lower.comparison_key
     else:
         assert upper.comparison_key != lower.comparison_key
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "file.txt:secret",
+        "CON",
+        "src/nul.txt",
+        "aux.py",
+        "COM1.log",
+        "CONIN$",
+        "CONOUT$.txt",
+        "COM¹.log",
+        "LPT³",
+        "dir/trailing. ",
+        "dir/file ",
+        "*.py",
+    ],
+)
+def test_windows_ads_and_reserved_names_are_rejected_on_every_host(value):
+    with pytest.raises(ProjectPathError):
+        ProjectPath.parse(value)
+
+
+@pytest.mark.parametrize("value", ["COM[1-9]", "[A-Z]UX", "src/C?N.py"])
+def test_globs_that_can_select_windows_devices_are_rejected(value):
+    with pytest.raises(ProjectPathError):
+        ProjectGlob.parse(value)

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import shlex
 
 from app.agent.state import CriterionResult
 from app.tasks.verification_spec import VerificationKind, VerificationSpec
@@ -75,26 +74,33 @@ class StructuredVerifier:
             return self._ast(spec)
         if spec.kind is VerificationKind.PY_COMPILE:
             return self._command(
-                spec,
-                f"{shlex.quote(self.python)} -m py_compile "
-                f"{shlex.quote(spec.target or '')}",
+                spec, [self.python, "-m", "py_compile", spec.target or ""]
             )
         if spec.kind is VerificationKind.PY_IMPORT:
             module = self._module_name(spec.target or "")
             if not module:
                 return self._result(spec, "BLOCKED", reason="invalid import target")
-            return self._command(spec, f'{self.python} -c "import {module}"')
+            return self._command(spec, [self.python, "-c", f"import {module}"])
         return self._result(spec, "BLOCKED", reason="unsupported verification kind")
 
-    def _command(self, spec: VerificationSpec, command: str) -> CriterionResult:
+    def _command(self, spec: VerificationSpec, argv: list[str]) -> CriterionResult:
         if self.command_runner is None:
             return self._result(spec, "BLOCKED", reason="no sandbox command runner")
-        result = self.command_runner.run(command)
+        run_argv = getattr(self.command_runner, "run_argv", None)
+        if run_argv is None:
+            return self._result(
+                spec, "BLOCKED", reason="command runner lacks framework argv support"
+            )
+        result = run_argv(argv)
         ok = result.returncode == 0
         output = (result.stdout or result.stderr or "")[:400]
+        command = " ".join(argv)
+        status = "PASS" if ok else (
+            "BLOCKED" if result.returncode in {122, 124, 125, 126, 127, 130} else "FAIL"
+        )
         return self._result(
             spec,
-            "PASS" if ok else "FAIL",
+            status,
             reason="" if ok else output or f"command failed: {command}",
             evidence=[f"{command} -> rc={result.returncode}: {output}"],
         )
@@ -123,10 +129,32 @@ class StructuredVerifier:
         if spec.kind is VerificationKind.PY_SIGNATURE:
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 return self._result(spec, "FAIL", reason="symbol has no function signature")
-            actual = [
-                argument.arg
-                for argument in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
-            ]
+            positional = [*node.args.posonlyargs, *node.args.args]
+            default_offset = len(positional) - len(node.args.defaults)
+            actual: list[str] = []
+            for index, argument in enumerate(positional):
+                token = argument.arg
+                if index >= default_offset:
+                    token += "=" + ast.unparse(
+                        node.args.defaults[index - default_offset]
+                    )
+                actual.append(token)
+                if node.args.posonlyargs and index + 1 == len(node.args.posonlyargs):
+                    actual.append("/")
+            if node.args.vararg is not None:
+                actual.append("*" + node.args.vararg.arg)
+            elif node.args.kwonlyargs:
+                actual.append("*")
+            for argument, default in zip(
+                node.args.kwonlyargs,
+                node.args.kw_defaults,
+            ):
+                token = argument.arg
+                if default is not None:
+                    token += "=" + ast.unparse(default)
+                actual.append(token)
+            if node.args.kwarg is not None:
+                actual.append("**" + node.args.kwarg.arg)
             if actual != list(spec.expected_signature):
                 return self._result(
                     spec,
@@ -159,9 +187,5 @@ class StructuredVerifier:
                 "BLOCKED",
                 reason="pytest target required; full suite was not authorized",
             )
-        command = f"{self.python} -m pytest -q"
-        if targets:
-            command += " " + " ".join(
-                shlex.quote(target) for target in targets
-            )
-        return self._command(representative, command)
+        argv = [self.python, "-m", "pytest", "-q", *targets]
+        return self._command(representative, argv)

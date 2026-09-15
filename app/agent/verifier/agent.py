@@ -14,6 +14,7 @@ from app.agent.verifier.evidence import (
 )
 from app.agent.verifier.structured import StructuredVerifier
 from app.tasks.models import TaskStatus
+from app.tasks.verification_context import VerificationContext
 
 
 class VerificationAgent:
@@ -126,6 +127,54 @@ class VerificationAgent:
         step,
         execution: ExecutionResult,
     ) -> VerificationResult:
+        specs = self._specs_for(task, step)
+        criteria = self._criteria_for(task, step)
+        workspace_root = getattr(self.structured.workspace, "root", None)
+        environment_check = getattr(
+            self.structured.command_runner, "verification_environment", None
+        )
+        if callable(environment_check):
+            environment_ready, environment_reason, environment = (
+                environment_check()
+            )
+        else:
+            environment_ready = self.structured.command_runner is not None
+            environment_reason = (
+                "sandbox command runner is unavailable"
+                if not environment_ready
+                else "test runner environment"
+            )
+            environment = {
+                "sandbox": "unavailable" if not environment_ready else "unspecified"
+            }
+        environment = {
+            **environment,
+            "python": self.structured.python,
+        }
+        try:
+            context = VerificationContext.capture(
+                workspace_root,
+                specs=specs,
+                criteria=criteria,
+                environment=environment,
+            )
+        except Exception as error:
+            return VerificationResult(
+                ok=False,
+                status="BLOCKED",
+                reason=f"verification context unavailable: {error}",
+                evidence=[f"verification_context_blocked: {error}"],
+            )
+
+        if not environment_ready:
+            return VerificationResult(
+                ok=False,
+                status="BLOCKED",
+                reason=f"verification environment unavailable: {environment_reason}",
+                evidence=[f"verification_environment_blocked: {environment_reason}"],
+                context=context,
+            )
+
         # Each verification must observe the CURRENT workspace: drop
         # any cached command results from a previous attempt.
         cache = getattr(
@@ -153,10 +202,8 @@ class VerificationAgent:
                 status=base.status,
                 reason=base.reason,
                 evidence=evidence,
+                context=context,
             )
-
-        specs = self._specs_for(task, step)
-        criteria = self._criteria_for(task, step)
 
         # Authoritative pytest scope: the test files this attempt
         # actually changed (never the whole repository by accident).
@@ -176,6 +223,7 @@ class VerificationAgent:
                     "no success criteria declared"
                 ),
                 evidence=evidence,
+                context=context,
             )
 
         if specs:
@@ -240,12 +288,44 @@ class VerificationAgent:
                 seen.add(item)
                 deduped.append(item)
 
+        current_environment = environment
+        current_environment_ready = environment_ready
+        if callable(environment_check):
+            (
+                current_environment_ready,
+                _current_environment_reason,
+                current_environment,
+            ) = environment_check()
+            current_environment = {
+                **current_environment,
+                "python": self.structured.python,
+            }
+
+        if ok and (
+            not current_environment_ready
+            or not context.matches(
+                workspace_root,
+                specs=specs,
+                criteria=criteria,
+                environment=current_environment,
+            )
+        ):
+            return VerificationResult(
+                ok=False,
+                status="BLOCKED",
+                reason="workspace, verification spec, or environment changed during verification",
+                evidence=[*deduped, "verification_context_changed"],
+                criterion_results=results,
+                context=context,
+            )
+
         return VerificationResult(
             ok=ok,
             status=status,
             reason=reason,
             evidence=deduped,
             criterion_results=results,
+            context=context,
         )
 
     def verify_step(
@@ -272,6 +352,7 @@ class VerificationAgent:
                     result.evidence
                     or ["verified"]
                 ),
+                context=result.context,
             )
 
         elif result.status == "BLOCKED":
@@ -279,6 +360,7 @@ class VerificationAgent:
                 step.id,
                 reason=result.reason or "verification blocked",
                 evidence=result.evidence or ["verification_blocked"],
+                context=result.context,
             )
         else:
             self.verifier.fail_step(
@@ -291,6 +373,7 @@ class VerificationAgent:
                     result.evidence
                     or ["verification_failed"]
                 ),
+                context=result.context,
             )
 
         return result
@@ -316,6 +399,7 @@ class VerificationAgent:
                     result.evidence
                     or ["verified"]
                 ),
+                context=result.context,
             )
 
         elif result.status == "BLOCKED":
@@ -323,6 +407,7 @@ class VerificationAgent:
                 task.id,
                 reason=result.reason or "verification blocked",
                 evidence=result.evidence or ["verification_blocked"],
+                context=result.context,
             )
         else:
             self.verifier.fail_task(
@@ -335,6 +420,7 @@ class VerificationAgent:
                     result.evidence
                     or ["verification_failed"]
                 ),
+                context=result.context,
             )
 
         return result

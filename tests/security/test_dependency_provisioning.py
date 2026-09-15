@@ -6,6 +6,7 @@ from app.sandbox.dependencies import (
     DEPENDENCY_IMAGE_PREFIX,
     DependencyResolver,
 )
+import pytest
 from app.sandbox.paths import SANDBOX_IMAGE
 from app.sandbox.runner import SandboxCommandRunner
 
@@ -167,7 +168,7 @@ def test_build_is_blocked_by_default(tmp_path):
 def test_build_uses_framework_generated_context(tmp_path):
     project = _project(
         tmp_path / "project",
-        "pytest==8.0.0\n-e .\n",
+        "pytest==8.0.0\n",
     )
 
     docker = _FakeDocker(build_code=0)
@@ -218,7 +219,7 @@ def test_build_uses_framework_generated_context(tmp_path):
         context / "requirements.txt"
     ).read_text(encoding="utf-8")
 
-    # Only the sanitized line survived.
+    # The fixed context contains only parsed, validated requirements.
     assert requirements == "pytest==8.0.0\n"
 
 
@@ -342,3 +343,129 @@ def test_generated_dependency_dockerfile_has_valid_run_continuations(tmp_path):
     assert "RUN python -m pip install --no-cache-dir \\\n" in dockerfile
     assert "    --disable-pip-version-check \\\n" in dockerfile
     assert "    -r /tmp/requirements.txt \\\n" in dockerfile
+
+
+@pytest.mark.parametrize(
+    ("name", "contents"),
+    [
+        ("pyproject.toml", "[project\ndependencies = ['pytest']\n"),
+        ("setup.cfg", "[options]\ninstall_requires =\n  pytest\n  =broken\n"),
+        ("requirements.txt", "-r nested.txt\n"),
+    ],
+)
+def test_malformed_or_nested_dependency_manifest_blocks_plan(
+    tmp_path, name, contents
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / name).write_text(contents, encoding="utf-8")
+
+    plan = DependencyResolver(
+        cache_root=tmp_path / "deps",
+        allow_build=True,
+        docker_run=_FakeDocker(),
+    ).plan(project)
+
+    assert plan.status == "BLOCKED"
+    assert "manifest" in plan.reason.casefold() or "refused" in plan.reason.casefold()
+
+
+def test_oversized_manifest_is_blocked_without_truncation(tmp_path):
+    project = _project(tmp_path / "project", "pytest==8\n" + "#" * 70_000)
+
+    plan = DependencyResolver(
+        cache_root=tmp_path / "deps",
+        allow_build=True,
+        docker_run=_FakeDocker(),
+    ).plan(project)
+
+    assert plan.status == "BLOCKED"
+    assert "size" in plan.reason.casefold()
+
+
+def test_requirement_count_overflow_is_blocked_not_sliced(tmp_path):
+    requirements = "".join(f"package-{index}==1\n" for index in range(61))
+    project = _project(tmp_path / "project", requirements)
+
+    plan = DependencyResolver(
+        cache_root=tmp_path / "deps",
+        allow_build=True,
+        docker_run=_FakeDocker(),
+    ).plan(project)
+
+    assert plan.status == "BLOCKED"
+    assert "count" in plan.reason.casefold()
+
+
+def test_duplicate_declarations_count_toward_manifest_limit(tmp_path):
+    project = _project(tmp_path / "project", "pytest==8\n" * 61)
+
+    plan = DependencyResolver(
+        cache_root=tmp_path / "deps",
+        allow_build=True,
+        docker_run=_FakeDocker(),
+    ).plan(project)
+
+    assert plan.status == "BLOCKED"
+    assert "count" in plan.reason.casefold()
+
+
+def test_build_system_and_dependency_groups_are_parsed(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(
+        "[build-system]\n"
+        "requires = ['setuptools>=70']\n"
+        "[dependency-groups]\n"
+        "test = ['pytest==8']\n"
+        "[tool.poetry.group.dev.dependencies]\n"
+        "ruff = '0.6.0'\n",
+        encoding="utf-8",
+    )
+
+    spec = DependencyResolver(cache_root=tmp_path / "deps").detect(project)
+
+    assert spec is not None
+    assert spec.requirements == (
+        "setuptools>=70",
+        "pytest==8",
+        "ruff==0.6.0",
+    )
+
+
+def test_unsupported_poetry_dependency_fields_block_plan(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(
+        "[tool.poetry.dependencies]\n"
+        "requests = {version = '^2.31', source = 'private'}\n",
+        encoding="utf-8",
+    )
+
+    plan = DependencyResolver(
+        cache_root=tmp_path / "deps",
+        allow_build=True,
+        docker_run=_FakeDocker(),
+    ).plan(project)
+
+    assert plan.status == "BLOCKED"
+    assert "unsupported" in plan.reason.casefold()
+
+
+@pytest.mark.parametrize("field", ["dependencies", "optional-dependencies"])
+def test_dynamic_project_dependencies_block_plan(tmp_path, field):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(
+        "[project]\n" f"dynamic = ['{field}']\n",
+        encoding="utf-8",
+    )
+
+    plan = DependencyResolver(
+        cache_root=tmp_path / "deps",
+        allow_build=True,
+        docker_run=_FakeDocker(),
+    ).plan(project)
+
+    assert plan.status == "BLOCKED"
+    assert "dynamic" in plan.reason.casefold()

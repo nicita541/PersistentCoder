@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from app.tasks.verification_spec import VerificationSpec
+from app.tasks.verification_context import VerificationContext
 
 
 class TaskStatus(str, Enum):
@@ -229,6 +230,7 @@ class VerificationRecord:
 
     reason: str | None
     evidence: list[str]
+    context: VerificationContext | None
 
     created_at: str
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import configparser
 import hashlib
-import re
 import subprocess
 import tomllib
 from dataclasses import dataclass
@@ -40,19 +40,15 @@ MAX_REQUIREMENTS = 60
 MAX_REQUIREMENT_LINE = 200
 MAX_BUILD_SECONDS = 1_800
 
+
+class DependencyManifestError(ValueError):
+    pass
+
 # A requirement line is accepted only if it is a plain PEP 508
 # requirement: name, optional extras, optional specifiers, optional
 # environment marker. Everything else is refused, so the model can
 # never smuggle a path, a URL, an index override or a pip option
 # into the dependency image.
-_REQUIREMENT_RE = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
-    r"(?:\[[A-Za-z0-9_,.\-]+\])?"
-    r"(?:\s*(?:===|==|~=|!=|<=|>=|<|>)\s*"
-    r"[A-Za-z0-9._*+!\-]+)*"
-    r"(?:\s*;\s*[A-Za-z0-9_.'\"<>=!,:\s\-]+)?$"
-)
-
 DENIED_SUBSTRINGS = (
     "://",
     "file:",
@@ -107,9 +103,15 @@ def _sanitize_requirement(
 
 def _poetry_requirement(name: str, value: object) -> str | None:
     if isinstance(value, dict):
+        unsupported_keys = set(value) - {"version"}
+        if unsupported_keys:
+            raise DependencyManifestError(
+                f"unsupported Poetry dependency fields for {name}: "
+                + ", ".join(sorted(unsupported_keys))
+            )
         value = value.get("version", "*")
     if not isinstance(value, str):
-        return None
+        raise DependencyManifestError(f"invalid Poetry dependency constraint: {name}")
     constraint = value.strip()
     if not constraint or constraint == "*":
         return name
@@ -119,13 +121,18 @@ def _poetry_requirement(name: str, value: object) -> str | None:
         try:
             major = int(parts[0])
         except ValueError:
-            return None
+            raise DependencyManifestError(f"invalid Poetry version constraint: {name}")
         if major > 0:
             upper = f"{major + 1}.0"
         elif len(parts) > 1:
-            upper = f"0.{int(parts[1]) + 1}"
+            try:
+                upper = f"0.{int(parts[1]) + 1}"
+            except ValueError as error:
+                raise DependencyManifestError(
+                    f"invalid Poetry version constraint: {name}"
+                ) from error
         else:
-            return None
+            raise DependencyManifestError(f"invalid Poetry version constraint: {name}")
         return f"{name}>={version},<{upper}"
     if constraint.startswith("~") and not constraint.startswith("~="):
         return f"{name}~={constraint[1:]}"
@@ -191,20 +198,19 @@ class DependencyPlan:
 def _read_requirements_file(
     path: Path,
 ) -> list[str]:
-    text = path.read_text(
-        encoding="utf-8",
-        errors="replace",
-    )
-
-    if len(text.encode("utf-8")) > MAX_MANIFEST_BYTES:
-        text = text[:MAX_MANIFEST_BYTES]
+    raw_bytes = path.read_bytes()
+    if len(raw_bytes) > MAX_MANIFEST_BYTES:
+        raise DependencyManifestError(f"manifest size exceeds limit: {path.name}")
+    try:
+        text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise DependencyManifestError(f"manifest is not UTF-8: {path.name}") from error
 
     lines: list[str] = []
 
     for raw in text.splitlines():
-        if raw.lstrip().startswith("-r"):
+        if not raw.strip() or raw.lstrip().startswith("#"):
             continue
-
         lines.append(raw)
 
     return lines
@@ -213,37 +219,119 @@ def _read_requirements_file(
 def _read_pyproject(
     path: Path,
 ) -> list[str]:
+    raw_bytes = path.read_bytes()
+    if len(raw_bytes) > MAX_MANIFEST_BYTES:
+        raise DependencyManifestError(f"manifest size exceeds limit: {path.name}")
     try:
-        data = tomllib.loads(
-            path.read_text(
-                encoding="utf-8",
-                errors="replace",
-            )
-        )
-
-    except Exception:
-        return []
+        data = tomllib.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise DependencyManifestError(f"malformed dependency manifest: {path.name}") from error
 
     values: list[str] = []
 
     project = data.get("project")
 
+    if project is not None and not isinstance(project, dict):
+        raise DependencyManifestError("project must be a TOML table")
+
     if isinstance(project, dict):
-        for item in project.get("dependencies") or []:
-            values.append(str(item))
+        dynamic = project.get("dynamic") or []
+        if not isinstance(dynamic, list) or not all(
+            isinstance(item, str) for item in dynamic
+        ):
+            raise DependencyManifestError("project.dynamic must be a string list")
+        dynamic_dependencies = {
+            item.casefold()
+            for item in dynamic
+            if item.casefold() in {"dependencies", "optional-dependencies"}
+        }
+        if dynamic_dependencies:
+            fields = ", ".join(sorted(dynamic_dependencies))
+            raise DependencyManifestError(
+                f"dynamic project dependencies are unsupported: {fields}"
+            )
+        declared = project.get("dependencies") or []
+        if not isinstance(declared, list) or not all(isinstance(item, str) for item in declared):
+            raise DependencyManifestError("project.dependencies must be a string list")
+        values.extend(declared)
+        optional = project.get("optional-dependencies") or {}
+        if not isinstance(optional, dict):
+            raise DependencyManifestError("project.optional-dependencies must be a table")
+        for group, items in optional.items():
+            if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
+                raise DependencyManifestError(
+                    f"project.optional-dependencies.{group} must be a string list"
+                )
+            values.extend(items)
 
-    poetry = (
-        data.get("tool", {})
-        .get("poetry", {})
-        .get("dependencies", {})
-    )
+    build_system = data.get("build-system")
+    if build_system is not None:
+        if not isinstance(build_system, dict):
+            raise DependencyManifestError("build-system must be a TOML table")
+        build_requires = build_system.get("requires") or []
+        if not isinstance(build_requires, list) or not all(
+            isinstance(item, str) for item in build_requires
+        ):
+            raise DependencyManifestError(
+                "build-system.requires must be a string list"
+            )
+        values.extend(build_requires)
 
-    if isinstance(poetry, dict):
-        for name, constraint in poetry.items():
-            if str(name).casefold() != "python":
-                requirement = _poetry_requirement(str(name), constraint)
-                if requirement:
-                    values.append(requirement)
+    dependency_groups = data.get("dependency-groups", {})
+    if not isinstance(dependency_groups, dict):
+        raise DependencyManifestError("dependency-groups must be a TOML table")
+    for group, items in dependency_groups.items():
+        if not isinstance(items, list) or not all(
+            isinstance(item, str) for item in items
+        ):
+            raise DependencyManifestError(
+                f"dependency-groups.{group} contains unsupported declarations"
+            )
+        values.extend(items)
+
+    tool = data.get("tool", {})
+    if not isinstance(tool, dict):
+        raise DependencyManifestError("tool must be a TOML table")
+    poetry_table = tool.get("poetry", {})
+    if not isinstance(poetry_table, dict):
+        raise DependencyManifestError("tool.poetry must be a TOML table")
+    poetry = poetry_table.get("dependencies", {})
+    if not isinstance(poetry, dict):
+        raise DependencyManifestError("tool.poetry.dependencies must be a TOML table")
+
+    for name, constraint in poetry.items():
+        if str(name).casefold() != "python":
+            requirement = _poetry_requirement(str(name), constraint)
+            if requirement:
+                values.append(requirement)
+
+    legacy_dev = poetry_table.get("dev-dependencies", {})
+    if not isinstance(legacy_dev, dict):
+        raise DependencyManifestError(
+            "tool.poetry.dev-dependencies must be a TOML table"
+        )
+    for name, constraint in legacy_dev.items():
+        requirement = _poetry_requirement(str(name), constraint)
+        if requirement:
+            values.append(requirement)
+
+    poetry_groups = poetry_table.get("group", {})
+    if not isinstance(poetry_groups, dict):
+        raise DependencyManifestError("tool.poetry.group must be a TOML table")
+    for group, group_table in poetry_groups.items():
+        if not isinstance(group_table, dict):
+            raise DependencyManifestError(
+                f"tool.poetry.group.{group} must be a TOML table"
+            )
+        group_dependencies = group_table.get("dependencies", {})
+        if not isinstance(group_dependencies, dict):
+            raise DependencyManifestError(
+                f"tool.poetry.group.{group}.dependencies must be a TOML table"
+            )
+        for name, constraint in group_dependencies.items():
+            requirement = _poetry_requirement(str(name), constraint)
+            if requirement:
+                values.append(requirement)
 
     return values
 
@@ -251,25 +339,31 @@ def _read_pyproject(
 def _read_setup_cfg(
     path: Path,
 ) -> list[str]:
-    text = path.read_text(
-        encoding="utf-8",
-        errors="replace",
-    )
-
-    match = re.search(
-        r"install_requires\s*=\s*\n"
-        r"((?:[ \t]+\S.*\n?)+)",
-        text,
-    )
-
-    if not match:
-        return []
-
-    return [
-        line.strip()
-        for line in match.group(1).splitlines()
-        if line.strip()
-    ]
+    raw_bytes = path.read_bytes()
+    if len(raw_bytes) > MAX_MANIFEST_BYTES:
+        raise DependencyManifestError(f"manifest size exceeds limit: {path.name}")
+    try:
+        text = raw_bytes.decode("utf-8")
+        parser = configparser.ConfigParser(interpolation=None, strict=True)
+        parser.read_string(text)
+    except (UnicodeDecodeError, configparser.Error) as error:
+        raise DependencyManifestError(f"malformed dependency manifest: {path.name}") from error
+    if not parser.has_option("options", "install_requires"):
+        values: list[str] = []
+    else:
+        values = [
+            line.strip()
+            for line in parser.get("options", "install_requires").splitlines()
+            if line.strip()
+        ]
+    if parser.has_section("options.extras_require"):
+        for _group, declared in parser.items("options.extras_require"):
+            values.extend(
+                line.strip()
+                for line in declared.splitlines()
+                if line.strip()
+            )
+    return values
 
 
 class DependencyResolver:
@@ -385,6 +479,7 @@ class DependencyResolver:
         if not manifests and not unsupported:
             return None
 
+        accepted_declarations = 0
         for label, raw in raw_lines:
             safe = _sanitize_requirement(raw)
 
@@ -392,14 +487,20 @@ class DependencyResolver:
                 refused.append(label)
                 continue
 
+            accepted_declarations += 1
+
             if safe not in requirements:
                 requirements.append(safe)
 
+        if accepted_declarations > MAX_REQUIREMENTS:
+            refused.append(
+                "dependency count exceeds limit "
+                f"({accepted_declarations} > {MAX_REQUIREMENTS})"
+            )
+
         return DependencySpec(
             manifests=tuple(manifests),
-            requirements=tuple(
-                requirements[:MAX_REQUIREMENTS]
-            ),
+            requirements=tuple(requirements),
             refused=tuple(refused),
             unsupported=tuple(unsupported),
         )
@@ -535,13 +636,33 @@ class DependencyResolver:
         self,
         workspace_root: str | Path,
     ) -> DependencyPlan:
-        spec = self.detect(workspace_root)
+        try:
+            spec = self.detect(workspace_root)
+        except (DependencyManifestError, OSError) as error:
+            return DependencyPlan(
+                image=self.base_image,
+                status="BLOCKED",
+                reason=str(error),
+            )
 
         if spec is None:
             return DependencyPlan(
                 image=self.base_image,
                 status="NONE",
                 reason="no dependency manifests found",
+            )
+
+        if spec.refused or spec.unsupported:
+            details = "; ".join((*spec.refused, *spec.unsupported))[:800]
+            return DependencyPlan(
+                image=self.base_image,
+                status="BLOCKED",
+                reason=(
+                    "dependency manifest refused: "
+                    f"{len(spec.refused)} refused, "
+                    f"{len(spec.unsupported)} unsupported: {details}"
+                ),
+                spec=spec,
             )
 
         if not spec.has_requirements:

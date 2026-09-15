@@ -18,6 +18,8 @@ from app.tasks.store_context import (
     owns_task,
     split_store_binding,
 )
+from app.tasks.verification_context import VerificationContext
+from app.tasks.migrations import migrate
 
 
 class VerificationStore:
@@ -57,71 +59,7 @@ class VerificationStore:
     def _initialize_database(
         self,
     ) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS
-                    verifications (
-                        id INTEGER
-                            PRIMARY KEY AUTOINCREMENT,
-
-                        task_id INTEGER,
-
-                        step_id INTEGER,
-
-                        status TEXT
-                            NOT NULL,
-
-                        reason TEXT,
-
-                        evidence_json TEXT
-                            NOT NULL
-                            DEFAULT '[]',
-
-                        created_at DATETIME
-                            NOT NULL
-                            DEFAULT CURRENT_TIMESTAMP,
-
-                        CHECK (
-                            (
-                                task_id IS NOT NULL
-                                AND step_id IS NULL
-                            )
-                            OR
-                            (
-                                task_id IS NULL
-                                AND step_id IS NOT NULL
-                            )
-                        ),
-
-                        FOREIGN KEY (task_id)
-                            REFERENCES tasks(id)
-                            ON DELETE CASCADE,
-
-                        FOREIGN KEY (step_id)
-                            REFERENCES steps(id)
-                            ON DELETE CASCADE
-                    )
-                """
-            )
-
-            connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS
-                    idx_verifications_task
-
-                ON verifications(task_id)
-                """
-            )
-
-            connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS
-                    idx_verifications_step
-
-                ON verifications(step_id)
-                """
-            )
+        migrate(self.database_path)
 
     @staticmethod
     def _dump_list(
@@ -194,6 +132,10 @@ class VerificationStore:
             evidence=self._load_list(
                 row["evidence_json"]
             ),
+            context=(
+                VerificationContext.from_dict(json.loads(row["context_json"]))
+                if row["context_json"] else None
+            ),
             created_at=str(
                 row["created_at"]
             ),
@@ -207,6 +149,7 @@ class VerificationStore:
         status: VerificationStatus,
         evidence: list[str],
         reason: str | None,
+        context: VerificationContext | None,
     ) -> VerificationRecord:
         column = (
             "task_id"
@@ -232,9 +175,10 @@ class VerificationStore:
                     {column},
                     status,
                     reason,
-                    evidence_json
+                    evidence_json,
+                    context_json
                 )
-                VALUES (?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 (
                     target_id,
@@ -242,6 +186,10 @@ class VerificationStore:
                     reason,
                     self._dump_list(
                         evidence
+                    ),
+                    (
+                        json.dumps(context.to_dict(), sort_keys=True)
+                        if context is not None else None
                     ),
                 ),
             )
@@ -274,6 +222,7 @@ class VerificationStore:
         status: VerificationStatus,
         evidence: list[str],
         reason: str | None = None,
+        context: VerificationContext | None = None,
     ) -> VerificationRecord:
         return self._record(
             target_type=(
@@ -283,6 +232,7 @@ class VerificationStore:
             status=status,
             evidence=evidence,
             reason=reason,
+            context=context,
         )
 
     def record_task(
@@ -292,6 +242,7 @@ class VerificationStore:
         status: VerificationStatus,
         evidence: list[str],
         reason: str | None = None,
+        context: VerificationContext | None = None,
     ) -> VerificationRecord:
         return self._record(
             target_type=(
@@ -301,6 +252,7 @@ class VerificationStore:
             status=status,
             evidence=evidence,
             reason=reason,
+            context=context,
         )
 
     def get_step_verifications(
@@ -352,3 +304,23 @@ class VerificationStore:
             self._row_to_record(row)
             for row in rows
         ]
+
+    @staticmethod
+    def is_current(
+        record: VerificationRecord,
+        workspace_root: str | Path,
+        *,
+        specs,
+        criteria=(),
+        environment: dict[str, object],
+    ) -> bool:
+        return bool(
+            record.status is VerificationStatus.PASS
+            and record.context is not None
+            and record.context.matches(
+                workspace_root,
+                specs=specs,
+                criteria=criteria,
+                environment=environment,
+            )
+        )

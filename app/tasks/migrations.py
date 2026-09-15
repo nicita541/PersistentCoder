@@ -96,10 +96,48 @@ def _file_journal(connection: sqlite3.Connection) -> None:
     )
 
 
+def _verification_context(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS verifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER,
+            step_id INTEGER,
+            status TEXT NOT NULL,
+            reason TEXT,
+            evidence_json TEXT NOT NULL DEFAULT '[]',
+            context_json TEXT,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CHECK (
+                (task_id IS NOT NULL AND step_id IS NULL)
+                OR (task_id IS NULL AND step_id IS NOT NULL)
+            ),
+            FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+            FOREIGN KEY (step_id) REFERENCES steps(id) ON DELETE CASCADE
+        )
+        """
+    )
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(verifications)").fetchall()
+    }
+    if "context_json" not in columns:
+        connection.execute("ALTER TABLE verifications ADD COLUMN context_json TEXT")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_verifications_task "
+        "ON verifications(task_id)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_verifications_step "
+        "ON verifications(step_id)"
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (1, "agent state snapshots", _state_snapshots),
     (2, "repair budget ledger", _budget_ledger),
     (3, "file operation journal", _file_journal),
+    (4, "revision-bound verification context", _verification_context),
 )
 
 

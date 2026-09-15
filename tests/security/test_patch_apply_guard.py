@@ -9,6 +9,13 @@ from app.agent.state import (
     AgentPhase,
     VerificationResult,
 )
+from app.tasks.verification_context import VerificationContext
+from app.tasks.models import (
+    PlanDraft,
+    TaskDraft,
+    TaskStatus,
+    VerificationStatus,
+)
 
 from helpers import (
     FakeLLM,
@@ -51,6 +58,25 @@ def _runtime(project: Path, database: Path) -> AgentRuntime:
     )
 
 
+def _record_trusted_pass(runtime: AgentRuntime, context: VerificationContext) -> int:
+    plan_id = runtime.plan_store.create_plan(
+        PlanDraft(
+            user_request="apply",
+            global_goal="apply",
+            tasks=[TaskDraft(title="apply", description="apply")],
+        )
+    )
+    task = runtime.plan_store.get_tasks(plan_id)[0]
+    runtime.plan_store.update_task_status(task.id, TaskStatus.DONE)
+    runtime.verification_store.record_task(
+        task.id,
+        status=VerificationStatus.PASS,
+        evidence=["verified"],
+        context=context,
+    )
+    return task.id
+
+
 def _tree(root: Path) -> dict[str, str]:
     return {
         str(path.relative_to(root)): path.read_text(
@@ -85,6 +111,28 @@ def test_a_successful_run_never_touches_the_project(tmp_path):
     assert (
         Path(runtime.workspace_root) / "artifact.txt"
     ).exists()
+
+
+def test_apply_accepts_the_current_durable_task_verification(tmp_path):
+    project = _project(tmp_path / "project")
+    runtime = _runtime(project, tmp_path / "pc.db")
+    environment = {
+        **runtime.command_runner.environment_identity(),
+        "image_id": "sha256:test-image",
+    }
+    runtime.command_runner.verification_environment = lambda: (
+        True,
+        "available",
+        environment,
+    )
+
+    state = runtime.run("Создай artifact.txt")
+    assert state.phase is AgentPhase.DONE
+
+    result = runtime.apply_patch(confirmed=True)
+
+    assert "artifact.txt" in result["applied"], result
+    assert (project / "artifact.txt").exists()
 
 
 def test_apply_requires_explicit_confirmation(tmp_path):
@@ -205,12 +253,33 @@ def test_apply_targets_source_project_not_module_project_root(
         patch
     )
 
+    environment = {
+        **runtime.command_runner.environment_identity(),
+        "image_id": "sha256:test-image",
+    }
+    runtime.command_runner.verification_environment = lambda: (
+        True,
+        "available",
+        environment,
+    )
+    verification_context = VerificationContext.capture(
+        runtime.workspace_root,
+        specs=[],
+        environment={
+            **environment,
+            "python": runtime.verification_agent.structured.python,
+        },
+    )
+    task_id = _record_trusted_pass(runtime, verification_context)
+
     runtime.last_state = SimpleNamespace(
         phase=AgentPhase.DONE,
+        active_task_id=task_id,
         verification=VerificationResult(
             ok=True,
             status="PASS",
             reason="all criteria passed",
+            context=verification_context,
         ),
     )
     assert runtime.session is not None
@@ -264,3 +333,56 @@ def test_apply_targets_source_project_not_module_project_root(
     ).read_text(
         encoding="utf-8"
     ) == "SECRET=host-only\n"
+
+
+def test_apply_rejects_stale_verification_after_workspace_change(tmp_path):
+    project = _project(tmp_path / "project")
+    runtime = _runtime(project, tmp_path / "pc.db")
+    workspace = Path(runtime.workspace_root)
+    (workspace / "src" / "app.py").write_text(
+        "VALUE = 2\n", encoding="utf-8"
+    )
+    patch = runtime.sandbox_workspace.write_patch()
+    assert patch is not None
+    environment = {
+        **runtime.command_runner.environment_identity(),
+        "image_id": "sha256:test-image",
+    }
+    runtime.command_runner.verification_environment = lambda: (
+        True,
+        "available",
+        environment,
+    )
+    context = VerificationContext.capture(
+        workspace,
+        specs=[],
+        environment={
+            **environment,
+            "python": runtime.verification_agent.structured.python,
+        },
+    )
+    task_id = _record_trusted_pass(runtime, context)
+    runtime.last_patch_path = str(patch)
+    runtime.last_state = SimpleNamespace(
+        phase=AgentPhase.DONE,
+        active_task_id=task_id,
+        verification=VerificationResult(
+            ok=True,
+            status="PASS",
+            reason="verified",
+            context=context,
+        ),
+    )
+    assert runtime.session is not None
+    runtime.session.transition(SessionStatus.RUNNING)
+    runtime.session.transition(SessionStatus.DIRTY_VERIFIED)
+    runtime.session = runtime.session_store.update(runtime.session)
+
+    (workspace / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    result = runtime.apply_patch(confirmed=True)
+
+    assert result["applied"] == []
+    assert "stale" in str(result["reason"])
+    assert (project / "src" / "app.py").read_text(
+        encoding="utf-8"
+    ) == "VALUE = 1\n"

@@ -161,6 +161,20 @@ class CriterionEvaluator:
 
         return ok, output
 
+    def _run_argv(self, argv: list[str]) -> tuple[bool, str, int]:
+        key = "argv:" + repr(argv)
+        if key in self._command_cache:
+            ok, output = self._command_cache[key]
+            return ok, output, 0 if ok else 1
+        runner = getattr(self.command_runner, "run_argv", None)
+        if runner is None:
+            return False, "command runner lacks framework argv support", 127
+        result = runner(argv)
+        output = (result.stdout or result.stderr or "").strip()[:400]
+        ok = result.returncode == 0
+        self._command_cache[key] = (ok, output)
+        return ok, output, result.returncode
+
     @staticmethod
     def _file_token(
         text: str,
@@ -308,13 +322,13 @@ class CriterionEvaluator:
                 reason=f"file missing: {path}",
             )
 
-        ok, output = self._run(
-            f'{self.python} -m py_compile "{path}"'
+        ok, output, code = self._run_argv(
+            [self.python, "-m", "py_compile", path]
         )
 
         return CriterionResult(
             criterion=criterion,
-            status="PASS" if ok else "FAIL",
+            status="PASS" if ok else ("BLOCKED" if code in {122,124,125,126,127,130} else "FAIL"),
             check="py_compile",
             evidence=[
                 f"py_compile {path}: "
@@ -361,13 +375,13 @@ class CriterionEvaluator:
                 reason="no module name in criterion",
             )
 
-        ok, output = self._run(
-            f'{self.python} -c "import {module}"'
+        ok, output, code = self._run_argv(
+            [self.python, "-c", f"import {module}"]
         )
 
         return CriterionResult(
             criterion=criterion,
-            status="PASS" if ok else "FAIL",
+            status="PASS" if ok else ("BLOCKED" if code in {122,124,125,126,127,130} else "FAIL"),
             check="import",
             evidence=[
                 f"import {module}: "
@@ -450,16 +464,14 @@ class CriterionEvaluator:
         if not target:
             target = self._default_test_target()
 
-        command = f"{self.python} -m pytest -q"
-
+        argv = [self.python, "-m", "pytest", "-q"]
         if target:
-            command += f' "{target}"'
-
-        ok, output = self._run(command)
+            argv.append(target)
+        ok, output, code = self._run_argv(argv)
 
         return CriterionResult(
             criterion=criterion,
-            status="PASS" if ok else "FAIL",
+            status="PASS" if ok else ("BLOCKED" if code in {122,124,125,126,127,130} else "FAIL"),
             check="pytest",
             evidence=[
                 f"pytest rc={0 if ok else 1}: "
