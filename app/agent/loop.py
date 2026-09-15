@@ -27,9 +27,11 @@ class AgentLoop:
         controller,
         *,
         max_iterations: int = 1000,
+        on_transition=None,
     ) -> None:
         self.controller = controller
         self.max_iterations = max_iterations
+        self.on_transition = on_transition
 
     def run(
         self,
@@ -40,6 +42,8 @@ class AgentLoop:
         )
 
         state.record_phase()
+        if self.on_transition is not None:
+            self.on_transition(state)
 
         iterations = 0
 
@@ -76,6 +80,8 @@ class AgentLoop:
                 )
 
             state.record_phase()
+            if self.on_transition is not None and not state.is_terminal:
+                self.on_transition(state)
 
         if state.phase is AgentPhase.DONE:
             self.controller.remember(state)

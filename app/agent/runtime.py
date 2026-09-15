@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import time
 from pathlib import Path
 
@@ -61,6 +62,12 @@ from app.sandbox.dependencies import (
     DependencyResolver,
 )
 from app.sandbox.workspace import SandboxWorkspace
+from app.agent.durable_attempts import (
+    AttemptRecoveryError,
+    DirectWorkspaceCheckpoints,
+    DurableAttemptCoordinator,
+)
+from app.tasks.unit_of_work import RuntimeUnitOfWork
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -146,16 +153,35 @@ class AgentRuntime:
         self.last_patch_path: str | None = None
         self.runtime_store = RuntimeStore(self.store_context)
         self.session_store = SessionStore(self.store_context)
+        # Mandatory state tables must exist before interrupted runs are
+        # inspected, because recovery itself is a durable transition.
+        self.plan_store = PlanStore(self.store_context)
+        self.step_store = StepStore(self.store_context)
+        self.attempt_store = AttemptStore(self.store_context)
+        self.state_authority = RuntimeUnitOfWork(self.store_context)
         self.interrupted_runs = (
             self.runtime_store.recover_interrupted()
         )
+        interrupted_ids = {
+            int(run["id"]) for run in self.interrupted_runs
+        }
+        for journal in self.state_authority.list_recovery_journals():
+            journal_run_id = int(journal["run_id"])
+            if journal_run_id in interrupted_ids:
+                continue
+            journal_run = self.runtime_store.get_run(journal_run_id)
+            if journal_run is not None:
+                self.interrupted_runs.append(journal_run)
+                interrupted_ids.add(journal_run_id)
 
         self.current_run_id: int | None = None
         self.last_run_id: int | None = None
+        self._last_durable_state = None
 
         self.resumed_run_id: int | None = None
         self.resumed_session_id: str | None = None
         self.recovery: list[dict[str, object]] = []
+        self.direct_checkpoint_workspace = None
 
         if workspace_root is None:
             # Production: agents edit a sandbox snapshot,
@@ -189,6 +215,20 @@ class AgentRuntime:
             self.workspace_root = Path(
                 workspace_root
             ).resolve()
+            direct_session_id = (
+                f"direct-{self.project_identity.project_id[:24]}"
+            )
+            self.direct_checkpoint_workspace = DirectWorkspaceCheckpoints(
+                self.workspace_root,
+                self.project_storage.snapshots_root
+                / direct_session_id
+                / "checkpoints",
+                session_id=direct_session_id,
+                preserve=(self.database_path,),
+            )
+            self.recovery = self.recover_sandboxes(
+                resume=resume_interrupted
+            )
 
         if self.sandbox_workspace is not None:
             self.session_id: str | None = (
@@ -208,7 +248,11 @@ class AgentRuntime:
                     raise RuntimeError("agent session was not created")
 
         else:
-            self.session_id = None
+            self.session_id = (
+                self.direct_checkpoint_workspace.session_id
+                if self.direct_checkpoint_workspace is not None
+                else None
+            )
             self.session = None
 
         self.events.subscribe(self._persist_event)
@@ -279,14 +323,20 @@ class AgentRuntime:
         # TASK OS (single)
         # ==================================
 
-        self.plan_store = PlanStore(
-            self.store_context
-        )
-        self.step_store = StepStore(
-            self.store_context
-        )
-        self.attempt_store = AttemptStore(
-            self.store_context
+        self.attempt_coordinator = (
+            DurableAttemptCoordinator(
+                authority=self.state_authority,
+                workspace=(
+                    self.sandbox_workspace
+                    or self.direct_checkpoint_workspace
+                ),
+                run_id=lambda: self.current_run_id,
+            )
+            if (
+                self.sandbox_workspace is not None
+                or self.direct_checkpoint_workspace is not None
+            )
+            else None
         )
         self.verification_store = (
             VerificationStore(
@@ -479,6 +529,8 @@ class AgentRuntime:
             events=self.events,
             sandbox_workspace=self.sandbox_workspace,
             attempt_store=self.attempt_store,
+            attempt_coordinator=self.attempt_coordinator,
+            budget_consumer=self._consume_budget,
             max_step_attempts=max_step_attempts,
             max_task_attempts=max_task_attempts,
             dependency_plan=self.dependency_plan,
@@ -486,6 +538,7 @@ class AgentRuntime:
 
         # Last finished AgentState (CLI: /status, /patch, /apply).
         self.last_state = None
+        self._last_durable_state = None
 
         # Finish the crash-recovery bookkeeping now that the
         # AttemptStore exists: an attempt that was IN_PROGRESS when
@@ -518,6 +571,7 @@ class AgentRuntime:
         for run in self.interrupted_runs:
             run_id = int(run["id"])
             session_id = run.get("sandbox_session_id")
+            journals = self.state_authority.list_recovery_journals(run_id)
 
             record: dict[str, object] = {
                 "run_id": run_id,
@@ -529,29 +583,46 @@ class AgentRuntime:
             }
 
             if not session_id:
+                if journals:
+                    raise AttemptRecoveryError(
+                        f"pending journal for run {run_id} has no sandbox session"
+                    )
                 record["note"] = (
                     "no sandbox session recorded; "
                     "nothing to restore"
                 )
 
             else:
-                try:
-                    workspace = (
-                        SandboxWorkspace.open_session(
+                if (
+                    self.direct_checkpoint_workspace is not None
+                    and str(session_id)
+                    == self.direct_checkpoint_workspace.session_id
+                ):
+                    workspace = self.direct_checkpoint_workspace
+                else:
+                    try:
+                        workspace = SandboxWorkspace.open_session(
                             str(session_id),
                             identity=self.project_identity,
                             storage=self.project_storage,
                         )
-                    )
-
-                except Exception as error:
-                    workspace = None
-                    record["note"] = (
-                        "sandbox recovery error: "
-                        f"{error}"
-                    )
+                    except Exception as error:
+                        if journals:
+                            raise AttemptRecoveryError(
+                                "cannot open sandbox with pending journal: "
+                                f"{error}"
+                            ) from error
+                        workspace = None
+                        record["note"] = (
+                            "sandbox recovery error: "
+                            f"{error}"
+                        )
 
                 if workspace is None:
+                    if journals:
+                        raise AttemptRecoveryError(
+                            "pending journal sandbox is unavailable"
+                        )
                     if not record["note"]:
                         record["note"] = (
                             "sandbox session is gone; "
@@ -559,16 +630,31 @@ class AgentRuntime:
                         )
 
                 else:
-                    label = (
-                        run.get("checkpoint_id")
-                        or workspace.latest_checkpoint()
-                    )
-
-                    restored = (
-                        workspace.rollback(label)
-                        if label
-                        else False
-                    )
+                    if journals:
+                        coordinator = DurableAttemptCoordinator(
+                            authority=self.state_authority,
+                            workspace=workspace,
+                            run_id=lambda: run_id,
+                        )
+                        reconciled = [
+                            coordinator.recover(journal)
+                            for journal in journals
+                        ]
+                        restored = any(
+                            bool(item.get("rolled_back"))
+                            for item in reconciled
+                        )
+                        label = str(journals[-1]["checkpoint_id"])
+                    else:
+                        label = (
+                            run.get("checkpoint_id")
+                            or workspace.latest_checkpoint()
+                        )
+                        restored = (
+                            workspace.rollback(label)
+                            if label
+                            else False
+                        )
 
                     record.update(
                         {
@@ -604,9 +690,8 @@ class AgentRuntime:
                     ):
                         # Continue in the restored sandbox instead of
                         # silently starting from a fresh copy.
-                        self.sandbox_workspace = (
-                            workspace
-                        )
+                        if workspace is not self.direct_checkpoint_workspace:
+                            self.sandbox_workspace = workspace
 
                         self.workspace_root = (
                             workspace.workspace_root
@@ -619,14 +704,10 @@ class AgentRuntime:
 
                         record["resumed"] = True
 
-            try:
-                self.runtime_store.set_recovery_note(
-                    run_id,
-                    str(record["note"]),
-                )
-
-            except Exception:
-                pass
+            self.runtime_store.set_recovery_note(
+                run_id,
+                str(record["note"]),
+            )
 
             recovered.append(record)
 
@@ -651,31 +732,27 @@ class AgentRuntime:
             if attempt_id is None:
                 continue
 
-            try:
-                attempt = self.attempt_store.get_attempt(
-                    int(attempt_id)
+            attempt = self.attempt_store.get_attempt(
+                int(attempt_id)
+            )
+
+            if attempt is None:
+                continue
+
+            if (
+                attempt.status
+                is AttemptStatus.IN_PROGRESS
+            ):
+                self.attempt_store.finish_attempt(
+                    int(attempt_id),
+                    status=AttemptStatus.BLOCKED,
+                    failure_reason=(
+                        "interrupted by process crash "
+                        "(recovered on restart)"
+                    ),
                 )
 
-                if attempt is None:
-                    continue
-
-                if (
-                    attempt.status
-                    is AttemptStatus.IN_PROGRESS
-                ):
-                    self.attempt_store.finish_attempt(
-                        int(attempt_id),
-                        status=AttemptStatus.BLOCKED,
-                        failure_reason=(
-                            "interrupted by process crash "
-                            "(recovered on restart)"
-                        ),
-                    )
-
-                    blocked.append(int(attempt_id))
-
-            except Exception:
-                continue
+                blocked.append(int(attempt_id))
 
         return blocked
 
@@ -773,6 +850,9 @@ class AgentRuntime:
         return self.session
 
     def run(self, request: str):
+        request = (request or "").strip()
+        if not request:
+            raise ValueError("request required")
         if (
             self.session is not None
             and self.session.status is not SessionStatus.CLEAN
@@ -781,9 +861,13 @@ class AgentRuntime:
                 f"session is not clean: {self.session.status.value}"
             )
 
-        run_id = self.runtime_store.start_run(
+        run_id, session_version = self.state_authority.start_run(
             request,
             sandbox_session_id=self.session_id,
+            session_id=self.session.id if self.session is not None else None,
+            session_version=(
+                self.session.version if self.session is not None else None
+            ),
         )
         self.current_run_id = run_id
         self.last_run_id = run_id
@@ -791,22 +875,50 @@ class AgentRuntime:
 
         try:
             if self.session is not None:
-                self.session.transition(SessionStatus.RUNNING)
+                self.session.status = SessionStatus.RUNNING
                 self.session.active_run_id = run_id
-                self._save_session()
+                self.session.version = int(session_version)
 
-            state = AgentLoop(self.controller).run(
+            state = AgentLoop(
+                self.controller,
+                on_transition=self._persist_state,
+            ).run(
                 request
             )
 
-        except Exception:
-            # Crash/interrupt during the run: never DONE.
-            self.runtime_store.finish_run(
-                run_id,
-                RUN_INTERRUPTED,
-            )
-            self._settle_session_after_run(succeeded=False)
+        except Exception as run_error:
+            recovery_error = None
+            if self.attempt_coordinator is not None:
+                try:
+                    self.attempt_coordinator.recover_pending(run_id)
+                except Exception as error:
+                    recovery_error = error
+            interrupted_state = self._last_durable_state
+            if interrupted_state is not None:
+                if recovery_error is None:
+                    interrupted_state.attempt_id = None
+                    interrupted_state.checkpoint_id = None
+                interrupted_state.phase = AgentPhase.FAILED
+                interrupted_state.completion = "FAILED"
+                self._finish_terminal_state(
+                    interrupted_state,
+                    run_status=RUN_INTERRUPTED,
+                    succeeded=False,
+                )
+            else:
+                interrupted_state = AgentState(
+                    request=request,
+                    phase=AgentPhase.FAILED,
+                    completion="FAILED",
+                )
+                self._finish_terminal_state(
+                    interrupted_state,
+                    run_status=RUN_INTERRUPTED,
+                    succeeded=False,
+                )
             self.current_run_id = None
+            if recovery_error is not None:
+                raise recovery_error from run_error
             raise
 
         self.last_patch_path = None
@@ -829,27 +941,10 @@ class AgentRuntime:
             else RUN_FAILED
         )
 
-        if state.plan_id is not None:
-            self.plan_store.set_plan_status(
-                state.plan_id,
-                PlanStatus.DONE
-                if state.phase is AgentPhase.DONE
-                else PlanStatus.FAILED,
-            )
-
-        self.runtime_store.update_run(
-            run_id,
-            phase=state.phase.value,
-            plan_id=state.plan_id,
-            task_id=None,
-            step_id=None,
-            attempt_id=None,
-            checkpoint_id=None,
-        )
-
-        self.runtime_store.finish_run(run_id, status)
-        self._settle_session_after_run(
-            succeeded=state.phase is AgentPhase.DONE
+        self._finish_terminal_state(
+            state,
+            run_status=status,
+            succeeded=state.phase is AgentPhase.DONE,
         )
         self.current_run_id = None
         self.last_state = state
@@ -1332,30 +1427,6 @@ class AgentRuntime:
                 int(time.time() * 1000),
             )
 
-            cursor: dict[str, object] = {}
-            for payload_key, cursor_key in (
-                ("plan_id", "plan_id"),
-                ("task_id", "task_id"),
-                ("step_id", "step_id"),
-                ("attempt_id", "attempt_id"),
-                ("checkpoint", "checkpoint_id"),
-            ):
-                if payload_key in payload:
-                    cursor[cursor_key] = payload[payload_key]
-
-            if event.name in (
-                "plan",
-                "execute",
-                "verify",
-                "repair",
-            ):
-                cursor["phase"] = event.name.upper()
-
-            self.runtime_store.update_run(
-                run_id,
-                **cursor,
-            )
-
             self.runtime_store.log_event(
                 run_id,
                 event.name,
@@ -1368,6 +1439,64 @@ class AgentRuntime:
 
         except Exception:
             pass
+
+    def _persist_state(self, state) -> None:
+        run_id = self.current_run_id
+        if run_id is None:
+            raise RuntimeError("cannot persist state without an active run")
+        self.state_authority.persist_state(run_id, state)
+        self._last_durable_state = copy.deepcopy(state)
+
+    def _consume_budget(self, scope: str, target_id: int, limit: int) -> int:
+        run_id = self.current_run_id
+        if run_id is None:
+            raise RuntimeError("cannot consume budget without an active run")
+        return self.state_authority.consume_budget(
+            run_id, scope, target_id, limit=limit
+        )
+
+    def _finish_terminal_state(
+        self, state, *, run_status: str, succeeded: bool
+    ) -> None:
+        run_id = self.current_run_id
+        if run_id is None:
+            raise RuntimeError("cannot finish without an active run")
+        session_status = None
+        session_id = None
+        session_version = None
+        if self.session is not None:
+            changed = bool(
+                self.sandbox_workspace
+                and self.sandbox_workspace.changed_files()
+            )
+            session_status = (
+                SessionStatus.DIRTY_VERIFIED
+                if changed and succeeded
+                else SessionStatus.DIRTY_FAILED
+                if changed
+                else SessionStatus.CLEAN
+            )
+            session_id = self.session.id
+            session_version = self.session.version
+        new_version = self.state_authority.finish_terminal(
+            run_id,
+            state,
+            run_status=run_status,
+            plan_status=(
+                PlanStatus.DONE
+                if state.plan_id is not None and succeeded
+                else PlanStatus.FAILED
+                if state.plan_id is not None
+                else None
+            ),
+            session_id=session_id,
+            session_status=session_status,
+            session_version=session_version,
+        )
+        if self.session is not None:
+            self.session.status = session_status
+            self.session.active_run_id = None
+            self.session.version = int(new_version)
 
     def sandbox_status(self) -> str:
         return self.command_runner.status()

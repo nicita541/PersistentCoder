@@ -73,6 +73,18 @@ def test_loop_switches_phases_in_order():
     ]
 
 
+def test_loop_leaves_terminal_state_for_atomic_runtime_finalization():
+    controller = StubController()
+    persisted: list[str] = []
+
+    AgentLoop(
+        controller,
+        on_transition=lambda state: persisted.append(state.phase.value),
+    ).run("build")
+
+    assert persisted == ["PLANNING", "READY", "EXECUTING", "VERIFYING"]
+
+
 def test_loop_reaches_failed_after_repair_gives_up(
     tmp_path,
 ):

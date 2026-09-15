@@ -108,9 +108,20 @@ def test_runtime_run_completes_plan(tmp_path):
     assert run["attempt_id"] is None
     assert run["checkpoint_id"] is None
     assert runtime.plan_store.get_plan(state.plan_id).status.value == "DONE"
+    with runtime.state_authority._connect() as connection:
+        committed = connection.execute(
+            """
+            SELECT COUNT(*) FROM file_operation_journal
+            WHERE state = 'COMMITTED'
+            """
+        ).fetchone()[0]
+    assert committed > 0
+    assert runtime.state_authority.list_recovery_journals(
+        runtime.last_run_id
+    ) == []
 
 
-def test_partial_event_preserves_existing_run_cursor(tmp_path):
+def test_event_bus_cannot_change_existing_run_cursor(tmp_path):
     runtime = _runtime(tmp_path, FakeLLM())
     run_id = runtime.runtime_store.start_run("build")
     runtime.current_run_id = run_id
@@ -124,7 +135,17 @@ def test_partial_event_preserves_existing_run_cursor(tmp_path):
     )
 
     runtime._persist_event(
-        AgentEvent("file_read", {"path": "sample.py"})
+        AgentEvent(
+            "execute",
+            {
+                "path": "sample.py",
+                "plan_id": 91,
+                "task_id": 92,
+                "step_id": 93,
+                "attempt_id": 94,
+                "checkpoint": "telemetry-checkpoint",
+            },
+        )
     )
 
     run = runtime.runtime_store.get_run(run_id)
@@ -134,6 +155,31 @@ def test_partial_event_preserves_existing_run_cursor(tmp_path):
     assert run["step_id"] == 33
     assert run["attempt_id"] == 44
     assert run["checkpoint_id"] == "attempt-4"
+
+
+def test_runtime_persists_each_phase_as_a_state_snapshot(tmp_path):
+    llm = FakeLLM(
+        [goal_response(), tasks_response(), dependencies_response()],
+        default=coder_envelope(),
+    )
+    runtime = _runtime(tmp_path, llm)
+
+    runtime.run("Сделай API.")
+
+    with runtime.state_authority._connect() as connection:
+        phases = [
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT phase FROM agent_state_snapshots
+                WHERE run_id = ? ORDER BY id
+                """,
+                (runtime.last_run_id,),
+            ).fetchall()
+        ]
+    assert phases[0] == "PLANNING"
+    assert phases[-1] == "DONE"
+    assert {"READY", "EXECUTING", "VERIFYING", "DONE"} <= set(phases)
 
 
 def test_production_workspace_has_no_host_command_runner(

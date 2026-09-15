@@ -29,15 +29,17 @@ TERMINAL_RUN_STATUSES = frozenset(
 
 class RuntimeStore:
     """
-    Durable execution state + event log.
+    Run registry and best-effort event log.
 
-    SQLite is the source of truth for:
+    SQLite records:
 
       - which run/plan/task/step/attempt/phase was active;
       - whether a run was interrupted by a crash;
       - a compact, append-only event log.
 
-    It never stores full model prompts or file contents.
+    Mandatory cursor transitions are owned by RuntimeUnitOfWork. Event
+    persistence cannot update them. This store never saves full model prompts
+    or file contents.
     """
 
     def __init__(

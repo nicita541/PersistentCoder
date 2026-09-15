@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from app.agent.runtime import AgentRuntime
+from app.agent.durable_attempts import AttemptRecoveryError
+from app.agent.state import AgentPhase, AgentState
 from app.tasks.models import AttemptStatus
 from app.tasks.runtime_store import INTERRUPTED
 
@@ -48,23 +52,20 @@ def test_crash_rolls_back_sandbox_and_marks_attempt_blocked(
     session_id = crashed.session_id
     workspace = Path(crashed.workspace_root)
 
-    run_id = crashed.runtime_store.start_run("fix src/app.py")
-
-    # attempt START: checkpoint + durable attempt record
-    crashed.sandbox_workspace.checkpoint("attempt-1")
-
-    attempt = crashed.attempt_store.start_step_attempt(
-        step.id
+    run_id = crashed.runtime_store.start_run(
+        "fix src/app.py", sandbox_session_id=session_id
     )
 
-    crashed.runtime_store.update_run(
-        run_id,
-        sandbox_session_id=session_id,
-        task_id=task.id,
-        step_id=step.id,
-        attempt_id=attempt.id,
-        checkpoint_id="attempt-1",
+    crashed.current_run_id = run_id
+    state = AgentState(
+        request="fix src/app.py",
+        phase=AgentPhase.EXECUTING,
+        plan_id=_plan_id,
+        active_task_id=task.id,
+        active_step_id=step.id,
     )
+    crashed.attempt_coordinator.begin(state, task, step)
+    attempt = crashed.attempt_store.get_attempt(state.attempt_id)
 
     # half-written attempt, then the process dies (no finish_run)
     (workspace / "src" / "app.py").write_text(
@@ -122,9 +123,10 @@ def test_crash_rolls_back_sandbox_and_marks_attempt_blocked(
         is AttemptStatus.BLOCKED
     )
 
-    assert restarted.interrupted_attempts == [
-        attempt.id
-    ]
+    assert restarted.interrupted_attempts == []
+
+    journal = restarted.state_authority.get_journal_for_attempt(attempt.id)
+    assert journal["state"] == "ROLLED_BACK"
 
     # A recovery event is durably logged.
     events = restarted.runtime_store.get_events(run_id)
@@ -219,3 +221,52 @@ def test_resume_can_be_disabled_explicitly(
     ) == "VALUE = 1\n"
 
     _ = (task, step)
+
+
+def test_pending_journal_stops_startup_when_sandbox_cannot_open(
+    tmp_path, monkeypatch
+):
+    project = _project(tmp_path / "project")
+    stores = make_stores(tmp_path, project_root=project)
+    plan_id, task, step = seed_plan(stores)
+    crashed = _runtime(project, stores.database_path)
+    run_id = crashed.runtime_store.start_run(
+        "crash", sandbox_session_id=crashed.session_id
+    )
+    crashed.current_run_id = run_id
+    crashed.attempt_coordinator.begin(
+        AgentState(
+            request="crash",
+            phase=AgentPhase.EXECUTING,
+            plan_id=plan_id,
+            active_task_id=task.id,
+            active_step_id=step.id,
+        ),
+        task,
+        step,
+    )
+    monkeypatch.setattr(
+        "app.agent.runtime.SandboxWorkspace.open_session",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("unavailable")),
+    )
+
+    with pytest.raises(AttemptRecoveryError, match="cannot open sandbox"):
+        _runtime(project, stores.database_path)
+
+
+def test_interrupted_attempt_database_error_stops_recovery(tmp_path, monkeypatch):
+    runtime = AgentRuntime(
+        workspace_root=tmp_path,
+        database_path=tmp_path / "pc.db",
+        llm=FakeLLM(),
+        system_prompt="GLOBAL SYSTEM POLICY",
+    )
+    runtime.interrupted_runs = [{"attempt_id": 123}]
+    monkeypatch.setattr(
+        runtime.attempt_store,
+        "get_attempt",
+        lambda attempt_id: (_ for _ in ()).throw(OSError("database failed")),
+    )
+
+    with pytest.raises(OSError, match="database failed"):
+        runtime._mark_interrupted_attempts()
