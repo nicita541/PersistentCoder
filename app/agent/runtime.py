@@ -527,7 +527,6 @@ class AgentRuntime:
             step_store=self.step_store,
             memory=self.memory,
             events=self.events,
-            sandbox_workspace=self.sandbox_workspace,
             attempt_store=self.attempt_store,
             attempt_coordinator=self.attempt_coordinator,
             budget_consumer=self._consume_budget,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.agent.controller import AgentController
+from app.agent.controller import AgentController, AgentControllerError
 from app.agent.durable_attempts import (
     AttemptPreparationError,
     DurableAttemptCoordinator,
@@ -138,6 +138,28 @@ def test_database_failure_before_attempt_blocks_checkpoint_and_coder(tmp_path):
 
     assert coder.calls == 0
     assert workspace.checkpoints == set()
+
+
+def test_controller_refuses_writable_action_without_durable_coordinator(tmp_path):
+    workspace = _Workspace()
+    stores, _, _, _, _, plan_id, task, step = _coordinator(
+        tmp_path, workspace
+    )
+    coder = _Coder()
+    controller = AgentController(
+        planner=object(), coder=coder, verifier=object(), repair=object(),
+        scheduler=object(), plan_store=stores.plan_store,
+        step_store=stores.step_store, attempt_store=stores.attempt_store,
+    )
+    state = AgentState(
+        request="build", phase=AgentPhase.EXECUTING, plan_id=plan_id,
+        active_task_id=task.id, active_step_id=step.id,
+    )
+
+    with pytest.raises(AgentControllerError, match="coordinator"):
+        controller.execute(state)
+
+    assert coder.calls == 0
 
 
 def test_ready_attempt_has_durable_attempt_checkpoint_and_cursor(tmp_path):

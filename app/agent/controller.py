@@ -45,7 +45,6 @@ class AgentController:
         step_store=None,
         memory=None,
         events=None,
-        sandbox_workspace=None,
         attempt_store=None,
         attempt_coordinator=None,
         budget_consumer=None,
@@ -62,12 +61,10 @@ class AgentController:
         self.step_store = step_store
         self.memory = memory
         self.events = events
-        self.sandbox_workspace = sandbox_workspace
         self.attempt_store = attempt_store
         self.attempt_coordinator = attempt_coordinator
         self.budget_consumer = budget_consumer
         self.dependency_plan = dependency_plan
-        self._attempt_seq = 0
         self.max_step_attempts = (
             max_step_attempts
         )
@@ -673,84 +670,12 @@ class AgentController:
         The AttemptStore is the source of truth for attempt history.
         """
 
-        if self.attempt_coordinator is not None:
-            self.attempt_coordinator.begin(state, task, step)
-            self._emit(
-                "attempt_start",
-                {
-                    "attempt_id": state.attempt_id,
-                    "checkpoint": state.checkpoint_id,
-                },
-            )
-            return
-
-        self._attempt_seq += 1
-
-        label = f"attempt-{self._attempt_seq}"
-
-        state.attempt_id = None
-        state.checkpoint_id = None
-
-        if self.sandbox_workspace is not None:
-            try:
-                self.sandbox_workspace.checkpoint(label)
-                state.checkpoint_id = label
-
-            except Exception as error:
-                self._emit(
-                    "checkpoint_failed",
-                    {"error": str(error)},
-                )
-                raise AgentControllerError(
-                    f"checkpoint creation failed: {error}"
-                ) from error
-
-        if self.attempt_store is not None:
-            approach = (
-                state.repair.approach
-                or state.repair.strategy
-                or None
+        if self.attempt_coordinator is None:
+            raise AgentControllerError(
+                "durable attempt coordinator is required before writable action"
             )
 
-            try:
-                if step is not None:
-                    record = (
-                        self.attempt_store
-                        .start_step_attempt(
-                            step.id,
-                            approach=approach,
-                        )
-                    )
-
-                else:
-                    record = (
-                        self.attempt_store
-                        .start_task_attempt(
-                            task.id,
-                            approach=approach,
-                        )
-                    )
-
-                state.attempt_id = record.id
-
-            except Exception as error:
-                self._emit(
-                    "attempt_start_failed",
-                    {"error": str(error)},
-                )
-                if self.sandbox_workspace is not None and state.checkpoint_id:
-                    restored = self.sandbox_workspace.rollback(
-                        state.checkpoint_id
-                    )
-                    if not restored:
-                        raise AgentControllerError(
-                            "attempt persistence failed and checkpoint vanished"
-                        ) from error
-                    self.sandbox_workspace.commit(state.checkpoint_id)
-                    state.checkpoint_id = None
-                raise AgentControllerError(
-                    f"attempt persistence failed: {error}"
-                ) from error
+        self.attempt_coordinator.begin(state, task, step)
 
         self._emit(
             "attempt_start",
@@ -774,85 +699,24 @@ class AgentController:
         A failed attempt must never leave half-written files.
         """
 
-        if self.attempt_coordinator is not None:
-            attempt_id = state.attempt_id
-            attempt_status = (
-                AttemptStatus.PASS
-                if ok
-                else (
-                    AttemptStatus.BLOCKED
-                    if status == "BLOCKED"
-                    else AttemptStatus.FAILED
-                )
+        if self.attempt_coordinator is None:
+            raise AgentControllerError(
+                "durable attempt coordinator is required for finalization"
             )
-            self.attempt_coordinator.finish(
-                state, ok=ok, status=status, reason=reason
-            )
-            self._emit(
-                "attempt_finish",
-                {
-                    "attempt_id": attempt_id,
-                    "status": attempt_status.value,
-                    "reason": reason,
-                },
-            )
-            return
 
-        label = state.checkpoint_id
         attempt_id = state.attempt_id
-
-        if ok:
-            if (
-                self.sandbox_workspace is not None
-                and label
-            ):
-                try:
-                    self.sandbox_workspace.commit(label)
-
-                except Exception as error:
-                    raise AgentControllerError(
-                        f"checkpoint commit failed: {error}"
-                    ) from error
-
-            attempt_status = AttemptStatus.PASS
-
-        else:
-            if (
-                self.sandbox_workspace is not None
-                and label
-            ):
-                try:
-                    restored = self.sandbox_workspace.rollback(label)
-                    if not restored:
-                        raise AgentControllerError(
-                            f"checkpoint is missing: {label}"
-                        )
-                    self.sandbox_workspace.commit(
-                        label
-                    )
-
-                except Exception as error:
-                    raise AgentControllerError(
-                        f"checkpoint rollback failed: {error}"
-                    ) from error
-
-            attempt_status = (
+        attempt_status = (
+            AttemptStatus.PASS
+            if ok
+            else (
                 AttemptStatus.BLOCKED
                 if status == "BLOCKED"
                 else AttemptStatus.FAILED
             )
-
-        if (
-            self.attempt_store is not None
-            and attempt_id is not None
-        ):
-            self.attempt_store.finish_attempt(
-                attempt_id,
-                status=attempt_status,
-                failure_reason=(
-                    None if ok else (reason or "attempt failed")
-                ),
-            )
+        )
+        self.attempt_coordinator.finish(
+            state, ok=ok, status=status, reason=reason
+        )
 
         self._emit(
             "attempt_finish",
@@ -863,8 +727,6 @@ class AgentController:
             },
         )
 
-        state.attempt_id = None
-        state.checkpoint_id = None
 
     # ======================================
     # HELPERS
