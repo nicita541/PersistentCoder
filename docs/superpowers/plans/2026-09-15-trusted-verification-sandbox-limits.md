@@ -87,7 +87,7 @@ oversized, truncated, or unsupported manifests as blocked evidence.
   disk/memory limits, and unavailable Docker.
 - [x] Run focused Stage 2 tests, `compileall`, the full non-real-LLM test suite,
   and the extension compile check.
-- [ ] Commit and push Stage 2 to `master`.
+- [x] Commit and push Stage 2 to `master`.
 
 ## Completion boundary
 
