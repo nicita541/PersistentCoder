@@ -346,6 +346,73 @@ class StepStore:
 
             return created_ids
 
+    def supersede_unfinished_and_create(
+        self,
+        task_id: int,
+        steps: list[StepDraft],
+    ) -> list[int]:
+        """Atomically replace only unfinished executable Step structure."""
+
+        if not steps:
+            raise StepStoreError("replacement steps are required")
+        with self._connect() as connection:
+            if not owns_task(connection, self.context, task_id):
+                raise StepStoreError(f"unknown task: {task_id}")
+            task_row = connection.execute(
+                "SELECT change_paths_json FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            task_paths = self._load_list(task_row["change_paths_json"])
+            maximum = connection.execute(
+                "SELECT COALESCE(MAX(position), 0) AS value FROM steps WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            start = int(maximum["value"])
+            connection.execute(
+                """
+                UPDATE steps
+                SET status = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE task_id = ? AND status != ?
+                """,
+                (StepStatus.SUPERSEDED.value, task_id, StepStatus.DONE.value),
+            )
+            ids: list[int] = []
+            for offset, step in enumerate(steps, start=1):
+                try:
+                    step_paths = canonicalize_change_paths(step.change_paths)
+                    AllowedChangeSet(task_paths, step_paths)
+                except ChangeScopeError as error:
+                    raise StepStoreError(str(error)) from error
+                cursor = connection.execute(
+                    """
+                    INSERT INTO steps (
+                        task_id, position, title, description, status,
+                        requires_json, produces_json, success_criteria_json,
+                        change_paths_json, verification_specs_json,
+                        attempt_count, result_artifacts_json,
+                        verification_evidence_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '[]', '[]')
+                    """,
+                    (
+                        task_id,
+                        start + offset,
+                        step.title,
+                        step.description,
+                        StepStatus.PENDING.value,
+                        self._dump_list(step.requires),
+                        self._dump_list(step.produces),
+                        self._dump_list(step.success_criteria),
+                        self._dump_list(step_paths),
+                        self._dump_specs(step.verification_specs),
+                    ),
+                )
+                ids.append(int(cursor.lastrowid))
+            connection.execute(
+                "UPDATE tasks SET current_step = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (task_id,),
+            )
+            return ids
+
     def _row_to_step(
         self,
         row: sqlite3.Row,

@@ -239,10 +239,15 @@ class Verifier:
                 "task must have steps"
             )
 
-        if not all(
-            step.status
-            is StepStatus.DONE
+        active_steps = [
+            step
             for step in steps
+            if step.status is not StepStatus.SUPERSEDED
+        ]
+
+        if not active_steps or not all(
+            step.status is StepStatus.DONE
+            for step in active_steps
         ):
             raise VerificationError(
                 "all steps must be DONE "

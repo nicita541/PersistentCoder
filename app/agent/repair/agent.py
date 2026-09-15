@@ -10,6 +10,7 @@ from app.agent.repair.strategies import (
     REPLAN_TASK,
     RETRY_STEP,
 )
+from app.agent.repair.context import approach_fingerprint
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,7 @@ class ApproachPlan:
     verification_plan: list[str] = field(
         default_factory=list
     )
+    fingerprint: str = ""
 
 
 @dataclass(frozen=True)
@@ -148,7 +150,7 @@ class RepairAgent:
         except Exception:
             return False
 
-        normalized = approach.casefold()
+        normalized = approach.casefold().strip()
 
         for record in records:
             if not record.approach:
@@ -182,6 +184,10 @@ class RepairAgent:
         approach_text = (
             f"{analysis.failure_class}::{root_cause}"
         )
+        fingerprint = approach_fingerprint(
+            analysis.failure_class,
+            root_cause,
+        )
 
         strategy = self.strategies.select(
             analysis=analysis,
@@ -195,7 +201,7 @@ class RepairAgent:
 
         repeated = self._was_attempted(
             step,
-            approach_text,
+            fingerprint,
         )
 
         if repeated:
@@ -210,7 +216,7 @@ class RepairAgent:
             try:
                 self.replanner.assert_step_approach_allowed(
                     step.id,
-                    approach_text,
+                    fingerprint,
                 )
 
             except Exception:
@@ -241,6 +247,7 @@ class RepairAgent:
                 getattr(verification, "evidence", [])
                 or []
             )[:5],
+            fingerprint=fingerprint,
         )
 
         return RepairOutcome(

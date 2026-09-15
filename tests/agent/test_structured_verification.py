@@ -104,7 +104,25 @@ def test_all_explicit_pytest_targets_run_together(tmp_path):
 
     assert all(result.status == "PASS" for result in results)
     assert runner.commands == [
-        'python -m pytest -q "test_a.py" "test_b.py"'
+        "python -m pytest -q test_a.py test_b.py"
+    ]
+
+
+def test_python_compile_quotes_shell_metacharacters_in_target(tmp_path):
+    runner = RecordingCommandRunner(stdout="ok")
+
+    result = _verifier(tmp_path, runner).verify_all(
+        [
+            VerificationSpec(
+                VerificationKind.PY_COMPILE,
+                "sample.py; touch PWNED",
+            )
+        ]
+    )[0]
+
+    assert result.status == "PASS"
+    assert runner.commands == [
+        "python -m py_compile 'sample.py; touch PWNED'"
     ]
 
 

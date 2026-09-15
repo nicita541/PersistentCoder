@@ -102,3 +102,12 @@ def test_loop_reaches_failed_after_repair_gives_up(
     assert state.completion == "FAILED"
     assert "REPAIRING" in state.history
     assert state.history[-1] == "FAILED"
+    assert runtime.plan_store.get_plan(state.plan_id).status.value == "FAILED"
+    assert runtime.last_run_id is not None
+    run = runtime.runtime_store.get_run(runtime.last_run_id)
+    assert run is not None
+    assert run["status"] == "FAILED"
+    assert run["task_id"] is None
+    assert run["step_id"] is None
+    assert run["attempt_id"] is None
+    assert run["checkpoint_id"] is None

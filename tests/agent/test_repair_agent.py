@@ -145,6 +145,23 @@ def test_gives_up_after_task_attempt_limit(
     assert outcome.action == GIVE_UP
 
 
+def test_task_attempt_limit_wins_for_fresh_replacement_step(
+    tmp_path,
+):
+    stores, task_id, step_id = _prepare(tmp_path)
+    agent = _agent(stores)
+
+    outcome = agent.repair(
+        task=stores.plan_store.get_task(task_id),
+        verification=_failure(),
+        step=stores.step_store.get_step(step_id),
+        step_attempt_number=1,
+        task_attempt_number=3,
+    )
+
+    assert outcome.action == GIVE_UP
+
+
 def test_analyzer_prefers_task_scope_on_blocked(
     tmp_path,
 ):
@@ -190,6 +207,7 @@ def test_repair_returns_structured_approach(tmp_path):
     assert plan.new_approach
     assert isinstance(plan.files_to_inspect, list)
     assert isinstance(plan.verification_plan, list)
+    assert plan.fingerprint == "verification_fail::pytest failed"
 
 
 def test_no_repeating_failed_approach(tmp_path):

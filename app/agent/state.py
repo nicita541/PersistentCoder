@@ -168,6 +168,7 @@ class RepairState:
     strategy: str | None = None
     reason: str | None = None
     approach: str | None = None
+    context: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass

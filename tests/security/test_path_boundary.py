@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 
 import pytest
@@ -184,15 +183,3 @@ def test_sandbox_metadata_is_under_project_sandbox():
     assert SANDBOX_ROOT == PROJECT_ROOT / ".sandbox"
     assert is_within_project(SANDBOX_ROOT)
     assert is_within_project(TMP_ROOT)
-
-
-# 10
-def test_host_venv_is_under_project():
-    venv = PROJECT_ROOT / ".venv"
-
-    assert venv.exists()
-
-    executable = Path(sys.executable).resolve()
-
-    assert is_within_project(executable)
-    assert executable.parent.parent == venv

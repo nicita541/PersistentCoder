@@ -190,6 +190,17 @@ class ActionEnvelopeDecoder:
                 files = [entry]
 
         if files is not None:
+            canonical_files = []
+            for entry in files:
+                if not isinstance(entry, dict):
+                    canonical_files.append(entry)
+                    continue
+                canonical = dict(entry)
+                key = _content_key(canonical)
+                if key is not None and key != "content":
+                    canonical["content"] = canonical.pop(key)
+                canonical_files.append(canonical)
+            files = canonical_files
             normalized["files"] = files
         return normalized
 

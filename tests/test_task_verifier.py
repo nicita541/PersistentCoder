@@ -556,6 +556,31 @@ def test_all_steps_done_does_not_automatically_finish_task(
     )
 
 
+def test_superseded_steps_do_not_block_task_verification(
+    tmp_path,
+):
+    database_path = tmp_path / "planner.db"
+    (
+        plan_store,
+        step_store,
+        verification_store,
+        task_id,
+    ) = _create_running_task(database_path)
+    steps = step_store.get_steps(task_id)
+    step_store.update_step_status(steps[0].id, StepStatus.SUPERSEDED)
+    for step in steps[1:]:
+        step_store.update_step_status(step.id, StepStatus.DONE)
+    verifier = _make_verifier(
+        plan_store,
+        step_store,
+        verification_store,
+    )
+
+    verifier.begin_task_verification(task_id)
+
+    assert plan_store.get_task(task_id).status is TaskStatus.VERIFYING
+
+
 def test_pass_task_marks_task_done(
     tmp_path,
 ):

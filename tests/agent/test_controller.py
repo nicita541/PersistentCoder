@@ -138,3 +138,34 @@ def test_blocked_dependency_gates_task_without_calling_coder(tmp_path):
     assert task.status.value == "BLOCKED"
     assert "BLOCKED_DEPENDENCY" in state.execution.failure_reason
     assert len(llm.calls) == calls_before
+
+
+def test_failed_attempt_passes_structured_different_approach_to_next_prompt(
+    tmp_path,
+):
+    llm = FakeLLM(
+        [
+            goal_response(),
+            tasks_response(),
+            dependencies_response(),
+            "invalid",
+            "invalid",
+            "invalid",
+        ],
+        default=coder_envelope(),
+    )
+    runtime = _runtime(tmp_path, llm)
+
+    state = runtime.run("Build")
+
+    assert state.phase.value == "DONE"
+    prompts = [
+        "\n".join(str(message.get("content", "")) for message in call)
+        for call in llm.calls
+    ]
+    repair_prompts = [
+        prompt for prompt in prompts if "STRUCTURED REPAIR CONTEXT" in prompt
+    ]
+    assert repair_prompts
+    assert "required_different_approach:" in repair_prompts[0]
+    assert "root_cause:" in repair_prompts[0]

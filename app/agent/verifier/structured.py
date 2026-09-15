@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import shlex
 
 from app.agent.state import CriterionResult
 from app.tasks.verification_spec import VerificationKind, VerificationSpec
@@ -74,7 +75,9 @@ class StructuredVerifier:
             return self._ast(spec)
         if spec.kind is VerificationKind.PY_COMPILE:
             return self._command(
-                spec, f'{self.python} -m py_compile "{spec.target}"'
+                spec,
+                f"{shlex.quote(self.python)} -m py_compile "
+                f"{shlex.quote(spec.target or '')}",
             )
         if spec.kind is VerificationKind.PY_IMPORT:
             module = self._module_name(spec.target or "")
@@ -158,5 +161,7 @@ class StructuredVerifier:
             )
         command = f"{self.python} -m pytest -q"
         if targets:
-            command += " " + " ".join(f'"{target}"' for target in targets)
+            command += " " + " ".join(
+                shlex.quote(target) for target in targets
+            )
         return self._command(representative, command)

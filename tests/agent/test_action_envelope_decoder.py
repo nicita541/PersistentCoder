@@ -81,3 +81,13 @@ def test_delete_shape_is_canonicalized():
         "files": [{"path": "old.py", "operation": "delete"}],
         "commands": [],
     }
+
+
+def test_nested_file_content_alias_is_canonicalized():
+    decoded = ActionEnvelopeDecoder().decode(
+        '{"action":"write","files":[{"path":"sample.py","code":"x = 1"}]}'
+    )
+
+    assert decoded["files"] == [
+        {"path": "sample.py", "content": "x = 1"}
+    ]
