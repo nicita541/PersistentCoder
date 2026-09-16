@@ -37,13 +37,13 @@
 - Consumes: `ProjectIdentity`, `ProjectPath`, `SnapshotManifest`, `VerificationContext`, session baseline/workspace roots.
 - Produces: `PatchOperation`, `PatchEntry`, `PatchManifest`, and `PatchManifestBuilder.build(...) -> PatchManifest`.
 
-- [ ] Write failing tests for deterministic ADD/MODIFY/DELETE entries, manifest identity, stable ordering, and canonical serialization.
-- [ ] Run the tests and confirm failure because the manifest domain does not exist.
-- [ ] Implement frozen manifest value objects with strict enum/hash/path/size invariants and canonical SHA-256 identity.
-- [ ] Implement a single builder that inventories baseline and workspace without following links and retains unsafe/unreviewable entries with explicit reasons.
-- [ ] Add failing tests for UTF-8 text, binary/non-UTF-8, protected paths, links/reparse points, special files, and workspace mutation during build.
-- [ ] Implement fail-closed classification and a final workspace digest recheck.
-- [ ] Run manifest tests and the existing snapshot/path/patch regressions.
+- [x] Write failing tests for deterministic ADD/MODIFY/DELETE entries, manifest identity, stable ordering, and canonical serialization.
+- [x] Run the tests and confirm failure because the manifest domain does not exist.
+- [x] Implement frozen manifest value objects with strict enum/hash/path/size invariants and canonical SHA-256 identity.
+- [x] Implement a single builder that inventories baseline and workspace without following links and retains unsafe/unreviewable entries with explicit reasons.
+- [x] Add failing tests for UTF-8 text, binary/non-UTF-8, protected paths, links/reparse points, special files, and workspace mutation during build.
+- [x] Implement fail-closed classification and a final workspace digest recheck.
+- [x] Run manifest tests and the existing snapshot/path/patch regressions.
 
 ### Task 2: Durable manifest store and apply journal
 
