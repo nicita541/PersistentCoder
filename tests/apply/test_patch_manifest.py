@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import app.apply.builder as manifest_builder
 from app.apply.builder import ManifestBuildError, PatchManifestBuilder
 from app.apply.manifest import (
     ManifestValidationError,
@@ -416,11 +417,12 @@ def _replace_directory_with_symlink_during_scan(
     *,
     target: Path,
     outside: Path,
-) -> Path:
+) -> tuple[Path, list[str]]:
     original_scandir = os.scandir
     original_os_open = os.open
     backup = target.with_name(f"{target.name}-original")
     replaced = False
+    outside_enumerations: list[str] = []
 
     def replace_target(path: object) -> None:
         nonlocal replaced
@@ -439,6 +441,8 @@ def _replace_directory_with_symlink_during_scan(
 
     def racing_scandir(path):
         replace_target(path)
+        if replaced:
+            outside_enumerations.append(str(path))
         return original_scandir(path)
 
     def racing_os_open(path, flags, *args, **kwargs):
@@ -447,7 +451,7 @@ def _replace_directory_with_symlink_during_scan(
 
     monkeypatch.setattr(os, "scandir", racing_scandir)
     monkeypatch.setattr(os, "open", racing_os_open)
-    return backup
+    return backup, outside_enumerations
 
 
 def _restore_replaced_path(target: Path, backup: Path) -> None:
@@ -522,12 +526,12 @@ def test_builder_rejects_root_replaced_with_link_before_scan(
     (workspace / "local.txt").write_text("local", encoding="utf-8")
     (outside / "outside.txt").write_text("outside", encoding="utf-8")
     reads = _track_reads_under(monkeypatch, outside)
-    backup = _replace_directory_with_symlink_during_scan(
+    backup, outside_enumerations = _replace_directory_with_symlink_during_scan(
         monkeypatch, target=workspace, outside=outside
     )
 
     try:
-        with pytest.raises(ManifestBuildError, match="changed|link"):
+        with pytest.raises(ManifestBuildError, match="changed|link|scan"):
             PatchManifestBuilder().build(
                 project_identity=identity,
                 session_id="session-1",
@@ -536,6 +540,7 @@ def test_builder_rejects_root_replaced_with_link_before_scan(
                 verification_id="verification-1",
             )
         assert reads == []
+        assert outside_enumerations == []
     finally:
         _restore_replaced_path(workspace, backup)
 
@@ -554,12 +559,12 @@ def test_builder_rejects_directory_replaced_with_link_before_scan(
     (nested / "local.txt").write_text("local", encoding="utf-8")
     (outside / "outside.txt").write_text("outside", encoding="utf-8")
     reads = _track_reads_under(monkeypatch, outside)
-    backup = _replace_directory_with_symlink_during_scan(
+    backup, outside_enumerations = _replace_directory_with_symlink_during_scan(
         monkeypatch, target=nested, outside=outside
     )
 
     try:
-        with pytest.raises(ManifestBuildError, match="changed|link"):
+        with pytest.raises(ManifestBuildError, match="changed|link|scan"):
             PatchManifestBuilder().build(
                 project_identity=identity,
                 session_id="session-1",
@@ -568,6 +573,7 @@ def test_builder_rejects_directory_replaced_with_link_before_scan(
                 verification_id="verification-1",
             )
         assert reads == []
+        assert outside_enumerations == []
     finally:
         _restore_replaced_path(nested, backup)
 
@@ -588,6 +594,7 @@ def test_builder_does_not_read_file_replaced_with_link_before_open(
     original_path_open = Path.open
     original_os_open = os.open
     reads = 0
+    followed_opens = 0
     replaced = False
 
     class TrackingHandle:
@@ -625,15 +632,32 @@ def test_builder_does_not_read_file_replaced_with_link_before_open(
         return original_path_open(path, *args, **kwargs)
 
     def racing_os_open(path, flags, *args, **kwargs):
+        nonlocal followed_opens
         if Path(path) == target:
             replace_target()
+            followed_opens += 1
         return original_os_open(path, flags, *args, **kwargs)
+
+    original_windows_create = getattr(
+        manifest_builder, "_windows_create_handle", None
+    )
+
+    def racing_windows_create(path, *args, **kwargs):
+        if Path(path) == target:
+            replace_target()
+        return original_windows_create(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "open", racing_path_open)
     monkeypatch.setattr(os, "open", racing_os_open)
+    if original_windows_create is not None:
+        monkeypatch.setattr(
+            manifest_builder, "_windows_create_handle", racing_windows_create
+        )
 
     try:
-        with pytest.raises(ManifestBuildError, match="changed|link|read"):
+        with pytest.raises(
+            ManifestBuildError, match="changed|link|read|reparse"
+        ):
             PatchManifestBuilder().build(
                 project_identity=identity,
                 session_id="session-1",
@@ -642,6 +666,52 @@ def test_builder_does_not_read_file_replaced_with_link_before_open(
                 verification_id="verification-1",
             )
         assert reads == 0
+        assert followed_opens == 0
+    finally:
+        _restore_replaced_path(target, backup)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows share modes are required")
+def test_windows_file_handle_blocks_replacement_before_descriptor_conversion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import msvcrt
+
+    identity = _identity(tmp_path / "source")
+    baseline = tmp_path / "baseline"
+    workspace = tmp_path / "workspace"
+    baseline.mkdir()
+    workspace.mkdir()
+    target = workspace / "file.txt"
+    backup = workspace / "file-original.txt"
+    target.write_text("local", encoding="utf-8")
+    original_open_osfhandle = msvcrt.open_osfhandle
+    attempted = False
+    replacement_allowed = False
+
+    def racing_open_osfhandle(handle: int, flags: int) -> int:
+        nonlocal attempted, replacement_allowed
+        attempted = True
+        try:
+            target.replace(backup)
+        except OSError:
+            raise
+        replacement_allowed = True
+        return original_open_osfhandle(handle, flags)
+
+    monkeypatch.setattr(msvcrt, "open_osfhandle", racing_open_osfhandle)
+
+    try:
+        with pytest.raises(ManifestBuildError):
+            PatchManifestBuilder().build(
+                project_identity=identity,
+                session_id="session-1",
+                baseline_root=baseline,
+                workspace_root=workspace,
+                verification_id="verification-1",
+            )
+        assert attempted is True
+        assert replacement_allowed is False
     finally:
         _restore_replaced_path(target, backup)
 
@@ -704,6 +774,20 @@ def test_builder_bounds_bytes_read_from_growing_file(
     monkeypatch.setattr(Path, "open", growing_path_open)
     monkeypatch.setattr(os, "open", tracking_os_open)
     monkeypatch.setattr(os, "read", growing_os_read)
+    if os.name == "nt":
+        import msvcrt
+
+        original_open_osfhandle = msvcrt.open_osfhandle
+
+        def tracking_open_osfhandle(handle: int, flags: int) -> int:
+            nonlocal target_fd
+            descriptor = original_open_osfhandle(handle, flags)
+            target_fd = descriptor
+            return descriptor
+
+        monkeypatch.setattr(
+            msvcrt, "open_osfhandle", tracking_open_osfhandle
+        )
 
     with pytest.raises(SnapshotLimitError):
         PatchManifestBuilder(

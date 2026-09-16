@@ -7,6 +7,11 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
+if os.name == "nt":
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
 from app.apply.manifest import PatchEntry, PatchManifest, PatchOperation
 from app.project_identity import ProjectIdentity
 from app.sandbox.limits import DEFAULT_LIMITS, SandboxLimits
@@ -17,6 +22,123 @@ from app.sandbox.snapshot import SnapshotLimitError
 
 class ManifestBuildError(RuntimeError):
     """Raised when the two trees cannot produce a stable safe manifest."""
+
+
+if os.name == "nt":
+    _FILE_LIST_DIRECTORY = 0x0001
+    _FILE_READ_ATTRIBUTES = 0x0080
+    _GENERIC_READ = 0x80000000
+    _FILE_SHARE_READ = 0x00000001
+    _FILE_SHARE_WRITE = 0x00000002
+    _OPEN_EXISTING = 3
+    _FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+    _FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+    _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+    _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    class _FileTime(ctypes.Structure):
+        _fields_ = [
+            ("low", wintypes.DWORD),
+            ("high", wintypes.DWORD),
+        ]
+
+    class _ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("attributes", wintypes.DWORD),
+            ("creation_time", _FileTime),
+            ("access_time", _FileTime),
+            ("write_time", _FileTime),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        ]
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _create_file = _kernel32.CreateFileW
+    _create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    _create_file.restype = wintypes.HANDLE
+    _get_file_information = _kernel32.GetFileInformationByHandle
+    _get_file_information.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_ByHandleFileInformation),
+    ]
+    _get_file_information.restype = wintypes.BOOL
+    _close_handle = _kernel32.CloseHandle
+    _close_handle.argtypes = [wintypes.HANDLE]
+    _close_handle.restype = wintypes.BOOL
+
+
+    def _windows_create_handle(path: Path, *, directory: bool) -> int:
+        access = (
+            _FILE_LIST_DIRECTORY | _FILE_READ_ATTRIBUTES
+            if directory
+            else _GENERIC_READ | _FILE_READ_ATTRIBUTES
+        )
+        flags = _FILE_FLAG_OPEN_REPARSE_POINT
+        if directory:
+            flags |= _FILE_FLAG_BACKUP_SEMANTICS
+        handle = _create_file(
+            str(path),
+            access,
+            _FILE_SHARE_READ | _FILE_SHARE_WRITE,
+            None,
+            _OPEN_EXISTING,
+            flags,
+            None,
+        )
+        if handle in {None, _INVALID_HANDLE_VALUE}:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return int(handle)
+
+
+    def _windows_close(handle: int) -> None:
+        if not _close_handle(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+
+    def _windows_information(handle: int) -> _ByHandleFileInformation:
+        information = _ByHandleFileInformation()
+        if not _get_file_information(handle, ctypes.byref(information)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return information
+
+
+    def _validate_windows_handle(
+        handle: int,
+        metadata: os.stat_result,
+        *,
+        directory: bool,
+    ) -> None:
+        information = _windows_information(handle)
+        attributes = int(information.attributes)
+        if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+            raise ManifestBuildError("Windows handle names a reparse point")
+        handle_is_directory = bool(attributes & _FILE_ATTRIBUTE_DIRECTORY)
+        if handle_is_directory != directory:
+            raise ManifestBuildError("Windows handle type changed")
+        file_index = (
+            int(information.file_index_high) << 32
+        ) | int(information.file_index_low)
+        if file_index != int(getattr(metadata, "st_ino", -1)):
+            raise ManifestBuildError("Windows handle identity changed")
+        if not directory:
+            size = (
+                int(information.file_size_high) << 32
+            ) | int(information.file_size_low)
+            if size != int(metadata.st_size):
+                raise ManifestBuildError("Windows handle size changed")
 
 
 def _is_reparse(metadata: os.stat_result) -> bool:
@@ -61,6 +183,14 @@ class _Inventory:
     @property
     def by_path(self) -> dict[str, _InventoryEntry]:
         return {entry.path.value: entry for entry in self.entries}
+
+
+@dataclass(frozen=True, slots=True)
+class _DirectoryGuard:
+    path: Path
+    metadata: os.stat_result
+    handle: int
+    windows_handle: bool
 
 
 class PatchManifestBuilder:
@@ -155,59 +285,106 @@ class PatchManifestBuilder:
             raise ManifestBuildError(f"manifest directory changed or became a link: {path}")
         return metadata
 
-    def _validate_directory_chain(
+    def _open_directory_guard(
         self,
-        chain: tuple[tuple[Path, os.stat_result], ...],
-    ) -> None:
-        for path, expected in chain:
+        path: Path,
+        metadata: os.stat_result | None = None,
+    ) -> _DirectoryGuard:
+        expected = metadata or self._directory_metadata(path)
+        handle: int | None = None
+        windows_handle = os.name == "nt"
+        try:
+            if windows_handle:
+                handle = _windows_create_handle(path, directory=True)
+                _validate_windows_handle(handle, expected, directory=True)
+            else:
+                flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                handle = os.open(path, flags)
+                opened = os.fstat(handle)
+                if _metadata_identity(opened) != _metadata_identity(expected):
+                    raise ManifestBuildError(
+                        f"manifest directory changed before open: {path}"
+                    )
             current = self._directory_metadata(path)
             if _metadata_identity(current) != _metadata_identity(expected):
                 raise ManifestBuildError(
-                    f"manifest directory changed during build: {path}"
+                    f"manifest directory changed before guard: {path}"
                 )
+            return _DirectoryGuard(path, expected, handle, windows_handle)
+        except ManifestBuildError:
+            if handle is not None:
+                self._close_directory_handle(handle, windows_handle)
+            raise
+        except OSError as error:
+            if handle is not None:
+                self._close_directory_handle(handle, windows_handle)
+            raise ManifestBuildError(
+                f"cannot guard manifest directory: {path}"
+            ) from error
+
+    @staticmethod
+    def _close_directory_handle(handle: int, windows_handle: bool) -> None:
+        if windows_handle:
+            _windows_close(handle)
+        else:
+            os.close(handle)
+
+    def _close_directory_guard(self, guard: _DirectoryGuard) -> None:
+        self._close_directory_handle(guard.handle, guard.windows_handle)
+
+    def _validate_directory_chain(
+        self,
+        chain: tuple[_DirectoryGuard, ...],
+    ) -> None:
+        for guard in chain:
+            current = self._directory_metadata(guard.path)
+            if _metadata_identity(current) != _metadata_identity(guard.metadata):
+                raise ManifestBuildError(
+                    f"manifest directory changed during build: {guard.path}"
+                )
+            try:
+                if guard.windows_handle:
+                    _validate_windows_handle(
+                        guard.handle,
+                        guard.metadata,
+                        directory=True,
+                    )
+                else:
+                    opened = os.fstat(guard.handle)
+                    if _metadata_identity(opened) != _metadata_identity(
+                        guard.metadata
+                    ):
+                        raise ManifestBuildError(
+                            "manifest directory handle changed during build: "
+                            f"{guard.path}"
+                        )
+            except OSError as error:
+                raise ManifestBuildError(
+                    f"cannot validate manifest directory: {guard.path}"
+                ) from error
 
     def _scan_directory(
         self,
         directory: Path,
-        chain: tuple[tuple[Path, os.stat_result], ...],
+        chain: tuple[_DirectoryGuard, ...],
     ) -> tuple[str, ...]:
         self._validate_directory_chain(chain)
-        descriptor: int | None = None
         try:
-            directory_flags = (
-                getattr(os, "O_RDONLY", 0)
-                | getattr(os, "O_DIRECTORY", 0)
-                | getattr(os, "O_NOFOLLOW", 0)
+            scan_target: str | Path | int = (
+                directory if chain[-1].windows_handle else chain[-1].handle
             )
-            if getattr(os, "O_DIRECTORY", 0) and getattr(os, "O_NOFOLLOW", 0):
-                descriptor = os.open(directory, directory_flags)
-                opened = os.fstat(descriptor)
-                if _metadata_identity(opened) != _metadata_identity(chain[-1][1]):
-                    raise ManifestBuildError(
-                        f"manifest directory changed before scan: {directory}"
-                    )
-                children = tuple(
-                    child.name
-                    for child in sorted(
-                        os.scandir(descriptor), key=lambda item: item.name
-                    )
+            children = tuple(
+                child.name
+                for child in sorted(
+                    os.scandir(scan_target), key=lambda item: item.name
                 )
-            else:
-                children = tuple(
-                    child.name
-                    for child in sorted(
-                        os.scandir(directory), key=lambda item: item.name
-                    )
-                )
+            )
         except ManifestBuildError:
             raise
         except OSError as error:
             raise ManifestBuildError(
                 f"cannot scan manifest tree: {directory}"
             ) from error
-        finally:
-            if descriptor is not None:
-                os.close(descriptor)
         self._validate_directory_chain(chain)
         return children
 
@@ -215,7 +392,8 @@ class PatchManifestBuilder:
         entries: list[_InventoryEntry] = []
         total_bytes = 0
         root_metadata = self._directory_metadata(root)
-        root_chain = ((root, root_metadata),)
+        root_guard = self._open_directory_guard(root, root_metadata)
+        root_chain = (root_guard,)
 
         def add(entry: _InventoryEntry) -> None:
             nonlocal total_bytes
@@ -240,7 +418,7 @@ class PatchManifestBuilder:
         def walk(
             directory: Path,
             prefix: tuple[str, ...],
-            chain: tuple[tuple[Path, os.stat_result], ...],
+            chain: tuple[_DirectoryGuard, ...],
         ) -> None:
             for child_name in self._scan_directory(directory, chain):
                 self._validate_directory_chain(chain)
@@ -278,11 +456,17 @@ class PatchManifestBuilder:
                     )
                     continue
                 if stat.S_ISDIR(metadata.st_mode):
-                    walk(
-                        child_path,
-                        (*prefix, child_name),
-                        (*chain, (child_path, metadata)),
+                    child_guard = self._open_directory_guard(
+                        child_path, metadata
                     )
+                    try:
+                        walk(
+                            child_path,
+                            (*prefix, child_name),
+                            (*chain, child_guard),
+                        )
+                    finally:
+                        self._close_directory_guard(child_guard)
                     continue
                 if stat.S_ISREG(metadata.st_mode):
                     add(
@@ -305,8 +489,11 @@ class PatchManifestBuilder:
                     )
                 )
 
-        walk(root, (), root_chain)
-        self._validate_directory_chain(root_chain)
+        try:
+            walk(root, (), root_chain)
+            self._validate_directory_chain(root_chain)
+        finally:
+            self._close_directory_guard(root_guard)
         entries.sort(key=lambda entry: entry.path.value)
         keys = [entry.path.comparison_key for entry in entries]
         if len(keys) != len(set(keys)):
@@ -330,7 +517,7 @@ class PatchManifestBuilder:
         path: Path,
         project_path: ProjectPath,
         before: os.stat_result,
-        ancestors: tuple[tuple[Path, os.stat_result], ...],
+        ancestors: tuple[_DirectoryGuard, ...],
         remaining_inventory_bytes: int,
     ) -> _InventoryEntry:
         if int(before.st_size) > self.limits.max_snapshot_file_bytes:
@@ -376,7 +563,7 @@ class PatchManifestBuilder:
         path: Path,
         project_path: ProjectPath,
         before: os.stat_result,
-        ancestors: tuple[tuple[Path, os.stat_result], ...],
+        ancestors: tuple[_DirectoryGuard, ...],
         remaining_inventory_bytes: int,
     ) -> tuple[bytes, str, bool]:
         self._validate_directory_chain(ancestors)
@@ -384,13 +571,34 @@ class PatchManifestBuilder:
         contains_binary_control = False
         content = bytearray()
         descriptor: int | None = None
+        native_handle: int | None = None
         try:
-            flags = (
-                os.O_RDONLY
-                | getattr(os, "O_BINARY", 0)
-                | getattr(os, "O_NOFOLLOW", 0)
-            )
-            descriptor = os.open(path, flags)
+            descriptor_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+            if os.name == "nt":
+                native_handle = _windows_create_handle(
+                    path, directory=False
+                )
+                _validate_windows_handle(
+                    native_handle, before, directory=False
+                )
+                current = os.stat(path, follow_symlinks=False)
+                if (
+                    _is_link(current)
+                    or _metadata_identity(before)
+                    != _metadata_identity(current)
+                ):
+                    raise ManifestBuildError(
+                        "file changed or became a link before descriptor "
+                        f"conversion: {project_path.value}"
+                    )
+                descriptor = msvcrt.open_osfhandle(
+                    native_handle, descriptor_flags
+                )
+                native_handle = None
+            else:
+                descriptor = os.open(
+                    path, descriptor_flags | os.O_NOFOLLOW
+                )
             opened = os.fstat(descriptor)
             current = os.stat(path, follow_symlinks=False)
             if (
@@ -438,6 +646,8 @@ class PatchManifestBuilder:
         finally:
             if descriptor is not None:
                 os.close(descriptor)
+            if native_handle is not None:
+                _windows_close(native_handle)
 
         self._validate_directory_chain(ancestors)
         if (
@@ -457,7 +667,7 @@ class PatchManifestBuilder:
         project_path: ProjectPath,
         metadata: os.stat_result,
         kind: str,
-        ancestors: tuple[tuple[Path, os.stat_result], ...],
+        ancestors: tuple[_DirectoryGuard, ...],
     ) -> _InventoryEntry:
         self._validate_directory_chain(ancestors)
         target = ""
