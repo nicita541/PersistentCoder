@@ -89,6 +89,15 @@ def _canonical_json(value: object) -> str:
     )
 
 
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ManifestValidationError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
 def _project_id_for_root(root: str) -> str:
     comparison_root = os.path.normcase(root) if os.name == "nt" else root
     return hashlib.sha256(comparison_root.encode("utf-8")).hexdigest()
@@ -108,10 +117,10 @@ class PatchEntry:
 
     def __post_init__(self) -> None:
         try:
-            path = (
-                self.path
+            path = ProjectPath.parse(
+                self.path.value
                 if isinstance(self.path, ProjectPath)
-                else ProjectPath.parse(self.path)
+                else self.path
             )
         except (TypeError, ValueError) as error:
             raise ManifestValidationError("entry path is invalid") from error
@@ -183,13 +192,20 @@ class PatchEntry:
     def from_dict(cls, value: object) -> "PatchEntry":
         if not isinstance(value, dict) or set(value) != _ENTRY_KEYS:
             raise ManifestValidationError("entry fields are not canonical")
+        raw_path = value["path"]
+        try:
+            canonical_path = ProjectPath.parse(raw_path)
+        except (TypeError, ValueError) as error:
+            raise ManifestValidationError("entry path is invalid") from error
+        if not isinstance(raw_path, str) or canonical_path.value != raw_path:
+            raise ManifestValidationError("serialized entry path is not canonical")
         try:
             operation = PatchOperation(value["operation"])
         except (TypeError, ValueError) as error:
             raise ManifestValidationError("entry operation is invalid") from error
         try:
             return cls(
-                path=value["path"],
+                path=canonical_path,
                 operation=operation,
                 before_sha256=value["before_sha256"],
                 after_sha256=value["after_sha256"],
@@ -292,7 +308,10 @@ class PatchManifest:
     def from_dict(cls, value: dict[str, Any]) -> "PatchManifest":
         if not isinstance(value, dict) or set(value) != _MANIFEST_KEYS:
             raise ManifestValidationError("manifest fields are not canonical")
-        if value["schema_version"] != cls.SCHEMA_VERSION:
+        if (
+            type(value["schema_version"]) is not int
+            or value["schema_version"] != cls.SCHEMA_VERSION
+        ):
             raise ManifestValidationError("manifest schema version is unsupported")
         if not isinstance(value["entries"], list):
             raise ManifestValidationError("manifest entries are not canonical")
@@ -318,7 +337,9 @@ class PatchManifest:
         if not isinstance(value, str):
             raise ManifestValidationError("manifest JSON must be text")
         try:
-            decoded = json.loads(value)
+            decoded = json.loads(value, object_pairs_hook=_reject_duplicate_keys)
+        except ManifestValidationError:
+            raise
         except (json.JSONDecodeError, TypeError) as error:
             raise ManifestValidationError("manifest JSON is invalid") from error
         return cls.from_dict(decoded)
