@@ -31,3 +31,6 @@ vscode-extension/out/
 
 # Isolated development worktrees
 .worktrees/
+
+# Superpowers execution ledgers and review packages
+.superpowers/
