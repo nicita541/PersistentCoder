@@ -36,6 +36,21 @@ def store_for(context):
     return PatchManifestStore(context)
 
 
+def _row_dict(connection, table, where="", parameters=()):
+    columns = [row[1] for row in connection.execute(f"PRAGMA table_info({table})")]
+    row = connection.execute(f"SELECT * FROM {table} {where}", parameters).fetchone()
+    assert row is not None
+    return dict(zip(columns, row))
+
+
+def _insert_row(connection, table, row, *, command="INSERT"):
+    placeholders = ", ".join("?" for _ in row)
+    connection.execute(
+        f"{command} INTO {table} ({', '.join(row)}) VALUES ({placeholders})",
+        list(row.values()),
+    )
+
+
 def test_manifest_store_round_trip_is_ordered_and_idempotent(tmp_path):
     context, _, session_id, manifest = manifest_fixture(tmp_path)
     store = store_for(context)
@@ -77,17 +92,86 @@ def test_manifest_rows_are_immutable(tmp_path, table, operation):
             connection.execute(sql)
 
 
-def test_entry_constraints_reject_duplicate_ordinals_paths_and_foreign_owner(tmp_path):
+@pytest.mark.parametrize(
+    "constraint",
+    ["duplicate_ordinal", "duplicate_path", "foreign_owner", "case_path"],
+)
+def test_entry_constraints_reject_one_invalid_relationship(tmp_path, constraint):
     context, _, session_id, manifest = manifest_fixture(tmp_path)
     store_for(context).save(manifest, agent_session_id=session_id)
     with sqlite3.connect(context.database_path) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
-        columns = [row[1] for row in connection.execute("PRAGMA table_info(patch_manifest_entries)")]
-        original = dict(zip(columns, connection.execute("SELECT * FROM patch_manifest_entries LIMIT 1").fetchone()))
-        for changes in ({}, {"ordinal": 1}, {"project_id": "0" * 64}, {"path": "A.py", "ordinal": 2}):
-            row = original | changes
-            with pytest.raises(sqlite3.IntegrityError):
-                connection.execute(f"INSERT INTO patch_manifest_entries ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})", list(row.values()))
+        original_manifest = _row_dict(connection, "patch_manifests")
+        scratch_manifest_id = "1" * 64
+        _insert_row(
+            connection,
+            "patch_manifests",
+            original_manifest | {
+                "manifest_id": scratch_manifest_id,
+                "entry_count": 4,
+            },
+        )
+        original_entry = _row_dict(
+            connection,
+            "patch_manifest_entries",
+            "WHERE manifest_id = ? AND ordinal = 0",
+            (manifest.manifest_id,),
+        )
+        base_entry = original_entry | {
+            "manifest_id": scratch_manifest_id,
+            "ordinal": 0,
+        }
+        _insert_row(connection, "patch_manifest_entries", base_entry)
+        candidate = base_entry | {
+            "ordinal": 1,
+            "path": "fresh.py",
+            "path_key": "fresh.py",
+        }
+        changes = {
+            "duplicate_ordinal": {"ordinal": 0},
+            "duplicate_path": {"path": "a.py", "path_key": "unique-key"},
+            "foreign_owner": {"project_id": "0" * 64},
+            "case_path": {"path": "A.py", "path_key": "a.py"},
+        }[constraint]
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_row(connection, "patch_manifest_entries", candidate | changes)
+
+
+@pytest.mark.parametrize("table", ["patch_manifests", "patch_manifest_entries"])
+def test_insert_or_replace_cannot_change_immutable_rows(tmp_path, table):
+    context, _, session_id, manifest = manifest_fixture(tmp_path)
+    store_for(context).save(manifest, agent_session_id=session_id)
+    with sqlite3.connect(context.database_path) as connection:
+        if table == "patch_manifests":
+            original = _row_dict(
+                connection,
+                table,
+                "WHERE manifest_id = ?",
+                (manifest.manifest_id,),
+            )
+            replacement = original | {"workspace_sha256": "9" * 64}
+            where = "WHERE manifest_id = ?"
+            parameters = (manifest.manifest_id,)
+        else:
+            original = _row_dict(
+                connection,
+                table,
+                "WHERE manifest_id = ? AND ordinal = 0",
+                (manifest.manifest_id,),
+            )
+            replacement = original | {"after_size": 999}
+            where = "WHERE manifest_id = ? AND ordinal = 0"
+            parameters = (manifest.manifest_id,)
+
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            _insert_row(
+                connection,
+                table,
+                replacement,
+                command="INSERT OR REPLACE",
+            )
+
+        assert _row_dict(connection, table, where, parameters) == original
 
 
 def test_manifest_read_recomputes_identity_and_save_detects_collision(tmp_path):

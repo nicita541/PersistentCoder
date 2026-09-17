@@ -240,6 +240,32 @@ def _apply_journal(connection: sqlite3.Connection) -> None:
     """)
 
 
+def _immutable_manifest_insert_guards(connection: sqlite3.Connection) -> None:
+    connection.execute("""
+        CREATE TRIGGER patch_manifests_immutable_insert
+        BEFORE INSERT ON patch_manifests
+        WHEN EXISTS (
+            SELECT 1 FROM patch_manifests
+            WHERE manifest_id = NEW.manifest_id
+        )
+        BEGIN SELECT RAISE(ABORT, 'manifest is immutable'); END
+    """)
+    connection.execute("""
+        CREATE TRIGGER patch_manifest_entries_immutable_insert
+        BEFORE INSERT ON patch_manifest_entries
+        WHEN EXISTS (
+            SELECT 1 FROM patch_manifest_entries AS stored
+            WHERE stored.manifest_id = NEW.manifest_id
+            AND (
+                stored.ordinal = NEW.ordinal
+                OR stored.path = NEW.path
+                OR stored.path_key = NEW.path_key
+            )
+        )
+        BEGIN SELECT RAISE(ABORT, 'manifest is immutable'); END
+    """)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (1, "agent state snapshots", _state_snapshots),
     (2, "repair budget ledger", _budget_ledger),
@@ -247,6 +273,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (4, "revision-bound verification context", _verification_context),
     (5, "immutable patch manifests", _patch_manifests),
     (6, "transactional apply journal", _apply_journal),
+    (7, "guard immutable manifest inserts", _immutable_manifest_insert_guards),
 )
 
 

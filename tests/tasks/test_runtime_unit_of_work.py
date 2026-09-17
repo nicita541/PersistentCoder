@@ -53,7 +53,7 @@ def test_migrations_are_ordered_and_idempotent(tmp_path):
             )
         }
 
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,)]
     assert {
         "agent_state_snapshots",
         "budget_ledger",
