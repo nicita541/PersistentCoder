@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -9,6 +10,8 @@ from pathlib import Path
 from typing import Iterator
 
 from app.agent.state import AgentState
+from app.apply.manifest import PatchManifest
+from app.apply.store import insert_manifest, read_manifest
 from app.agent.session import SessionStatus
 from app.tasks.migrations import migrate
 from app.tasks.models import (
@@ -27,6 +30,13 @@ class StateAuthorityError(RuntimeError):
 
 class ConcurrentWriterError(StateAuthorityError):
     pass
+
+
+_APPLY_TRANSITIONS = {
+    "PREPARING": frozenset({"APPLYING", "ROLLED_BACK", "CONFLICT", "RECOVERY_FAILED"}),
+    "APPLYING": frozenset({"COMMITTED", "ROLLED_BACK", "RECOVERY_FAILED"}),
+    "RECOVERY_FAILED": frozenset({"ROLLED_BACK"}),
+}
 
 
 def _json_default(value: object) -> object:
@@ -870,6 +880,131 @@ class RuntimeUnitOfWork:
             return None
         return {"consumed": int(row["consumed"]), "limit": int(row["limit_value"])}
 
+    def prepare_apply(
+        self,
+        *,
+        session_id: str,
+        manifest_id: str,
+        session_version: int,
+        staging_id: str,
+        backup_id: str,
+    ) -> tuple[int, int]:
+        """Reserve project apply ownership before any source filesystem changes.
+
+        Artifact IDs name children of framework-owned project staging/backup
+        directories. Callers must not interpret them as caller-supplied paths.
+        """
+        for identifier in (staging_id, backup_id):
+            if not isinstance(identifier, str) or re.fullmatch(r"[a-zA-Z0-9_-]{1,128}", identifier) is None:
+                raise ValueError("apply artifact identifier must be project-local")
+        if self.context is None:
+            raise StateAuthorityError("apply requires a StoreContext")
+        with self.transaction() as connection:
+            manifest = read_manifest(connection, self.context, manifest_id)
+            if manifest is None:
+                raise StateAuthorityError("manifest does not belong to the current project")
+            result = connection.execute(
+                """UPDATE agent_sessions SET version = version + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND project_id = ? AND canonical_source_root = ?
+                    AND sandbox_session_id = ? AND patch_manifest_id = ?
+                    AND status = 'DIRTY_VERIFIED' AND active_run_id IS NULL
+                    AND version = ?""",
+                (session_id, self.context.project_id, self.context.canonical_source_root,
+                 manifest.session_id, manifest_id, session_version),
+            )
+            if result.rowcount != 1:
+                raise StateAuthorityError("apply session binding or version does not match")
+            cursor = connection.execute(
+                """INSERT INTO apply_journal (
+                    project_id, canonical_source_root, agent_session_id, manifest_id,
+                    state, staging_id, backup_id
+                ) VALUES (?, ?, ?, ?, 'PREPARING', ?, ?)""",
+                (self.context.project_id, self.context.canonical_source_root,
+                 session_id, manifest_id, staging_id, backup_id),
+            )
+            return int(cursor.lastrowid), session_version + 1
+
+    def transition_apply(
+        self,
+        journal_id: int,
+        *,
+        expected_state: str,
+        target_state: str,
+        session_version: int,
+        error: str | None = None,
+    ) -> int:
+        """CAS a legal journal edge and the owning session in one transaction.
+
+        Failed restoration stays pending as RECOVERY_FAILED and reserves the
+        project until a recovery caller confirms ROLLED_BACK. Only COMMITTED
+        moves the session to APPLIED; other outcomes retain its manifest.
+        """
+        if target_state not in _APPLY_TRANSITIONS.get(expected_state, ()):
+            raise StateAuthorityError(f"illegal apply transition: {expected_state} -> {target_state}")
+        if error is not None and not isinstance(error, str):
+            raise ValueError("apply error must be text")
+        if self.context is None:
+            raise StateAuthorityError("apply requires a StoreContext")
+        with self.transaction() as connection:
+            journal = connection.execute(
+                """SELECT j.*, m.session_id AS sandbox_session_id
+                FROM apply_journal j JOIN patch_manifests m ON m.manifest_id = j.manifest_id
+                WHERE j.id = ? AND j.project_id = ? AND j.canonical_source_root = ?
+                    AND j.state = ?""",
+                (journal_id, self.context.project_id, self.context.canonical_source_root, expected_state),
+            ).fetchone()
+            if journal is None:
+                raise StateAuthorityError("apply journal state or project does not match")
+            connection.execute(
+                """UPDATE apply_journal SET state = ?, error = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND state = ?""",
+                (target_state, error[:2000] if error is not None else None, journal_id, expected_state),
+            )
+            result = connection.execute(
+                """UPDATE agent_sessions SET status = ?, version = version + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND project_id = ? AND canonical_source_root = ?
+                    AND patch_manifest_id = ? AND sandbox_session_id = ?
+                    AND version = ? AND status = 'DIRTY_VERIFIED'
+                    AND active_run_id IS NULL""",
+                ("APPLIED" if target_state == "COMMITTED" else "DIRTY_VERIFIED",
+                 journal["agent_session_id"], self.context.project_id,
+                 self.context.canonical_source_root, journal["manifest_id"],
+                 journal["sandbox_session_id"], session_version),
+            )
+            if result.rowcount != 1:
+                raise StateAuthorityError("apply session binding or version does not match")
+            return session_version + 1
+
+    def get_apply_journal(self, journal_id: int) -> dict[str, object] | None:
+        if self.context is None:
+            raise StateAuthorityError("apply requires a StoreContext")
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM apply_journal WHERE id = ? AND project_id = ? AND canonical_source_root = ?",
+                (journal_id, self.context.project_id, self.context.canonical_source_root),
+            ).fetchone()
+            return dict(row) if row is not None else None
+        finally:
+            connection.close()
+
+    def pending_apply_journals(self) -> list[dict[str, object]]:
+        if self.context is None:
+            raise StateAuthorityError("apply requires a StoreContext")
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """SELECT * FROM apply_journal WHERE project_id = ? AND canonical_source_root = ?
+                    AND state IN ('PREPARING', 'APPLYING', 'RECOVERY_FAILED') ORDER BY id""",
+                (self.context.project_id, self.context.canonical_source_root),
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            connection.close()
+
     def finish_terminal(
         self,
         run_id: int,
@@ -880,6 +1015,7 @@ class RuntimeUnitOfWork:
         session_id: str | None = None,
         session_status: SessionStatus | None = None,
         session_version: int | None = None,
+        patch_manifest: PatchManifest | None = None,
     ) -> int | None:
         if run_status not in {"DONE", "FAILED", "INTERRUPTED"}:
             raise ValueError(f"invalid terminal run status: {run_status}")
@@ -889,6 +1025,17 @@ class RuntimeUnitOfWork:
             raise ValueError("session id and status must be supplied together")
         if session_id is not None and session_version is None:
             raise ValueError("session version is required")
+        if patch_manifest is not None and (
+            run_status != "DONE"
+            or state.phase.value != "DONE"
+            or state.completion != "DONE"
+            or (plan_status is not None and plan_status is not PlanStatus.DONE)
+            or session_status is not SessionStatus.DIRTY_VERIFIED
+            or session_id is None
+        ):
+            raise ValueError("manifest binding requires a successful DIRTY_VERIFIED terminal session")
+        if run_status != "DONE" and session_status is SessionStatus.DIRTY_VERIFIED:
+            raise ValueError("failed terminal run cannot become DIRTY_VERIFIED")
         old_cursor = (
             state.active_task_id,
             state.active_step_id,
@@ -902,6 +1049,23 @@ class RuntimeUnitOfWork:
         try:
             with self.transaction() as connection:
                 self._require_running_run(connection, run_id)
+                if patch_manifest is not None:
+                    owner = connection.execute(
+                        """SELECT s.id FROM agent_sessions s JOIN agent_runs r
+                            ON r.id = s.active_run_id
+                        WHERE s.id = ? AND s.project_id = ?
+                            AND s.canonical_source_root = ? AND s.version = ?
+                            AND s.status = 'RUNNING' AND s.active_run_id = ?
+                            AND s.sandbox_session_id = ? AND r.sandbox_session_id = ?""",
+                        (session_id, self.context.project_id, self.context.canonical_source_root,
+                         session_version, run_id, patch_manifest.session_id, patch_manifest.session_id),
+                    ).fetchone()
+                    if owner is None:
+                        raise StateAuthorityError("terminal session, sandbox or active run does not match")
+                    insert_manifest(
+                        connection, self.context, patch_manifest,
+                        agent_session_id=session_id, allow_existing=False,
+                    )
                 if state.plan_id is not None:
                     if not owns_plan(connection, self.context, state.plan_id):
                         raise StateAuthorityError(
@@ -944,12 +1108,14 @@ class RuntimeUnitOfWork:
                     result = connection.execute(
                         """
                         UPDATE agent_sessions SET status = ?, active_run_id = NULL,
+                            patch_manifest_id = COALESCE(?, patch_manifest_id),
                             version = version + 1, updated_at = CURRENT_TIMESTAMP
                         WHERE id = ? AND project_id = ? AND canonical_source_root = ?
                             AND version = ? AND status = 'RUNNING'
                         """,
                         (
                             session_status.value,
+                            patch_manifest.manifest_id if patch_manifest is not None else None,
                             session_id,
                             self.context.project_id,
                             self.context.canonical_source_root,

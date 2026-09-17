@@ -53,12 +53,15 @@ def test_migrations_are_ordered_and_idempotent(tmp_path):
             )
         }
 
-    assert versions == [(1,), (2,), (3,), (4,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,)]
     assert {
         "agent_state_snapshots",
         "budget_ledger",
         "file_operation_journal",
         "verifications",
+        "patch_manifests",
+        "patch_manifest_entries",
+        "apply_journal",
     } <= tables
 
 
@@ -315,3 +318,160 @@ def test_verification_record_and_step_transition_roll_back_together(tmp_path):
 
     assert stores.step_store.get_step(step.id).status is StepStatus.VERIFYING
     assert stores.verification_store.get_step_verifications(step.id) == []
+
+
+def _manifest_terminal_fixture(tmp_path):
+    from app.apply.manifest import PatchEntry, PatchManifest, PatchOperation
+
+    context = _context(tmp_path)
+    RuntimeStore(context)
+    sessions = SessionStore(context)
+    session_id = sessions.create(sandbox_session_id="sandbox-1")
+    authority = RuntimeUnitOfWork(context)
+    run_id, version = authority.start_run("build", sandbox_session_id="sandbox-1", session_id=session_id, session_version=0)
+    manifest = PatchManifest.create(
+        project_id=context.project_id, canonical_source_root=context.canonical_source_root,
+        session_id="sandbox-1", baseline_sha256="a" * 64, workspace_sha256="b" * 64,
+        verification_id="verification-1",
+        entries=[PatchEntry("a.py", PatchOperation.ADD, None, "c" * 64, None, 1, True, True, ())],
+    )
+    return context, sessions, authority, run_id, session_id, version, manifest
+
+
+def _finish_with_manifest(authority, run_id, session_id, version, manifest, **overrides):
+    arguments = dict(run_status="DONE", plan_status=None, session_id=session_id,
+                     session_status=SessionStatus.DIRTY_VERIFIED, session_version=version,
+                     patch_manifest=manifest)
+    arguments.update(overrides)
+    return authority.finish_terminal(run_id, AgentState(request="build", phase=AgentPhase.DONE, completion="DONE"), **arguments)
+
+
+def test_success_terminal_inserts_manifest_and_binds_session_atomically(tmp_path):
+    context, sessions, authority, run_id, session_id, version, manifest = _manifest_terminal_fixture(tmp_path)
+    new_version = _finish_with_manifest(authority, run_id, session_id, version, manifest)
+    from app.apply.store import PatchManifestStore
+    assert PatchManifestStore(context).get(manifest.manifest_id) == manifest
+    settled = sessions.get(session_id)
+    assert settled.patch_manifest_id == manifest.manifest_id
+    assert settled.status is SessionStatus.DIRTY_VERIFIED
+    assert settled.version == new_version == version + 1
+    assert RuntimeStore(context).get_run(run_id)["status"] == "DONE"
+
+
+@pytest.mark.parametrize("failure", ["session", "entry", "snapshot", "version"])
+def test_manifest_terminal_failure_leaves_no_partial_state(tmp_path, failure):
+    context, sessions, authority, run_id, session_id, version, manifest = _manifest_terminal_fixture(tmp_path)
+    if failure != "version":
+        table = {"session": "agent_sessions", "entry": "patch_manifest_entries", "snapshot": "agent_state_snapshots"}[failure]
+        action = "UPDATE" if failure == "session" else "INSERT"
+        with sqlite3.connect(context.database_path) as connection:
+            connection.execute(f"CREATE TRIGGER fail_terminal BEFORE {action} ON {table} BEGIN SELECT RAISE(ABORT, 'injected'); END")
+    with pytest.raises((sqlite3.IntegrityError, StateAuthorityError)):
+        _finish_with_manifest(authority, run_id, session_id, version + (failure == "version"), manifest)
+    from app.apply.store import PatchManifestStore
+    assert PatchManifestStore(context).get(manifest.manifest_id) is None
+    assert sessions.get(session_id).status is SessionStatus.RUNNING
+    assert sessions.get(session_id).patch_manifest_id is None
+    assert RuntimeStore(context).get_run(run_id)["status"] == "RUNNING"
+    assert authority.get_latest_snapshot(run_id) is None
+
+
+@pytest.mark.parametrize("run_status", ["FAILED", "INTERRUPTED"])
+def test_failed_terminal_cannot_bind_manifest_or_clear_prior_binding(tmp_path, run_status):
+    context, sessions, authority, run_id, session_id, version, manifest = _manifest_terminal_fixture(tmp_path)
+    with pytest.raises((ValueError, StateAuthorityError)):
+        _finish_with_manifest(authority, run_id, session_id, version, manifest, run_status=run_status, session_status=SessionStatus.DIRTY_FAILED)
+    with sqlite3.connect(context.database_path) as connection:
+        connection.execute("UPDATE agent_sessions SET patch_manifest_id = 'prior-manifest' WHERE id = ?", (session_id,))
+    authority.finish_terminal(run_id, AgentState(request="build", phase=AgentPhase.FAILED), run_status=run_status, plan_status=None, session_id=session_id, session_status=SessionStatus.DIRTY_FAILED, session_version=version)
+    assert sessions.get(session_id).patch_manifest_id == "prior-manifest"
+
+
+def test_terminal_manifest_requires_matching_owner_sandbox_and_active_run(tmp_path):
+    context, sessions, authority, run_id, session_id, version, manifest = _manifest_terminal_fixture(tmp_path)
+    with sqlite3.connect(context.database_path) as connection:
+        connection.execute("UPDATE agent_sessions SET sandbox_session_id = 'other' WHERE id = ?", (session_id,))
+    with pytest.raises((ValueError, StateAuthorityError), match="session|sandbox"):
+        _finish_with_manifest(authority, run_id, session_id, version, manifest)
+    with sqlite3.connect(context.database_path) as connection:
+        connection.execute("UPDATE agent_sessions SET sandbox_session_id = 'sandbox-1', active_run_id = 999 WHERE id = ?", (session_id,))
+    with pytest.raises(StateAuthorityError, match="session|run"):
+        _finish_with_manifest(authority, run_id, session_id, version, manifest)
+
+
+def test_terminal_refuses_manifest_saved_in_a_separate_transaction(tmp_path):
+    context, sessions, authority, run_id, session_id, version, manifest = _manifest_terminal_fixture(tmp_path)
+    from app.apply.store import PatchManifestStore
+    PatchManifestStore(context).save(manifest, agent_session_id=session_id)
+    with pytest.raises((ValueError, StateAuthorityError), match="transaction|already"):
+        _finish_with_manifest(authority, run_id, session_id, version, manifest)
+    assert sessions.get(session_id).status is SessionStatus.RUNNING
+
+
+def _prepared_apply(tmp_path):
+    context, sessions, authority, run_id, session_id, version, manifest = _manifest_terminal_fixture(tmp_path)
+    version = _finish_with_manifest(authority, run_id, session_id, version, manifest)
+    journal_id, version = authority.prepare_apply(session_id=session_id, manifest_id=manifest.manifest_id, session_version=version, staging_id="stage-1", backup_id="backup-1")
+    return context, sessions, authority, session_id, journal_id, version
+
+
+def test_apply_journal_cas_commits_session_and_journal_together(tmp_path):
+    _, sessions, authority, session_id, journal_id, version = _prepared_apply(tmp_path)
+    assert authority.get_apply_journal(journal_id)["state"] == "PREPARING"
+    version = authority.transition_apply(journal_id, expected_state="PREPARING", target_state="APPLYING", session_version=version)
+    version = authority.transition_apply(journal_id, expected_state="APPLYING", target_state="COMMITTED", session_version=version)
+    assert authority.get_apply_journal(journal_id)["state"] == "COMMITTED"
+    assert sessions.get(session_id).status is SessionStatus.APPLIED
+    assert sessions.get(session_id).version == version
+    assert authority.pending_apply_journals() == []
+
+
+@pytest.mark.parametrize("target", ["CONFLICT", "ROLLED_BACK", "RECOVERY_FAILED"])
+def test_apply_failure_keeps_manifest_and_records_bounded_error(tmp_path, target):
+    _, sessions, authority, session_id, journal_id, version = _prepared_apply(tmp_path)
+    before = sessions.get(session_id).patch_manifest_id
+    authority.transition_apply(journal_id, expected_state="PREPARING", target_state=target, session_version=version, error="x" * 5000)
+    journal = authority.get_apply_journal(journal_id)
+    assert journal["state"] == target
+    assert len(journal["error"]) <= 2000
+    assert sessions.get(session_id).patch_manifest_id == before
+    assert sessions.get(session_id).status is SessionStatus.DIRTY_VERIFIED
+    assert bool(authority.pending_apply_journals()) == (target == "RECOVERY_FAILED")
+
+
+def test_apply_rejects_stale_illegal_and_foreign_transitions(tmp_path):
+    _, sessions, authority, session_id, journal_id, version = _prepared_apply(tmp_path)
+    for source, target, supplied_version in [("PREPARING", "COMMITTED", version), ("APPLYING", "COMMITTED", version), ("PREPARING", "APPLYING", version - 1)]:
+        with pytest.raises((ValueError, StateAuthorityError)):
+            authority.transition_apply(journal_id, expected_state=source, target_state=target, session_version=supplied_version)
+    foreign = RuntimeUnitOfWork(_context(tmp_path, "foreign"))
+    assert foreign.get_apply_journal(journal_id) is None
+    assert foreign.pending_apply_journals() == []
+    with pytest.raises(StateAuthorityError):
+        foreign.transition_apply(journal_id, expected_state="PREPARING", target_state="APPLYING", session_version=version)
+    assert authority.get_apply_journal(journal_id)["state"] == "PREPARING"
+    assert sessions.get(session_id).version == version
+
+
+def test_apply_session_failure_rolls_back_journal_transition(tmp_path):
+    context, _, authority, _, journal_id, version = _prepared_apply(tmp_path)
+    with sqlite3.connect(context.database_path) as connection:
+        connection.execute("CREATE TRIGGER fail_apply BEFORE UPDATE ON agent_sessions BEGIN SELECT RAISE(ABORT, 'injected'); END")
+    with pytest.raises(sqlite3.IntegrityError):
+        authority.transition_apply(journal_id, expected_state="PREPARING", target_state="APPLYING", session_version=version)
+    assert authority.get_apply_journal(journal_id)["state"] == "PREPARING"
+
+
+@pytest.mark.parametrize("identifier", ["../outside", "/tmp/stage", "C:\\stage", "a/b", "a\\b", ".", "", "x" * 129])
+def test_apply_rejects_nonlocal_artifact_identifiers(tmp_path, identifier):
+    _, _, authority, run_id, session_id, version, manifest = _manifest_terminal_fixture(tmp_path)
+    version = _finish_with_manifest(authority, run_id, session_id, version, manifest)
+    with pytest.raises(ValueError, match="identifier"):
+        authority.prepare_apply(session_id=session_id, manifest_id=manifest.manifest_id, session_version=version, staging_id=identifier, backup_id="backup-1")
+
+
+def test_apply_preparation_prevents_overlapping_writers(tmp_path):
+    _, sessions, authority, session_id, journal_id, version = _prepared_apply(tmp_path)
+    with pytest.raises((StateAuthorityError, sqlite3.IntegrityError)):
+        authority.prepare_apply(session_id=session_id, manifest_id=sessions.get(session_id).patch_manifest_id, session_version=version, staging_id="stage-2", backup_id="backup-2")
+    assert len(authority.pending_apply_journals()) == 1
