@@ -59,12 +59,12 @@
 - Consumes: canonical manifest dictionaries and project-scoped `StoreContext`.
 - Produces: `PatchManifestStore.save/get`, immutable manifest rows/entries, and `RuntimeUnitOfWork` apply-journal/session transitions.
 
-- [ ] Write failing migration/store tests for project isolation, immutable rows, ordered entries, round-trip identity, and duplicate-save idempotence.
-- [ ] Add migrations for `patch_manifests`, `patch_manifest_entries`, and `apply_journal`, including identity/scope foreign keys and state checks.
-- [ ] Implement a project-scoped store that verifies canonical manifest ID while reading and refuses mutation or cross-project lookup.
-- [ ] Write failing transition tests for `PREPARING`, `APPLYING`, `COMMITTED`, `ROLLED_BACK`, `CONFLICT`, and `RECOVERY_FAILED` plus optimistic session version checks.
-- [ ] Implement atomic journal creation/state transitions and atomic session manifest binding/clearing in `RuntimeUnitOfWork`.
-- [ ] Run migration, store, session, and UoW tests.
+- [x] Write failing migration/store tests for project isolation, immutable rows, ordered entries, round-trip identity, and duplicate-save idempotence.
+- [x] Add migrations for `patch_manifests`, `patch_manifest_entries`, and `apply_journal`, including identity/scope foreign keys and state checks.
+- [x] Implement a project-scoped store that verifies canonical manifest ID while reading and refuses mutation or cross-project lookup.
+- [x] Write failing transition tests for `PREPARING`, `APPLYING`, `COMMITTED`, `ROLLED_BACK`, `CONFLICT`, and `RECOVERY_FAILED` plus optimistic session version checks.
+- [x] Implement atomic journal creation/state transitions and atomic session manifest binding/clearing in `RuntimeUnitOfWork`.
+- [x] Run migration, store, session, and UoW tests.
 
 ### Task 3: Transactional ApplyService
 
