@@ -1074,6 +1074,13 @@ class RuntimeUnitOfWork:
             or session_id is None
         ):
             raise ValueError("manifest binding requires a successful DIRTY_VERIFIED terminal session")
+        if (
+            session_status is SessionStatus.DIRTY_VERIFIED
+            and patch_manifest is None
+        ):
+            raise ValueError(
+                "a verified dirty terminal session requires an immutable manifest"
+            )
         if run_status != "DONE" and session_status is SessionStatus.DIRTY_VERIFIED:
             raise ValueError("failed terminal run cannot become DIRTY_VERIFIED")
         old_cursor = (

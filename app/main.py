@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import argparse
+from pathlib import Path
+
 from rich.console import Console
 from rich.markdown import Markdown
 
@@ -39,6 +42,10 @@ def show_commands() -> None:
     console.print(
         "[dim]/apply — применить verified patch "
         "(нужно подтверждение)[/dim]"
+    )
+    console.print(
+        "[dim]/discard — удалить неприменённые изменения "
+        "и начать с чистого source (нужно подтверждение)[/dim]"
     )
     console.print(
         "[dim]/remember текст — сохранить правило "
@@ -153,6 +160,12 @@ def render_status(runtime) -> None:
             f"{record['note']}"
         )
 
+    for record in status.get("apply_recovery") or []:
+        console.print(
+            "[yellow]apply recovery:[/yellow] "
+            f"{record['status']} — {record.get('reason') or 'ok'}"
+        )
+
 
 def render_patch(runtime) -> None:
     preview = runtime.patch_preview()
@@ -162,26 +175,37 @@ def render_patch(runtime) -> None:
         "[bold cyan]PATCH[/bold cyan]"
     )
 
-    if not preview["patch"]:
+    if not preview.get("manifest_id") and not preview.get("patch"):
         console.print(
-            "[yellow]Patch ещё не создан. "
+            "[yellow]Проверенный результат ещё не создан. "
             "Сначала выполните задачу.[/yellow]"
         )
         return
 
-    console.print(f"path: {preview['patch']}")
-    console.print(
-        f"exists: {preview['patch_exists']}"
-    )
-    console.print("changed files:")
+    if preview.get("manifest_id"):
+        console.print(f"manifest: {preview['manifest_id']}")
+    if preview.get("patch"):
+        console.print(f"review diff: {preview['patch']}")
+        console.print(f"diff exists: {preview['patch_exists']}")
+    console.print("changes:")
 
     changed = preview["changed_files"] or []
 
     if not changed:
         console.print("  (нет)")
 
-    for path in changed:
-        console.print(f"  - {path}")
+    entries = preview.get("entries") or []
+    if entries:
+        for entry in entries:
+            suffix = ""
+            if not entry.get("apply_safe"):
+                suffix = " — BLOCKED: " + ", ".join(entry.get("reasons") or [])
+            console.print(
+                f"  - {entry.get('operation')} {entry.get('path')}{suffix}"
+            )
+    else:
+        for path in changed:
+            console.print(f"  - {path}")
 
     verification = preview.get(
         "verification"
@@ -238,9 +262,9 @@ def render_timeline(runtime) -> None:
 def apply_patch_with_confirmation(runtime) -> None:
     preview = runtime.patch_preview()
 
-    if not preview["patch"]:
+    if not preview.get("manifest_id") and not preview.get("patch"):
         console.print(
-            "[yellow]Patch не создан: "
+            "[yellow]Проверенный результат не создан: "
             "нечего применять.[/yellow]"
         )
         return
@@ -250,8 +274,11 @@ def apply_patch_with_confirmation(runtime) -> None:
     )
 
     if (
-        preview.get("phase") != "DONE"
-        or not verification.get("ok")
+        not preview.get("manifest_id")
+        and (
+            preview.get("phase") != "DONE"
+            or not verification.get("ok")
+        )
     ):
         console.print(
             "[bold red]Apply запрещён: "
@@ -260,6 +287,14 @@ def apply_patch_with_confirmation(runtime) -> None:
         )
         console.print(
             "[dim]Изменения не применены.[/dim]"
+        )
+        return
+
+    if preview.get("manifest_id") and not preview.get("can_apply"):
+        console.print(
+            "[bold red]Apply запрещён: "
+            f"{preview.get('manifest_reason') or 'manifest содержит заблокированные пути'}."
+            "[/bold red]"
         )
         return
 
@@ -295,6 +330,28 @@ def apply_patch_with_confirmation(runtime) -> None:
 
     for path in applied:
         console.print(f"  - {path}")
+
+
+def discard_session_with_confirmation(runtime) -> None:
+    session = getattr(runtime, "session", None)
+    status = getattr(getattr(session, "status", None), "value", None)
+    if status not in {"DIRTY_VERIFIED", "DIRTY_FAILED"}:
+        console.print("[yellow]Нет неприменённых изменений.[/yellow]")
+        return
+
+    answer = console.input(
+        "[bold yellow]Discard all sandbox changes? "
+        "[y/N]:[/bold yellow] "
+    ).strip().casefold()
+    if answer not in {"y", "yes", "д", "да"}:
+        console.print("[yellow]Discard отменён.[/yellow]")
+        return
+
+    runtime.discard_session()
+    console.print(
+        "[green]Неприменённые изменения удалены; "
+        "сессия снова CLEAN.[/green]"
+    )
 
 
 def render_result(state, runtime) -> str:
@@ -492,7 +549,7 @@ def make_progress_reporter(console):
     return report
 
 
-def main() -> None:
+def main(project_root: str | Path | None = None) -> None:
     console.print(
         "[bold cyan]PersistentCoder[/bold cyan]"
     )
@@ -515,7 +572,8 @@ def main() -> None:
     # ==========================================
 
     try:
-        runtime = AgentRuntime()
+        target_project = Path(project_root or Path.cwd()).resolve()
+        runtime = AgentRuntime(project_root=target_project)
 
     except Exception as exc:
         console.print(
@@ -530,6 +588,11 @@ def main() -> None:
     )
     console.print(
         "[green]PersistentCoder готов.[/green]"
+    )
+
+    console.print(
+        "[green]Проект:[/green] "
+        f"{runtime.source_project_root}"
     )
 
     console.print(
@@ -610,6 +673,10 @@ def main() -> None:
             )
             continue
 
+        if normalized == "/discard":
+            discard_session_with_confirmation(runtime)
+            continue
+
         if normalized.startswith("/remember "):
             content = user_input[
                 len("/remember "):
@@ -687,5 +754,15 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="Run PersistentCoder for one source project",
+    )
+    parser.add_argument(
+        "project_root",
+        nargs="?",
+        default=str(Path.cwd()),
+        help="source project directory (defaults to current directory)",
+    )
+    arguments = parser.parse_args()
+    main(arguments.project_root)
 

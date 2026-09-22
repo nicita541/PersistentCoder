@@ -358,6 +358,21 @@ def test_success_terminal_inserts_manifest_and_binds_session_atomically(tmp_path
     assert RuntimeStore(context).get_run(run_id)["status"] == "DONE"
 
 
+def test_verified_dirty_terminal_cannot_exist_without_manifest(tmp_path):
+    _, sessions, authority, run_id, session_id, version, _ = _manifest_terminal_fixture(tmp_path)
+    with pytest.raises(ValueError, match="requires an immutable manifest"):
+        authority.finish_terminal(
+            run_id,
+            AgentState(request="build", phase=AgentPhase.DONE, completion="DONE"),
+            run_status="DONE",
+            plan_status=None,
+            session_id=session_id,
+            session_status=SessionStatus.DIRTY_VERIFIED,
+            session_version=version,
+        )
+    assert sessions.get(session_id).status is SessionStatus.RUNNING
+
+
 @pytest.mark.parametrize("failure", ["session", "entry", "snapshot", "version"])
 def test_manifest_terminal_failure_leaves_no_partial_state(tmp_path, failure):
     context, sessions, authority, run_id, session_id, version, manifest = _manifest_terminal_fixture(tmp_path)

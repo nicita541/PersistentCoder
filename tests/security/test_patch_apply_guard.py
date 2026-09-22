@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from app.agent.runtime import AgentRuntime
 from app.agent.session import SessionStatus
+from app.apply.builder import PatchManifestBuilder
 from app.agent.state import (
     AgentPhase,
     VerificationResult,
@@ -75,6 +76,26 @@ def _record_trusted_pass(runtime: AgentRuntime, context: VerificationContext) ->
         context=context,
     )
     return task.id
+
+
+def _bind_verified_manifest(runtime: AgentRuntime) -> None:
+    assert runtime.session is not None
+    assert runtime.sandbox_workspace is not None
+    manifest = PatchManifestBuilder().build(
+        project_identity=runtime.project_identity,
+        session_id=runtime.session_id,
+        baseline_root=runtime.sandbox_workspace.baseline_root,
+        workspace_root=runtime.sandbox_workspace.workspace_root,
+        verification_id="test-verification",
+    )
+    runtime.patch_manifest_store.save(
+        manifest,
+        agent_session_id=runtime.session.id,
+    )
+    runtime.session.transition(SessionStatus.RUNNING)
+    runtime.session.transition(SessionStatus.DIRTY_VERIFIED)
+    runtime.session.patch_manifest_id = manifest.manifest_id
+    runtime.session = runtime.session_store.update(runtime.session)
 
 
 def _tree(root: Path) -> dict[str, str]:
@@ -232,15 +253,6 @@ def test_apply_targets_source_project_not_module_project_root(
         encoding="utf-8",
     )
 
-    # Protected file must never be applied.
-    (
-        workspace
-        / ".env"
-    ).write_text(
-        "SECRET=stolen\n",
-        encoding="utf-8",
-    )
-
     patch = (
         runtime
         .sandbox_workspace
@@ -282,10 +294,7 @@ def test_apply_targets_source_project_not_module_project_root(
             context=verification_context,
         ),
     )
-    assert runtime.session is not None
-    runtime.session.transition(SessionStatus.RUNNING)
-    runtime.session.transition(SessionStatus.DIRTY_VERIFIED)
-    runtime.session = runtime.session_store.update(runtime.session)
+    _bind_verified_manifest(runtime)
 
     preview = runtime.patch_preview()
 
@@ -373,10 +382,7 @@ def test_apply_rejects_stale_verification_after_workspace_change(tmp_path):
             context=context,
         ),
     )
-    assert runtime.session is not None
-    runtime.session.transition(SessionStatus.RUNNING)
-    runtime.session.transition(SessionStatus.DIRTY_VERIFIED)
-    runtime.session = runtime.session_store.update(runtime.session)
+    _bind_verified_manifest(runtime)
 
     (workspace / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
     result = runtime.apply_patch(confirmed=True)

@@ -224,6 +224,11 @@ class AgentController:
         ]
         files = context.get("files_to_inspect", [])
         checks = context.get("verification_plan", [])
+        evidence = context.get("evidence", [])
+        do_not_repeat = context.get("do_not_repeat", [])
+        lines.append("analysis_effort: " + str(context.get("analysis_effort", "LOW")))
+        lines.append("evidence: " + "; ".join(str(item) for item in evidence))
+        lines.append("do_not_repeat: " + "; ".join(str(item) for item in do_not_repeat))
         lines.append("files_to_inspect: " + ", ".join(str(item) for item in files))
         lines.append("verification_plan: " + "; ".join(str(item) for item in checks))
         return "\n".join(lines)[:4000]
@@ -525,6 +530,9 @@ class AgentController:
                     "required_different_approach": outcome.approach.new_approach,
                     "files_to_inspect": outcome.approach.files_to_inspect,
                     "verification_plan": outcome.approach.verification_plan,
+                    "evidence": outcome.approach.evidence,
+                    "do_not_repeat": outcome.approach.do_not_repeat,
+                    "analysis_effort": outcome.approach.analysis_effort,
                 }
                 if outcome.approach is not None
                 else {}

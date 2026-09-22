@@ -89,6 +89,7 @@ def test_help_status_plan_memory_patch_are_available(
         "/memory",
         "/patch",
         "/apply",
+        "/discard",
         "/exit",
     ):
         assert command in text
@@ -205,3 +206,46 @@ def test_apply_is_refused_without_a_verified_done_run(
 
     assert "Apply запрещён" in text
     assert "не применены" in text
+
+
+def test_discard_requires_confirmation_and_cleans_dirty_session(monkeypatch):
+    called = []
+    runtime = SimpleNamespace(
+        session=SimpleNamespace(
+            status=SimpleNamespace(value="DIRTY_VERIFIED"),
+        ),
+        discard_session=lambda: called.append(True),
+    )
+    buffer = _capture(monkeypatch)
+    monkeypatch.setattr(main_module.console, "input", lambda _prompt: "yes")
+
+    main_module.discard_session_with_confirmation(runtime)
+
+    assert called == [True]
+    assert "сессия снова CLEAN" in buffer.getvalue()
+
+
+def test_cli_binds_runtime_to_explicit_project_root(tmp_path, monkeypatch):
+    project = tmp_path / "user project"
+    project.mkdir()
+    observed = []
+
+    class RuntimeFixture:
+        def __init__(self, *, project_root):
+            observed.append(Path(project_root))
+            self.source_project_root = Path(project_root)
+            self.events = SimpleNamespace(subscribe=lambda _callback: None)
+
+        @staticmethod
+        def sandbox_status():
+            return "available"
+
+    buffer = _capture(monkeypatch)
+    monkeypatch.setattr(main_module, "AgentRuntime", RuntimeFixture)
+    monkeypatch.setattr(main_module, "configure_project_env", lambda: None)
+    monkeypatch.setattr(main_module.console, "input", lambda _prompt: "/exit")
+
+    main_module.main(project)
+
+    assert observed == [project.resolve()]
+    assert str(project.resolve()) in buffer.getvalue()

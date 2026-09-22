@@ -270,6 +270,13 @@ def test_e2e_repair_changes_approach_and_passes(
         + [
             _scoped_coder_envelopes()[0],
             _scoped_coder_envelopes(BROKEN_CALCULATOR)[1],
+            json.dumps(
+                {
+                    "root_cause": "calculator.py has a syntax error",
+                    "do_not_repeat": "do not reuse the broken function definition",
+                    "next_action": "replace calculator.py with complete valid functions",
+                }
+            ),
             _scoped_coder_envelopes()[1],
             _scoped_coder_envelopes()[2],
         ]

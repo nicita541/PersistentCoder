@@ -62,37 +62,46 @@ def test_applies_real_file_change(tmp_path):
     assert result.evidence
 
 
-def test_command_is_refused_without_sandbox(tmp_path):
+def test_legacy_command_is_refused_before_file_write(tmp_path):
     command = 'python -c "print(123)"'
 
-    llm = FakeLLM([coder_envelope(command=command)])
+    llm = FakeLLM(
+        [
+            envelope(
+                files=[{"path": "artifact.txt", "content": "hello"}],
+                commands=[command],
+            )
+        ]
+    )
 
     agent, _ = _agent(tmp_path, llm)
 
     result = agent.execute(FakeTask())
 
-    # No sandbox runner -> the command must NOT run on the host.
+    # Legacy model-provided shell text is rejected before any write.
     assert result.ok is False
-    assert "host" in result.failure_reason
+    assert "arbitrary commands" in result.failure_reason
     assert result.commands == []
+    assert not (tmp_path / "artifact.txt").exists()
 
 
-def test_command_runs_through_injected_sandbox_runner(
+def test_typed_tool_runs_through_injected_sandbox_runner(
     tmp_path,
 ):
-    command = "pytest -q"
+    tool = {"tool": "python_module", "module": "demo", "args": ["--check"]}
 
     runner = RecordingCommandRunner(
         stdout="1 passed"
     )
 
-    llm = FakeLLM([coder_envelope(command=command)])
+    llm = FakeLLM([coder_envelope(tool=tool)])
 
     agent, _ = _agent(tmp_path, llm, runner)
 
     result = agent.execute(FakeTask())
 
-    assert runner.commands == [command]
+    assert runner.commands == []
+    assert runner.argv_commands == [["python", "-m", "demo", "--check"]]
     assert result.ok is True
     assert result.commands[0].ok is True
     assert "1 passed" in result.commands[0].stdout
@@ -137,7 +146,11 @@ def test_docker_command_timing_is_reported(tmp_path):
     executor = CodeExecutor(
         workspace=workspace,
         llm=FakeLLM(
-            [coder_envelope(command="python -m pytest -q")]
+            [
+                coder_envelope(
+                    tool={"tool": "python_module", "module": "demo", "args": []}
+                )
+            ]
         ),
         context=ContextBuilder(project=workspace.project),
         command_runner=RecordingCommandRunner(stdout="1 passed"),
@@ -183,15 +196,15 @@ def test_empty_envelope_is_not_fake_success(tmp_path):
     assert "nothing" in result.summary
 
 
-def test_failed_command_is_not_ok(tmp_path):
-    command = "pytest -q"
+def test_failed_typed_tool_is_not_ok(tmp_path):
+    tool = {"tool": "python_module", "module": "demo", "args": []}
 
     runner = RecordingCommandRunner(
         returncode=3,
         stderr="failed",
     )
 
-    llm = FakeLLM([coder_envelope(command=command)])
+    llm = FakeLLM([coder_envelope(tool=tool)])
 
     agent, _ = _agent(tmp_path, llm, runner)
 

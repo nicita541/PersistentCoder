@@ -7,16 +7,16 @@ from app.agent.state import (
     ExecutionResult,
 )
 from app.agent.coder.protocol import ActionEnvelopeDecoder, ProtocolError
+from app.agent.coder.tool_protocol import ToolProtocolError, decode_tool_calls
 from app.sandbox.limits import (
     DEFAULT_LIMITS,
-    LimitExceeded,
 )
 from app.sandbox.policy import (
-    CommandPolicy,
     PolicyViolation,
 )
 from app.context.builder import ACTION_PROTOCOL
 from app.sandbox.project_path import ProjectPath, ProjectPathError
+from app.sandbox.project_tool_runner import ProjectToolRunner
 from app.tasks.change_scope import AllowedChangeSet, ChangeScopeError
 
 
@@ -56,7 +56,7 @@ class CodeExecutor:
         system_prompt: str | None = None,
         max_new_tokens: int = 1024,
         run_commands: bool = True,
-        command_runner=None,
+        command_runner: ProjectToolRunner | None = None,
         limits=DEFAULT_LIMITS,
         known_files=None,
         on_event=None,
@@ -159,7 +159,7 @@ class CodeExecutor:
                 "role": "user",
                 "content": (
                     f"Task: {task}\n"
-                    "Return JSON with files/commands."
+                    "Return JSON with files/tools."
                 ),
             },
         ]
@@ -194,6 +194,8 @@ class CodeExecutor:
         transcript: list[str] = []
         envelope_errors = 0
         observation_bytes = 0
+        observation_attempts: dict[str, int] = {}
+        observation_labels: dict[str, str] = {}
 
         for iteration in range(
             1,
@@ -334,6 +336,22 @@ class CodeExecutor:
                     observed,
                 )
 
+                observation_key = repr(
+                    (
+                        action,
+                        proposal.get("path"),
+                        proposal.get("pattern"),
+                        proposal.get("query") or proposal.get("text"),
+                    )
+                )
+                observation_attempts[observation_key] = (
+                    observation_attempts.get(observation_key, 0) + 1
+                )
+                observation_labels[observation_key] = (
+                    f"{action}:"
+                    f"{proposal.get('path') or proposal.get('pattern') or proposal.get('query') or proposal.get('text') or ''}"
+                )
+
                 observation_bytes += len(text.encode("utf-8"))
                 if observation_bytes > self.limits.max_observe_bytes:
                     return self._fail(
@@ -381,13 +399,25 @@ class CodeExecutor:
                     )
 
                 transcript.append(text)
+                if not _ok:
+                    transcript.append(
+                        "SYSTEM FEEDBACK: this observation failed. Do not repeat "
+                        "the same observation. If the allowed target does not "
+                        "exist, create it now with an edit action containing "
+                        "complete file content."
+                    )
+                elif observation_attempts[observation_key] > 1:
+                    transcript.append(
+                        "SYSTEM FEEDBACK: this observation is already known. "
+                        "Do not repeat it; make the requested edit now."
+                    )
 
                 continue
 
             if action == "edit":
                 if (
                     "files" not in proposal
-                    and "commands" not in proposal
+                    and "tools" not in proposal
                 ):
                     # Valid JSON, but the model described WHAT it
                     # wants instead of providing the payload (very
@@ -401,7 +431,7 @@ class CodeExecutor:
                     ):
                         return self._fail(
                             "action envelope has no "
-                            "files or commands",
+                            "files or tools",
                             "empty action envelope",
                             ["empty_action_envelope"],
                             observed,
@@ -446,7 +476,7 @@ class CodeExecutor:
                 return self._fail(
                     "unknown action",
                     f"unknown action: {action!r}",
-                    ["unknown_action"],
+                    ["unknown_action", "model_response:" + answer[:400]],
                     observed,
                 )
 
@@ -460,10 +490,15 @@ class CodeExecutor:
 
             continue
 
+        repeated = [
+            f"repeated_observation:{observation_labels[key]}:{count}"
+            for key, count in observation_attempts.items()
+            if count > 1
+        ]
         return self._fail(
             "tool loop budget exceeded",
             "max tool iterations exceeded",
-            ["tool_loop_budget"],
+            ["tool_loop_budget", *repeated],
             observed,
         )
 
@@ -585,10 +620,14 @@ class CodeExecutor:
         """
 
         files = proposal.get("files")
-        commands = proposal.get("commands")
+        tools = proposal.get("tools")
+        legacy_commands = proposal.get("commands")
 
-        if files is None and commands is None:
-            return "action envelope has no files or commands"
+        if files is None and tools is None:
+            return "action envelope has no files or tools"
+
+        if legacy_commands not in (None, []):
+            return "arbitrary commands are forbidden; use typed tools"
 
         if files is not None:
             if not isinstance(files, list):
@@ -686,31 +725,13 @@ class CodeExecutor:
                             f"must read {project_path.value} before editing"
                         )
 
-        if commands is not None:
-            if not isinstance(commands, list):
-                return "'commands' must be a list"
-
-            policy = getattr(
-                self.command_runner,
-                "policy",
-                None,
-            ) or CommandPolicy()
-
-            for command in commands:
-                if (
-                    not isinstance(command, str)
-                    or not command.strip()
-                ):
-                    return (
-                        "each command must be a "
-                        "non-empty string"
-                    )
-
-                try:
-                    policy.validate(command)
-
-                except PolicyViolation as error:
-                    return str(error)
+        try:
+            decode_tool_calls(
+                tools,
+                allowed_changes=allowed_changes,
+            )
+        except ToolProtocolError as error:
+            return str(error)
 
         return None
 
@@ -722,14 +743,14 @@ class CodeExecutor:
         cancellation_token=None,
     ) -> ExecutionResult:
         files = proposal.get("files")
-        commands = proposal.get("commands")
+        tools = proposal.get("tools")
 
-        if files is None and commands is None:
+        if files is None and tools is None:
             return ExecutionResult(
                 ok=False,
                 summary=(
                     "action envelope has no "
-                    "files or commands"
+                    "files or tools"
                 ),
                 failure_reason=(
                     "empty action envelope"
@@ -881,80 +902,51 @@ class CodeExecutor:
 
 
         # --------------------------------------
-        # COMMANDS
+        # TYPED TOOLS — argv only, never model-provided shell text
         # --------------------------------------
 
-        if commands is not None:
-            if not isinstance(commands, list):
+        if tools is not None:
+            try:
+                tool_calls = decode_tool_calls(tools)
+            except ToolProtocolError as error:
                 return ExecutionResult(
                     ok=False,
-                    summary=(
-                        "'commands' must be a list"
-                    ),
-                    failure_reason="invalid commands",
-                    evidence=["invalid_commands"],
+                    summary="invalid typed tool call",
+                    failure_reason=str(error),
+                    evidence=["invalid_tool_call"],
                 )
 
             if self.run_commands:
-                for command in commands:
-                    if (
-                        not isinstance(command, str)
-                        or not command.strip()
-                    ):
+                for tool_call in tool_calls:
+                    runner = getattr(self.command_runner, "run_argv", None)
+                    if runner is None:
                         return ExecutionResult(
                             ok=False,
-                            summary=(
-                                "each command must be "
-                                "a non-empty string"
-                            ),
+                            summary="typed tools are disabled",
                             failure_reason=(
-                                "invalid command"
+                                "no argv-only project runner; refusing to execute"
                             ),
-                            evidence=[
-                                "invalid_command"
-                            ],
-                        )
-
-                    if self.command_runner is None:
-                        return ExecutionResult(
-                            ok=False,
-                            summary=(
-                                "commands are disabled"
-                            ),
-                            failure_reason=(
-                                "no sandbox command "
-                                "runner; refusing to "
-                                "execute on host"
-                            ),
-                            evidence=[
-                                f"blocked_command:{command}"
-                            ],
+                            evidence=[f"blocked_tool:{tool_call.name}"],
                         )
 
                     try:
                         command_started = time.time()
-
                         if cancellation_token is None:
-                            result = self.command_runner.run(command)
+                            result = runner(list(tool_call.argv))
                         else:
-                            result = self.command_runner.run(
-                                command,
+                            result = runner(
+                                list(tool_call.argv),
                                 cancellation_token=cancellation_token,
                             )
 
                         self._notify(
                             "docker_command",
                             {
-                                "command": command[:200],
-                                "returncode": (
-                                    result.returncode
-                                ),
+                                "tool": tool_call.name,
+                                "command": tool_call.label[:200],
+                                "returncode": result.returncode,
                                 "duration_ms": int(
-                                    (
-                                        time.time()
-                                        - command_started
-                                    )
-                                    * 1000
+                                    (time.time() - command_started) * 1000
                                 ),
                             },
                         )
@@ -962,30 +954,19 @@ class CodeExecutor:
                     except PolicyViolation as error:
                         return ExecutionResult(
                             ok=False,
-                            summary=(
-                                "command rejected by "
-                                "policy"
-                            ),
+                            summary="typed tool rejected by policy",
                             failure_reason=str(error),
-                            evidence=[
-                                f"blocked_command:{command}"
-                            ],
+                            evidence=[f"blocked_tool:{tool_call.name}"],
                         )
 
                     execution = CommandExecution(
-                        command=command,
+                        command=tool_call.label,
                         returncode=result.returncode,
                         stdout=result.stdout,
                         stderr=result.stderr,
                     )
-
-                    command_results.append(
-                        execution
-                    )
-
-                    evidence.append(
-                        execution.as_evidence()
-                    )
+                    command_results.append(execution)
+                    evidence.append(execution.as_evidence())
 
         # --------------------------------------
         # REAL-EXECUTION GUARD
@@ -996,7 +977,7 @@ class CodeExecutor:
                 ok=False,
                 summary="nothing was executed",
                 failure_reason=(
-                    "no file changes and no commands"
+                    "no file changes and no tool calls"
                 ),
                 evidence=(
                     evidence
@@ -1004,26 +985,26 @@ class CodeExecutor:
                 ),
             )
 
-        commands_ok = all(
+        tools_ok = all(
             result.ok
             for result in command_results
         )
 
         failure_reason = None
 
-        if not commands_ok:
+        if not tools_ok:
             failure_reason = (
-                "one or more commands failed"
+                "one or more tool calls failed"
             )
 
         summary = (
             f"applied {len(artifacts)} file(s), "
             f"ran {len(command_results)} "
-            f"command(s)"
+            f"tool call(s)"
         )
 
         return ExecutionResult(
-            ok=commands_ok,
+            ok=tools_ok,
             summary=summary,
             artifacts=artifacts,
             evidence=evidence,

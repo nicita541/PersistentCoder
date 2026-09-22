@@ -204,7 +204,7 @@ def test_describe_only_envelope_fails_after_bounded_retries(
     result = agent.execute(FakeTask())
 
     assert result.ok is False
-    assert "no files or commands" in result.summary
+    assert "no files or tools" in result.summary
     assert not (tmp_path / "calculator.py").exists()
 
 
@@ -224,7 +224,7 @@ def test_markdown_fenced_envelope_is_accepted(tmp_path):
                             ),
                         }
                     ],
-                    "commands": [],
+                    "tools": [],
                 }
             )
             + "\n```"

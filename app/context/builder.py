@@ -15,20 +15,27 @@ ACTION_PROTOCOL = (
     '1) list sandbox files: {"action": "list", "pattern": "**/*.py"}\n'
     '2) read one file:      {"action": "read", "path": "relative/file.py"}\n'
     '3) search the repo:    {"action": "search", "query": "def add"}\n'
-    "4) create/update files: {\"action\": \"edit\",\n"
+    "4) create/update files and run typed tools: {\"action\": \"edit\",\n"
     '     "files": [{"path": "relative/file.py", '
     '"content": "COMPLETE new file content"}],\n'
-    '     "commands": ["python -m pytest -q test_your_module.py"]}\n'
+    '     "tools": [{"tool": "py_compile", "paths": ["relative/file.py"]}]}\n'
+    "Typed tools (there are NO arbitrary shell commands):\n"
+    '- {"tool": "py_compile", "paths": ["src/module.py"]}\n'
+    '- {"tool": "pytest", "targets": ["tests/test_module.py"], "options": ["-q"]}\n'
+    '- {"tool": "python_file", "path": "scripts/check.py", "args": ["--quick"]}\n'
+    '- {"tool": "python_module", "module": "package", "args": ["--help"]}\n'
     "Rules:\n"
     "- paths are always RELATIVE, never absolute;\n"
     "- an existing file must be READ in this task before it is "
     "edited;\n"
+    "- if READ reports that an allowed target is missing, do not read it "
+    "again; CREATE it directly with complete content;\n"
     '- "content" is the COMPLETE new file content, not a diff;\n'
     "- keep every file SHORT and focused on the current step: only "
     "the requested functions. A reply that is cut off before the "
     "closing brace is an invalid reply;\n"
     "- one file per reply is enough; do the rest in later steps;\n"
-    "- commands run only inside the sandbox container;\n"
+    "- typed tools run only through the bounded project runner;\n"
     "- run only the tests related to your change (name the test "
     "files explicitly); never run an unrelated whole-repository "
     "test suite."

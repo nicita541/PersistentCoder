@@ -64,13 +64,12 @@ def _strip_fence(raw: str) -> str:
 
 def _extract_object(text: str) -> dict[str, object]:
     decoder = json.JSONDecoder()
-    for index, char in enumerate(text):
-        if char != "{":
-            continue
+    index = text.find("{")
+    if index >= 0:
         try:
             value, _ = decoder.raw_decode(text[index:])
         except json.JSONDecodeError:
-            continue
+            value = None
         if isinstance(value, dict):
             return value
     raise ProtocolError("INVALID_JSON", "model did not return valid JSON")
@@ -83,6 +82,41 @@ def _repair_triple_content(text: str) -> str:
         lambda match: match.group(1) + json.dumps(match.group(2)),
         text,
     )
+
+
+_SINGLE_CONTENT_ENVELOPE = re.compile(
+    r'(?P<head>\{.*?"content"\s*:\s*")'
+    r'(?P<body>.*)'
+    r'(?P<tail>"\s*}\s*]\s*'
+    r'(?:,\s*"tools"\s*:\s*\[.*\])?\s*})\s*$',
+    re.DOTALL,
+)
+
+
+def _repair_unescaped_single_content(text: str) -> str:
+    """Repair only the observed one-file JSON deviation.
+
+    Qwen occasionally leaves quotes inside a Python source string unescaped.
+    The outer envelope shape remains fixed and anchored at the end.  This is a
+    string repair, never evaluation of Python or model-provided code.
+    """
+
+    match = _SINGLE_CONTENT_ENVELOPE.search(text)
+    if match is None:
+        return text
+
+    body = match.group("body")
+    repaired: list[str] = []
+    backslashes = 0
+    for char in body:
+        if char == '"' and backslashes % 2 == 0:
+            repaired.append("\\")
+        repaired.append(char)
+        if char == "\\":
+            backslashes += 1
+        else:
+            backslashes = 0
+    return match.group("head") + "".join(repaired) + match.group("tail")
 
 
 def _content_key(entry: dict[str, object]) -> str | None:
@@ -106,6 +140,7 @@ class ActionEnvelopeDecoder:
             proposal = _extract_object(text)
         except ProtocolError as first_error:
             repaired = _repair_triple_content(text)
+            repaired = _repair_unescaped_single_content(repaired)
             if repaired == text:
                 raise first_error
             proposal = _extract_object(repaired)
@@ -131,7 +166,7 @@ class ActionEnvelopeDecoder:
             if action in {"delete", "delete_file", "remove_file"}:
                 return "delete"
             return action
-        if "files" in proposal or "commands" in proposal:
+        if "files" in proposal or "tools" in proposal or "commands" in proposal:
             return "edit"
         if isinstance(proposal.get("file"), dict):
             return "edit"
@@ -155,7 +190,7 @@ class ActionEnvelopeDecoder:
             return {
                 "action": "edit",
                 "files": [{"path": path, "operation": "delete"}],
-                "commands": [],
+                "tools": [],
             }
 
         normalized = dict(proposal)
@@ -170,7 +205,11 @@ class ActionEnvelopeDecoder:
                 for path, content in files.items()
             ]
 
-        if files is None and "commands" not in normalized:
+        if (
+            files is None
+            and "tools" not in normalized
+            and "commands" not in normalized
+        ):
             entry = normalized.get("file")
             if isinstance(entry, str):
                 key = _content_key(normalized)

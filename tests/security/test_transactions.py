@@ -123,7 +123,11 @@ def test_failed_attempt_rolls_back_sandbox(tmp_path):
     sandbox workspace.
     """
 
-    command = 'python -c "import sys; sys.exit(2)"'
+    tool = {
+        "tool": "python_module",
+        "module": "persistentcoder_missing_module",
+        "args": [],
+    }
 
     llm = FakeLLM(
         [
@@ -131,7 +135,7 @@ def test_failed_attempt_rolls_back_sandbox(tmp_path):
             tasks_response(),
             dependencies_response(),
         ],
-        default=coder_envelope(command=command),
+        default=coder_envelope(tool=tool),
     )
 
     runtime = AgentRuntime(
@@ -144,7 +148,7 @@ def test_failed_attempt_rolls_back_sandbox(tmp_path):
 
     assert state.phase.value == "FAILED"
 
-    # The coder wrote artifact.txt, then the command failed; the
+    # The coder wrote artifact.txt, then the typed tool failed; the
     # attempt rollback must have removed it again.
     assert not (
         runtime.workspace_root / "artifact.txt"

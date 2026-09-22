@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from app.agent.runtime import AgentRuntime, DirtySessionError
 from app.agent.state import AgentPhase, VerificationResult
 from app.agent.session import SessionStatus
+from app.apply.builder import PatchManifestBuilder
 from app.tasks.verification_context import VerificationContext
 from app.tasks.models import (
     PlanDraft,
@@ -48,6 +51,26 @@ def _runtime(tmp_path: Path) -> AgentRuntime:
     )
 
 
+def _bind_verified_manifest(runtime: AgentRuntime) -> None:
+    assert runtime.session is not None
+    assert runtime.sandbox_workspace is not None
+    manifest = PatchManifestBuilder().build(
+        project_identity=runtime.project_identity,
+        session_id=runtime.session_id,
+        baseline_root=runtime.sandbox_workspace.baseline_root,
+        workspace_root=runtime.sandbox_workspace.workspace_root,
+        verification_id="test-verification",
+    )
+    runtime.patch_manifest_store.save(
+        manifest,
+        agent_session_id=runtime.session.id,
+    )
+    runtime.session.transition(SessionStatus.RUNNING)
+    runtime.session.transition(SessionStatus.DIRTY_VERIFIED)
+    runtime.session.patch_manifest_id = manifest.manifest_id
+    runtime.session = runtime.session_store.update(runtime.session)
+
+
 def test_runtime_binds_storage_before_opening_stores(
     tmp_path: Path,
 ) -> None:
@@ -57,6 +80,29 @@ def test_runtime_binds_storage_before_opening_stores(
         tmp_path / "project"
     ).resolve()
     assert runtime.runtime_store.database_path == tmp_path / "runtime.db"
+
+
+def test_apply_staging_uses_framework_storage_on_source_volume(tmp_path) -> None:
+    runtime = _runtime(tmp_path)
+
+    assert runtime._apply_staging_root() == runtime.project_storage.tmp_root / "apply"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows drive selection")
+def test_apply_staging_moves_beside_project_for_another_drive(tmp_path) -> None:
+    runtime = _runtime(tmp_path)
+    source_drive = runtime.source_project_root.drive.casefold()
+    other_drive = "c:" if source_drive != "c:" else "z:"
+    runtime.project_storage = SimpleNamespace(
+        tmp_root=Path(f"{other_drive}/persistentcoder/storage/tmp")
+    )
+
+    staging = runtime._apply_staging_root()
+
+    assert staging.parent == runtime.source_project_root.parent
+    assert staging.name == (
+        ".persistentcoder-apply-" + runtime.project_identity.project_id[:16]
+    )
     assert runtime.runtime_store.context == runtime.store_context
     assert runtime.plan_store.context == runtime.store_context
     assert runtime.session is not None
@@ -129,6 +175,7 @@ def test_verified_run_claims_and_leaves_dirty_session(
     assert state.phase is AgentPhase.DONE
     assert runtime.session is not None
     assert runtime.session.status is SessionStatus.DIRTY_VERIFIED
+    assert runtime.session.patch_manifest_id is not None
     assert runtime.session.active_run_id is None
     run = runtime.runtime_store.get_run(runtime.last_run_id)
     assert run is not None
@@ -192,9 +239,7 @@ def test_apply_rebases_session_to_clean_source(
             ),
         },
     )()
-    runtime.session.transition(SessionStatus.RUNNING)
-    runtime.session.transition(SessionStatus.DIRTY_VERIFIED)
-    runtime.session = runtime.session_store.update(runtime.session)
+    _bind_verified_manifest(runtime)
 
     result = runtime.apply_patch(confirmed=True)
 

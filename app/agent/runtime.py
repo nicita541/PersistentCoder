@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
+import os
 import time
 from pathlib import Path
 
+from app.apply.builder import PatchManifestBuilder
+from app.apply.manifest import PatchManifest
+from app.apply.service import ApplyService, ApplyStatus
+from app.apply.store import PatchManifestStore
 from app.agent.coder.agent import CodingAgent
 from app.agent.coder.executor import CodeExecutor
 from app.agent.coder.workspace import Workspace
@@ -77,14 +84,36 @@ class DirtySessionError(RuntimeError):
     pass
 
 
+class _LazyLocalLLM:
+    """Load model weights only when the first model answer is requested."""
+
+    def __init__(self) -> None:
+        self._client = None
+
+    def _load(self):
+        if self._client is not None:
+            return self._client
+        try:
+            from app.llm.client import MODEL_NAME, QwenClient
+
+            self._client = QwenClient()
+        except Exception as error:
+            raise RuntimeError(
+                "local model is unavailable: "
+                "make sure the configured model is present in the project cache "
+                "and can be loaded on this machine "
+                f"({locals().get('MODEL_NAME', 'configured model')}): {error}"
+            ) from error
+        return self._client
+
+    def chat(self, messages, max_new_tokens: int = 512) -> str:
+        return self._load().chat(messages, max_new_tokens=max_new_tokens)
+
+
 def default_llm_factory():
-    """
-    Ленивая загрузка единственного LLM client.
-    """
+    """Return one lazy local-model client shared by all agent subsystems."""
 
-    from app.llm.client import QwenClient
-
-    return QwenClient()
+    return _LazyLocalLLM()
 
 
 class AgentRuntime:
@@ -109,6 +138,9 @@ class AgentRuntime:
         database_path: str | Path | None = None,
         llm=None,
         llm_factory=None,
+        planner_llm=None,
+        coder_llm=None,
+        debugger_llm=None,
         system_prompt: str | None = None,
         load_policy: bool = True,
         max_step_attempts: int = 2,
@@ -159,6 +191,7 @@ class AgentRuntime:
         self.step_store = StepStore(self.store_context)
         self.attempt_store = AttemptStore(self.store_context)
         self.state_authority = RuntimeUnitOfWork(self.store_context)
+        self.patch_manifest_store = PatchManifestStore(self.store_context)
         self.interrupted_runs = (
             self.runtime_store.recover_interrupted()
         )
@@ -194,6 +227,24 @@ class AgentRuntime:
             self.recovery = self.recover_sandboxes(
                 resume=resume_interrupted
             )
+
+            if self.sandbox_workspace is None:
+                unsettled_sessions = self.session_store.list_unsettled()
+                for dirty_session in reversed(unsettled_sessions):
+                    workspace = SandboxWorkspace.open_session(
+                        dirty_session.sandbox_session_id,
+                        identity=self.project_identity,
+                        storage=self.project_storage,
+                    )
+                    if workspace is not None:
+                        self.sandbox_workspace = workspace
+                        self.workspace_root = workspace.workspace_root
+                        break
+                if unsettled_sessions and self.sandbox_workspace is None:
+                    raise DirtySessionError(
+                        "dirty session workspace is unavailable; "
+                        "explicit recovery or discard is required"
+                    )
 
             if self.sandbox_workspace is None:
                 self.sandbox_workspace = (
@@ -247,6 +298,12 @@ class AgentRuntime:
                 if self.session is None:
                     raise RuntimeError("agent session was not created")
 
+            if self.session.status is SessionStatus.APPLIED:
+                self.sandbox_workspace.rebase_from_source()
+                self.session.transition(SessionStatus.CLEAN)
+                self.session.patch_manifest_id = None
+                self.session = self.session_store.update(self.session)
+
         else:
             self.session_id = (
                 self.direct_checkpoint_workspace.session_id
@@ -254,6 +311,19 @@ class AgentRuntime:
                 else None
             )
             self.session = None
+
+        self.apply_recovery = []
+        if (
+            self.sandbox_workspace is not None
+            and self.state_authority.pending_apply_journals()
+        ):
+            self.apply_recovery = list(
+                self._new_apply_service().recover_pending()
+            )
+            if self.session is not None:
+                refreshed = self.session_store.get(self.session.id)
+                if refreshed is not None:
+                    self.session = refreshed
 
         self.events.subscribe(self._persist_event)
 
@@ -300,6 +370,21 @@ class AgentRuntime:
         # call, so no stage can silently forget it.
         self.llm = enforce_system_policy(
             self.llm,
+            self.system_prompt,
+        )
+        # Role overrides are optional. By default every role shares one local
+        # model (important on small GPUs); callers may inject specialized or
+        # larger clients without changing the agent graph.
+        self.planner_llm = enforce_system_policy(
+            planner_llm if planner_llm is not None else self.llm,
+            self.system_prompt,
+        )
+        self.coder_llm = enforce_system_policy(
+            coder_llm if coder_llm is not None else self.llm,
+            self.system_prompt,
+        )
+        self.debugger_llm = enforce_system_policy(
+            debugger_llm if debugger_llm is not None else self.llm,
             self.system_prompt,
         )
 
@@ -411,7 +496,7 @@ class AgentRuntime:
         # ==================================
 
         self.planner = PlannerAgent(
-            self.llm,
+            self.planner_llm,
             self.plan_store,
             step_store=self.step_store,
             max_repair_attempts=(
@@ -468,7 +553,7 @@ class AgentRuntime:
 
         self.executor = CodeExecutor(
             workspace=self.workspace,
-            llm=self.llm,
+            llm=self.coder_llm,
             context=self.context,
             system_prompt=self.system_prompt,
             command_runner=self.command_runner,
@@ -510,7 +595,7 @@ class AgentRuntime:
             replanner=self.replanner,
             attempt_store=self.attempt_store,
             replan_store=self.replan_store,
-            llm=self.llm,
+            llm=self.debugger_llm,
             system_prompt=self.system_prompt,
         )
 
@@ -835,19 +920,97 @@ class AgentRuntime:
     def rebase_session_after_apply(self):
         if self.session is None or self.sandbox_workspace is None:
             raise DirtySessionError("no sandbox session")
-        if self.session.status is not SessionStatus.DIRTY_VERIFIED:
+        if self.session.status not in {
+            SessionStatus.DIRTY_VERIFIED,
+            SessionStatus.APPLIED,
+        }:
             raise DirtySessionError(
-                "only a verified dirty session can be rebased after apply"
+                "only an applied or verified dirty session can be rebased"
             )
 
-        self.session.transition(SessionStatus.APPLIED)
-        self._save_session()
+        # ApplyService performs DIRTY_VERIFIED -> APPLIED atomically with the
+        # journal COMMIT.  Keep the DIRTY_VERIFIED branch only for callers that
+        # explicitly established the source tree by another framework-owned
+        # mechanism (not the production apply path).
+        if self.session.status is SessionStatus.DIRTY_VERIFIED:
+            self.session.transition(SessionStatus.APPLIED)
+            self._save_session()
         self.sandbox_workspace.rebase_from_source()
         self.session.transition(SessionStatus.CLEAN)
         self.session.patch_manifest_id = None
         self._save_session()
         self.last_patch_path = None
         return self.session
+
+    def _manifest_verification_id(self, state) -> str:
+        verification = getattr(state, "verification", None)
+        context = getattr(verification, "context", None)
+        if (
+            verification is None
+            or not getattr(verification, "ok", False)
+            or context is None
+        ):
+            raise RuntimeError(
+                "a changed successful run requires bound verification context"
+            )
+        payload = json.dumps(
+            context.to_dict(),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def _build_patch_manifest(self, state) -> PatchManifest | None:
+        if self.sandbox_workspace is None or self.session_id is None:
+            return None
+        verification_id = self._manifest_verification_id(state)
+        manifest = PatchManifestBuilder().build(
+            project_identity=self.project_identity,
+            session_id=self.session_id,
+            baseline_root=self.sandbox_workspace.baseline_root,
+            workspace_root=self.sandbox_workspace.workspace_root,
+            verification_id=verification_id,
+        )
+        return manifest if manifest.entries else None
+
+    def _new_apply_service(self) -> ApplyService:
+        if self.sandbox_workspace is None:
+            raise DirtySessionError("no sandbox workspace")
+        return ApplyService(
+            self.store_context,
+            self.patch_manifest_store,
+            self.state_authority,
+            self.source_project_root,
+            self.sandbox_workspace.workspace_root,
+            self._apply_staging_root(),
+        )
+
+    @staticmethod
+    def _paths_share_volume(left: Path, right: Path) -> bool:
+        left_drive = left.drive.casefold()
+        right_drive = right.drive.casefold()
+        if left_drive or right_drive:
+            return bool(left_drive) and left_drive == right_drive
+        try:
+            return os.stat(left).st_dev == os.stat(right).st_dev
+        except OSError:
+            return False
+
+    def _apply_staging_root(self) -> Path:
+        framework_staging = self.project_storage.tmp_root / "apply"
+        if self._paths_share_volume(
+            self.source_project_root,
+            self.project_storage.tmp_root,
+        ):
+            return framework_staging
+        return (
+            self.source_project_root.parent
+            / (
+                ".persistentcoder-apply-"
+                f"{self.project_identity.project_id[:16]}"
+            )
+        )
 
     def run(self, request: str):
         request = (request or "").strip()
@@ -921,31 +1084,47 @@ class AgentRuntime:
                 raise recovery_error from run_error
             raise
 
-        self.last_patch_path = None
+        try:
+            self.last_patch_path = None
+            patch_manifest = None
 
-        if (
-            state.phase is AgentPhase.DONE
-            and self.sandbox_workspace is not None
-        ):
-            patch = (
-                self.sandbox_workspace.write_patch()
+            if (
+                state.phase is AgentPhase.DONE
+                and self.sandbox_workspace is not None
+            ):
+                patch = self.sandbox_workspace.write_patch()
+
+                if patch is not None:
+                    self.last_patch_path = str(patch)
+                    state.patch_path = str(patch)
+
+                patch_manifest = self._build_patch_manifest(state)
+
+            status = (
+                RUN_DONE
+                if state.phase is AgentPhase.DONE
+                else RUN_FAILED
             )
 
-            if patch is not None:
-                self.last_patch_path = str(patch)
-                state.patch_path = str(patch)
-
-        status = (
-            RUN_DONE
-            if state.phase is AgentPhase.DONE
-            else RUN_FAILED
-        )
-
-        self._finish_terminal_state(
-            state,
-            run_status=status,
-            succeeded=state.phase is AgentPhase.DONE,
-        )
+            self._finish_terminal_state(
+                state,
+                run_status=status,
+                succeeded=state.phase is AgentPhase.DONE,
+                patch_manifest=patch_manifest,
+            )
+        except Exception:
+            # A result is not DONE until its exact verified manifest and the
+            # terminal session transition commit together.
+            state.phase = AgentPhase.FAILED
+            state.completion = "FAILED"
+            self._finish_terminal_state(
+                state,
+                run_status=RUN_INTERRUPTED,
+                succeeded=False,
+            )
+            self.current_run_id = None
+            self.last_state = state
+            raise
         self.current_run_id = None
         self.last_state = state
 
@@ -1008,6 +1187,15 @@ class AgentRuntime:
                 self.interrupted_runs
             ),
             "recovery": list(self.recovery),
+            "apply_recovery": [
+                {
+                    "status": result.status.value,
+                    "manifest_id": result.manifest_id,
+                    "journal_id": result.journal_id,
+                    "reason": result.reason,
+                }
+                for result in self.apply_recovery
+            ],
             "active_plan": (
                 plan.id if plan else None
             ),
@@ -1254,17 +1442,65 @@ class AgentRuntime:
         patch_path = self.last_patch_path
 
         changed: list[str] = []
-
-        if self.sandbox_workspace is not None:
-            changed = [
-                relative
-                for relative in (
-                    self.sandbox_workspace
-                    .changed_files()
+        entries: list[dict[str, object]] = []
+        manifest_id = (
+            self.session.patch_manifest_id
+            if self.session is not None
+            else None
+        )
+        manifest = None
+        manifest_load_error = None
+        if manifest_id is not None:
+            try:
+                manifest = self.patch_manifest_store.get(manifest_id)
+            except Exception as error:
+                manifest_load_error = (
+                    "bound manifest is invalid: "
+                    f"{type(error).__name__}"
                 )
-                if self.sandbox_workspace
-                .is_patch_safe(relative)
+        manifest_current = False
+        manifest_reason = None
+
+        if manifest is not None:
+            changed = [entry.path.value for entry in manifest.entries]
+            entries = [
+                {
+                    "path": entry.path.value,
+                    "operation": entry.operation.value,
+                    "before_size": entry.before_size,
+                    "after_size": entry.after_size,
+                    "reviewable": entry.reviewable,
+                    "apply_safe": entry.apply_safe,
+                    "reasons": list(entry.reasons),
+                }
+                for entry in manifest.entries
             ]
+            try:
+                current = PatchManifestBuilder().build(
+                    project_identity=self.project_identity,
+                    session_id=manifest.session_id,
+                    baseline_root=self.sandbox_workspace.baseline_root,
+                    workspace_root=self.sandbox_workspace.workspace_root,
+                    verification_id=manifest.verification_id,
+                )
+                manifest_current = current.manifest_id == manifest.manifest_id
+                if not manifest_current:
+                    manifest_reason = (
+                        "verified workspace is stale: "
+                        "workspace changed after verification"
+                    )
+            except Exception as error:
+                manifest_reason = (
+                    "cannot validate verified workspace: "
+                    f"{type(error).__name__}"
+                )
+        elif manifest_id is not None:
+            manifest_reason = (
+                manifest_load_error
+                or "bound manifest is missing or invalid"
+            )
+        else:
+            manifest_reason = "no verified manifest"
 
         verification = None
 
@@ -1285,6 +1521,19 @@ class AgentRuntime:
                 and Path(patch_path).exists()
             ),
             "changed_files": changed,
+            "manifest_id": manifest_id,
+            "manifest_current": manifest_current,
+            "manifest_reason": manifest_reason,
+            "entries": entries,
+            "can_apply": bool(
+                manifest is not None
+                and manifest_current
+                and entries
+                and all(
+                    entry["reviewable"] and entry["apply_safe"]
+                    for entry in entries
+                )
+            ),
             "verification": verification,
             "phase": (
                 state.phase.value
@@ -1304,9 +1553,9 @@ class AgentRuntime:
 
         Hard prerequisites (never bypassed):
           - the user explicitly confirmed;
-          - the last run finished DONE;
-          - verification PASS;
-          - the patch exists and every changed path is patch-safe.
+          - the durable session owns an immutable verified manifest;
+          - the current workspace still matches that manifest;
+          - every manifest entry is reviewable and apply-safe.
 
         There is no auto-apply anywhere in the agent loop.
         """
@@ -1320,7 +1569,7 @@ class AgentRuntime:
                 "preview": preview,
             }
 
-        if self.sandbox_workspace is None:
+        if self.sandbox_workspace is None or self.session is None:
             return {
                 "applied": [],
                 "reason": "no sandbox workspace",
@@ -1329,7 +1578,7 @@ class AgentRuntime:
 
         state = getattr(self, "last_state", None)
 
-        if state is None or state.phase is not AgentPhase.DONE:
+        if state is not None and state.phase is not AgentPhase.DONE:
             return {
                 "applied": [],
                 "reason": (
@@ -1338,14 +1587,17 @@ class AgentRuntime:
                 "preview": preview,
             }
 
-        verification = state.verification
+        verification = getattr(state, "verification", None)
 
         if (
-            verification is None
-            or not getattr(
+            state is not None
+            and (
+                verification is None
+                or not getattr(
                 verification,
                 "ok",
                 False,
+                )
             )
         ):
             return {
@@ -1357,88 +1609,43 @@ class AgentRuntime:
                 "preview": preview,
             }
 
-        context = getattr(verification, "context", None)
-        environment_ready, environment_reason, environment = (
-            self.command_runner.verification_environment()
-        )
-        environment = {
-            **environment,
-            "python": self.verification_agent.structured.python,
-        }
-        if not environment_ready:
+        manifest_id = preview.get("manifest_id")
+        if not isinstance(manifest_id, str):
             return {
                 "applied": [],
-                "reason": (
-                    "verification environment unavailable: "
-                    f"{environment_reason}"
-                ),
+                "reason": "no verified manifest was produced",
                 "preview": preview,
             }
-        task_id = getattr(state, "active_task_id", None)
-        tasks = []
-        if task_id is not None:
-            task = self.plan_store.get_task(int(task_id))
-            if task is not None:
-                tasks.append(task)
-        else:
-            plan_id = getattr(state, "plan_id", None)
-            if plan_id is not None:
-                tasks.extend(self.plan_store.get_tasks(int(plan_id)))
 
-        trusted = False
-        if context is not None:
-            for task in tasks:
-                records = self.verification_store.get_task_verifications(task.id)
-                durable = records[-1] if records else None
-                if (
-                    task.status.value == "DONE"
-                    and durable is not None
-                    and durable.context == context
-                    and self.verification_store.is_current(
-                        durable,
-                        self.workspace_root,
-                        specs=task.verification_specs,
-                        criteria=task.success_criteria,
-                        environment=environment,
-                    )
-                ):
-                    trusted = True
-                    break
-
-        if not trusted:
+        if not preview.get("can_apply"):
             return {
                 "applied": [],
-                "reason": (
-                    "durable verification evidence is unbound or stale; "
-                    "run verification again"
+                "reason": str(
+                    preview.get("manifest_reason")
+                    or "verified manifest contains blocked entries"
                 ),
                 "preview": preview,
             }
 
-        if not preview["patch_exists"]:
-            return {
-                "applied": [],
-                "reason": "no patch file was produced",
-                "preview": preview,
-            }
-
-        applied = (
-            self.sandbox_workspace.apply_to_project(
-                self.source_project_root,
-                paths=list(
-                    preview["changed_files"]
-                ),
-            )
+        result = self._new_apply_service().apply(
+            manifest_id,
+            agent_session_id=self.session.id,
+            expected_session_version=self.session.version,
         )
 
-        # A successful direct apply establishes the source tree as the
-        # new clean baseline.  Keep the durable session transition in
-        # the same framework-owned path as manual rebases.
-        self.rebase_session_after_apply()
+        if result.status is ApplyStatus.COMMITTED:
+            refreshed = self.session_store.get(self.session.id)
+            if refreshed is None:
+                raise RuntimeError("applied session disappeared")
+            self.session = refreshed
+            self.rebase_session_after_apply()
 
         return {
-            "applied": applied,
-            "reason": "applied",
+            "applied": list(result.applied_paths),
+            "reason": result.reason or result.status.value.casefold(),
+            "status": result.status.value,
+            "manifest_id": result.manifest_id,
+            "journal_id": result.journal_id,
             "preview": preview,
         }
 
@@ -1514,7 +1721,12 @@ class AgentRuntime:
         )
 
     def _finish_terminal_state(
-        self, state, *, run_status: str, succeeded: bool
+        self,
+        state,
+        *,
+        run_status: str,
+        succeeded: bool,
+        patch_manifest: PatchManifest | None = None,
     ) -> None:
         run_id = self.current_run_id
         if run_id is None:
@@ -1523,9 +1735,13 @@ class AgentRuntime:
         session_id = None
         session_version = None
         if self.session is not None:
-            changed = bool(
-                self.sandbox_workspace
-                and self.sandbox_workspace.changed_files()
+            changed = (
+                patch_manifest is not None
+                if succeeded
+                else bool(
+                    self.sandbox_workspace
+                    and self.sandbox_workspace.changed_files()
+                )
             )
             session_status = (
                 SessionStatus.DIRTY_VERIFIED
@@ -1550,11 +1766,14 @@ class AgentRuntime:
             session_id=session_id,
             session_status=session_status,
             session_version=session_version,
+            patch_manifest=patch_manifest,
         )
         if self.session is not None:
             self.session.status = session_status
             self.session.active_run_id = None
             self.session.version = int(new_version)
+            if patch_manifest is not None:
+                self.session.patch_manifest_id = patch_manifest.manifest_id
 
     def sandbox_status(self) -> str:
         return self.command_runner.status()

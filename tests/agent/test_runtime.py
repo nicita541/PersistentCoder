@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
+import types
 from pathlib import Path
 
+import pytest
+
 from app.agent.events import AgentEvent
-from app.agent.runtime import AgentRuntime
+from app.agent.runtime import AgentRuntime, default_llm_factory
 from app.sandbox.paths import PROJECT_ROOT
 from app.sandbox.runner import SandboxCommandRunner
 
@@ -44,6 +48,29 @@ def test_llm_is_created_exactly_once(tmp_path):
     assert runtime.llm is not None
 
 
+def test_default_model_failure_has_an_actionable_message(monkeypatch):
+    class BrokenClient:
+        def __init__(self):
+            raise OSError("weights are missing")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "app.llm.client",
+        types.SimpleNamespace(
+            MODEL_NAME="fixture/model",
+            QwenClient=BrokenClient,
+        ),
+    )
+
+    llm = default_llm_factory()
+
+    with pytest.raises(RuntimeError, match="local model is unavailable") as caught:
+        llm.chat([{"role": "user", "content": "hello"}])
+
+    assert "fixture/model" in str(caught.value)
+    assert "project cache" in str(caught.value)
+
+
 def test_single_llm_instance_shared_between_agents(
     tmp_path,
 ):
@@ -64,6 +91,27 @@ def test_single_llm_instance_shared_between_agents(
     assert runtime.coder.executor.llm is llm
     assert runtime.executor.llm is llm
     assert runtime.repair_agent.llm is llm
+
+
+def test_role_specific_models_can_be_injected(tmp_path):
+    shared = FakeLLM()
+    planner = FakeLLM()
+    coder = FakeLLM()
+    debugger = FakeLLM()
+
+    runtime = AgentRuntime(
+        workspace_root=tmp_path,
+        database_path=tmp_path / "pc.db",
+        llm=shared,
+        planner_llm=planner,
+        coder_llm=coder,
+        debugger_llm=debugger,
+        load_policy=False,
+    )
+
+    assert runtime.planner.llm is planner
+    assert runtime.coder.executor.llm is coder
+    assert runtime.repair_agent.llm is debugger
 
 
 def test_no_duplicate_subsystems_inside_agent_layer():

@@ -88,9 +88,11 @@ def test_loop_leaves_terminal_state_for_atomic_runtime_finalization():
 def test_loop_reaches_failed_after_repair_gives_up(
     tmp_path,
 ):
-    command = (
-        'python -c "import sys; sys.exit(2)"'
-    )
+    tool = {
+        "tool": "python_module",
+        "module": "persistentcoder_missing_module",
+        "args": [],
+    }
 
     llm = FakeLLM(
         [
@@ -98,7 +100,7 @@ def test_loop_reaches_failed_after_repair_gives_up(
             tasks_response(),
             dependencies_response(),
         ],
-        default=coder_envelope(command=command),
+        default=coder_envelope(tool=tool),
     )
 
     runtime = AgentRuntime(

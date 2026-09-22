@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 4;
 
 
 export type WorkMode =
@@ -29,10 +29,41 @@ export interface RunVerification {
 }
 
 
+export interface ChangeEntry {
+    path: string;
+    operation: string;
+    before_size: number | null;
+    after_size: number | null;
+    reviewable: boolean;
+    apply_safe: boolean;
+    reasons: string[];
+}
+
+
+export type ProjectAction =
+    | "apply"
+    | "discard";
+
+
+export interface ActionResult {
+    action: ProjectAction;
+    ok: boolean;
+    workflow_status: string;
+    message: string;
+    files: string[];
+}
+
+
 export interface RunResult {
     run_id: number | null;
 
     phase: string;
+
+    workflow_status: string;
+
+    message: string;
+
+    next_actions: string[];
 
     plan_id: number | null;
 
@@ -41,6 +72,14 @@ export interface RunResult {
     completion: string | null;
 
     patch_path: string | null;
+
+    manifest_id: string | null;
+
+    can_apply: boolean | null;
+
+    apply_block_reason: string | null;
+
+    change_entries: ChangeEntry[];
 
     read_files: string[];
 
@@ -90,8 +129,29 @@ export type BackendMessage =
           result: RunResult;
       }
     | {
+          type: "project_state";
+          request_id: string;
+          result: RunResult;
+      }
+    | {
           type: "run_failed";
           request_id: string;
+          error: string;
+      }
+    | {
+          type: "action_started";
+          request_id: string;
+          action: ProjectAction;
+      }
+    | {
+          type: "action_completed";
+          request_id: string;
+          result: ActionResult;
+      }
+    | {
+          type: "action_failed";
+          request_id: string;
+          action: ProjectAction;
           error: string;
       }
     | {
@@ -180,6 +240,22 @@ function readWorkMode(
 }
 
 
+function readProjectAction(
+    value: unknown
+): ProjectAction {
+    if (
+        value === "apply" ||
+        value === "discard"
+    ) {
+        return value;
+    }
+
+    throw new Error(
+        "Invalid project action from backend"
+    );
+}
+
+
 function parseAutoApply(
     value: unknown
 ): AutoApplyResult {
@@ -205,6 +281,30 @@ function parseAutoApply(
             readNullableString(
                 value.reason
             )
+    };
+}
+
+
+function parseActionResult(
+    value: unknown
+): ActionResult {
+    if (!isRecord(value)) {
+        throw new Error(
+            "Invalid action result"
+        );
+    }
+
+    return {
+        action:
+            readProjectAction(value.action),
+        ok:
+            value.ok === true,
+        workflow_status:
+            readString(value.workflow_status),
+        message:
+            readString(value.message),
+        files:
+            readStringArray(value.files)
     };
 }
 
@@ -286,6 +386,30 @@ function parseRunResult(
             ? value.commands
             : [];
 
+    const changeEntries =
+        Array.isArray(value.change_entries)
+            ? value.change_entries
+                  .filter(isRecord)
+                  .map(
+                      (entry) => ({
+                          path:
+                              readString(entry.path),
+                          operation:
+                              readString(entry.operation),
+                          before_size:
+                              readNullableNumber(entry.before_size),
+                          after_size:
+                              readNullableNumber(entry.after_size),
+                          reviewable:
+                              entry.reviewable === true,
+                          apply_safe:
+                              entry.apply_safe === true,
+                          reasons:
+                              readStringArray(entry.reasons)
+                      })
+                  )
+            : [];
+
     return {
         run_id:
             readNullableNumber(
@@ -296,6 +420,22 @@ function parseRunResult(
             readString(
                 value.phase,
                 "UNKNOWN"
+            ),
+
+        workflow_status:
+            readString(
+                value.workflow_status,
+                "failed"
+            ),
+
+        message:
+            readString(
+                value.message
+            ),
+
+        next_actions:
+            readStringArray(
+                value.next_actions
             ),
 
         plan_id:
@@ -317,6 +457,24 @@ function parseRunResult(
             readNullableString(
                 value.patch_path
             ),
+
+        manifest_id:
+            readNullableString(
+                value.manifest_id
+            ),
+
+        can_apply:
+            typeof value.can_apply === "boolean"
+                ? value.can_apply
+                : null,
+
+        apply_block_reason:
+            readNullableString(
+                value.apply_block_reason
+            ),
+
+        change_entries:
+            changeEntries,
 
         read_files:
             readStringArray(
@@ -476,6 +634,48 @@ export function parseBackendMessage(
         };
     }
 
+    if (type === "project_state") {
+        return {
+            type,
+            request_id:
+                readString(value.request_id),
+            result:
+                parseRunResult(value.result)
+        };
+    }
+
+    if (type === "action_started") {
+        return {
+            type,
+            request_id:
+                readString(value.request_id),
+            action:
+                readProjectAction(value.action)
+        };
+    }
+
+    if (type === "action_completed") {
+        return {
+            type,
+            request_id:
+                readString(value.request_id),
+            result:
+                parseActionResult(value.result)
+        };
+    }
+
+    if (type === "action_failed") {
+        return {
+            type,
+            request_id:
+                readString(value.request_id),
+            action:
+                readProjectAction(value.action),
+            error:
+                readString(value.error, "Project action failed")
+        };
+    }
+
     if (type === "protocol_error") {
         return {
             type,
@@ -530,5 +730,30 @@ export function makePingRequest(
     return JSON.stringify({
         type: "ping",
         request_id: requestId
+    });
+}
+
+
+export function makeInspectRequest(
+    requestId: string,
+    projectRoot: string
+): string {
+    return JSON.stringify({
+        type: "inspect",
+        request_id: requestId,
+        project_root: projectRoot
+    });
+}
+
+
+export function makeProjectActionRequest(
+    requestId: string,
+    action: ProjectAction,
+    projectRoot: string
+): string {
+    return JSON.stringify({
+        type: action,
+        request_id: requestId,
+        project_root: projectRoot
     });
 }

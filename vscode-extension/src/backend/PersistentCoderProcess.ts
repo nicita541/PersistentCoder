@@ -14,8 +14,11 @@ import {
 
 import {
     BackendMessage,
+    makeInspectRequest,
+    makeProjectActionRequest,
     makeRunRequest,
     parseBackendMessage,
+    ProjectAction,
     PROTOCOL_VERSION,
     WorkMode
 } from "./protocol";
@@ -46,6 +49,8 @@ export class PersistentCoderProcess
         | undefined;
 
     private stopping = false;
+
+    private cancelling = false;
 
     private currentStatus:
         BackendStatus = "stopped";
@@ -312,6 +317,27 @@ export class PersistentCoderProcess
                     return;
                 }
 
+                if (this.cancelling) {
+                    this.cancelling = false;
+                    this.setStatus(
+                        "starting",
+                        "Операция отменена. Восстанавливаем backend..."
+                    );
+
+                    try {
+                        this.start();
+                    } catch (error) {
+                        this.setStatus(
+                            "error",
+                            error instanceof Error
+                                ? error.message
+                                : String(error)
+                        );
+                    }
+
+                    return;
+                }
+
                 this.setStatus(
                     "error",
                     `Backend завершился неожиданно (code=${String(code)}).`
@@ -369,9 +395,72 @@ export class PersistentCoderProcess
         return requestId;
     }
 
+    public projectAction(
+        action: ProjectAction,
+        projectRoot: string
+    ): string {
+        if (this.currentStatus !== "ready") {
+            throw new Error(
+                "PersistentCoder backend ещё не готов."
+            );
+        }
+
+        const requestId = randomUUID();
+        this.write(
+            makeProjectActionRequest(
+                requestId,
+                action,
+                projectRoot
+            )
+        );
+        return requestId;
+    }
+
+    public inspect(projectRoot: string): string {
+        if (this.currentStatus !== "ready") {
+            throw new Error(
+                "PersistentCoder backend ещё не готов."
+            );
+        }
+
+        const requestId = randomUUID();
+        this.write(
+            makeInspectRequest(
+                requestId,
+                projectRoot
+            )
+        );
+        return requestId;
+    }
+
+    public cancelCurrentOperation(): boolean {
+        const child = this.child;
+        if (!child || child.exitCode !== null) {
+            return false;
+        }
+
+        this.cancelling = true;
+        this.setStatus(
+            "starting",
+            "Отмена операции..."
+        );
+
+        if (!child.kill()) {
+            this.cancelling = false;
+            throw new Error(
+                "Не удалось остановить текущую операцию."
+            );
+        }
+
+        return true;
+    }
+
     public dispose(): void {
         this.stopping =
             true;
+
+        this.cancelling =
+            false;
 
         if (
             this.child &&

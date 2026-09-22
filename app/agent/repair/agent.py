@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 
 from app.agent.repair.analyzer import (
@@ -11,6 +12,37 @@ from app.agent.repair.strategies import (
     RETRY_STEP,
 )
 from app.agent.repair.context import approach_fingerprint
+
+
+def build_debugger_messages(
+    *,
+    task_title: str,
+    failure_class: str,
+    reason: str,
+    evidence: list[str],
+) -> list[dict[str, str]]:
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are the Debugger Agent. Analyze only the supplied "
+                "failure evidence. Do not reveal hidden chain-of-thought. "
+                "Return one compact JSON object with string fields "
+                "root_cause, do_not_repeat, and next_action. The next action "
+                "must be materially different and stay within the current "
+                "task scope."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"TASK: {task_title}\n"
+                f"FAILURE_CLASS: {failure_class}\n"
+                f"REASON: {reason}\n"
+                "EVIDENCE:\n- " + "\n- ".join(evidence[:8])
+            ),
+        },
+    ]
 
 
 @dataclass(frozen=True)
@@ -32,6 +64,9 @@ class ApproachPlan:
     verification_plan: list[str] = field(
         default_factory=list
     )
+    evidence: list[str] = field(default_factory=list)
+    do_not_repeat: list[str] = field(default_factory=list)
+    analysis_effort: str = "LOW"
     fingerprint: str = ""
 
 
@@ -129,6 +164,74 @@ class RepairAgent:
 
         return files[:5]
 
+    @staticmethod
+    def _analysis_effort(analysis: FailureAnalysis) -> str:
+        if analysis.failure_class in {
+            "REPEATED_OBSERVATION",
+            "PROTOCOL_ERROR",
+        }:
+            return "LOW"
+        if analysis.failure_class == "DEPENDENCY_BLOCKED":
+            return "HIGH"
+        return "MEDIUM"
+
+    @staticmethod
+    def _fallback_diagnosis(
+        analysis: FailureAnalysis,
+        strategy: str,
+    ) -> tuple[str, str, list[str]]:
+        if analysis.failure_class == "REPEATED_OBSERVATION":
+            return (
+                analysis.reason,
+                "Stop repeating the observation; use the existing result and "
+                "perform the requested edit. If the target is absent, create it.",
+                ["the same observation action"],
+            )
+        return (
+            analysis.reason,
+            f"Use {strategy} with a materially different implementation approach.",
+            ["the failed approach fingerprint"],
+        )
+
+    def _diagnose(
+        self,
+        *,
+        task,
+        analysis: FailureAnalysis,
+        strategy: str,
+    ) -> tuple[str, str, list[str], str]:
+        effort = self._analysis_effort(analysis)
+        root_cause, next_action, do_not_repeat = self._fallback_diagnosis(
+            analysis,
+            strategy,
+        )
+        if self.llm is None:
+            return root_cause, next_action, do_not_repeat, effort
+
+        token_budget = {"LOW": 160, "MEDIUM": 256, "HIGH": 384}[effort]
+        messages = build_debugger_messages(
+            task_title=str(getattr(task, "title", task)),
+            failure_class=analysis.failure_class,
+            reason=analysis.reason,
+            evidence=analysis.evidence,
+        )
+        try:
+            raw = self.llm.chat(messages, max_new_tokens=token_budget).strip()
+            start = raw.find("{")
+            if start < 0:
+                raise ValueError("debugger did not return JSON")
+            parsed, _ = json.JSONDecoder().raw_decode(raw[start:])
+            values = [parsed.get(key) for key in ("root_cause", "do_not_repeat", "next_action")]
+            if not all(isinstance(value, str) and value.strip() for value in values):
+                raise ValueError("debugger diagnosis fields are invalid")
+            root_cause = str(values[0]).strip()[:800]
+            do_not_repeat = [str(values[1]).strip()[:500]]
+            next_action = str(values[2]).strip()[:800]
+        except Exception:
+            # Repair must remain available even when the diagnostic model fails.
+            pass
+        return root_cause, next_action, do_not_repeat, effort
+
     def _was_attempted(
         self,
         step,
@@ -179,14 +282,10 @@ class RepairAgent:
             verification=verification,
         )
 
-        root_cause = self._root_cause(verification)
-
-        approach_text = (
-            f"{analysis.failure_class}::{root_cause}"
-        )
+        stable_root_cause = analysis.reason or self._root_cause(verification)
         fingerprint = approach_fingerprint(
             analysis.failure_class,
-            root_cause,
+            stable_root_cause,
         )
 
         strategy = self.strategies.select(
@@ -210,6 +309,12 @@ class RepairAgent:
 
             elif strategy == REPLAN_TASK:
                 strategy = GIVE_UP
+
+        root_cause, next_action, do_not_repeat, analysis_effort = self._diagnose(
+            task=task,
+            analysis=analysis,
+            strategy=strategy,
+        )
 
         # Replanner-level approach guard.
         if step is not None and strategy == RETRY_STEP:
@@ -239,7 +344,7 @@ class RepairAgent:
             scope=scope,
             failure_class=analysis.failure_class,
             root_cause=root_cause,
-            new_approach=f"{strategy}::{approach_text}",
+            new_approach=next_action,
             files_to_inspect=self._files_to_inspect(
                 verification
             ),
@@ -247,6 +352,9 @@ class RepairAgent:
                 getattr(verification, "evidence", [])
                 or []
             )[:5],
+            evidence=list(analysis.evidence)[:8],
+            do_not_repeat=do_not_repeat,
+            analysis_effort=analysis_effort,
             fingerprint=fingerprint,
         )
 

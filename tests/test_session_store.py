@@ -102,3 +102,24 @@ def test_list_dirty_returns_only_current_project(
 
     assert [item.id for item in store_a.list_dirty()] == [session_id]
     assert store_b.list_dirty() == []
+
+
+def test_list_unsettled_includes_committed_session_pending_rebase(
+    tmp_path: Path,
+) -> None:
+    context = _context(
+        tmp_path / "sessions.db",
+        "a",
+        tmp_path / "project",
+    )
+    store = SessionStore(context)
+    session_id = store.create(sandbox_session_id="sandbox-a")
+    session = store.get(session_id)
+    assert session is not None
+    session.transition(SessionStatus.RUNNING)
+    session.transition(SessionStatus.DIRTY_VERIFIED)
+    session.transition(SessionStatus.APPLIED)
+    store.update(session)
+
+    assert store.list_dirty() == []
+    assert [item.id for item in store.list_unsettled()] == [session_id]

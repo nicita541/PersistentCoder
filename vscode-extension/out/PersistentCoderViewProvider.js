@@ -73,6 +73,29 @@ class PersistentCoderViewProvider {
             "ready"
             ? "Local"
             : "Starting...");
+        if (this.backend.status === "ready") {
+            this.inspectProjectState();
+        }
+    }
+    inspectProjectState() {
+        if (this.currentRequestId) {
+            return;
+        }
+        const projectRoot = this.activeProjectRoot();
+        if (!projectRoot) {
+            return;
+        }
+        try {
+            this.currentRequestId = this.backend.inspect(projectRoot);
+        }
+        catch (error) {
+            this.post({
+                type: "runFailed",
+                error: error instanceof Error
+                    ? error.message
+                    : String(error)
+            });
+        }
     }
     activeProjectRoot() {
         const activeDocument = vscode.window
@@ -100,10 +123,62 @@ class PersistentCoderViewProvider {
             return;
         }
         const data = message;
+        if (data.type === "cancelOperation") {
+            if (!this.currentRequestId) {
+                return;
+            }
+            try {
+                this.backend.cancelCurrentOperation();
+                this.currentRequestId = undefined;
+                this.post({
+                    type: "operationCancelled",
+                    message: "Операция отменена. Sandbox будет восстановлен при запуске backend."
+                });
+            }
+            catch (error) {
+                this.post({
+                    type: "runFailed",
+                    error: error instanceof Error
+                        ? error.message
+                        : String(error)
+                });
+            }
+            return;
+        }
         if (data.type ===
             "settings") {
             void vscode.window
                 .showInformationMessage("Настройки PersistentCoder подключим позже.");
+            return;
+        }
+        if (data.type === "apply" ||
+            data.type === "discard") {
+            if (this.currentRequestId) {
+                this.post({
+                    type: "runFailed",
+                    error: "Сейчас уже выполняется операция."
+                });
+                return;
+            }
+            const projectRoot = this.activeProjectRoot();
+            if (!projectRoot) {
+                this.post({
+                    type: "runFailed",
+                    error: "Откройте папку проекта в VS Code."
+                });
+                return;
+            }
+            try {
+                this.currentRequestId = this.backend.projectAction(data.type, projectRoot);
+            }
+            catch (error) {
+                this.post({
+                    type: "runFailed",
+                    error: error instanceof Error
+                        ? error.message
+                        : String(error)
+                });
+            }
             return;
         }
         if (data.type !==
@@ -177,6 +252,18 @@ class PersistentCoderViewProvider {
         if (message.type ===
             "ready") {
             this.postBackendStatus("ready", "Local");
+            this.inspectProjectState();
+            return;
+        }
+        if (message.type === "project_state") {
+            if (message.request_id !== this.currentRequestId) {
+                return;
+            }
+            this.currentRequestId = undefined;
+            this.post({
+                type: "projectState",
+                result: message.result
+            });
             return;
         }
         if (message.type ===
@@ -202,6 +289,38 @@ class PersistentCoderViewProvider {
             this.post({
                 type: "runCompleted",
                 result: message.result
+            });
+            return;
+        }
+        if (message.type === "action_started") {
+            if (message.request_id !== this.currentRequestId) {
+                return;
+            }
+            this.post({
+                type: "actionStarted",
+                action: message.action
+            });
+            return;
+        }
+        if (message.type === "action_completed") {
+            if (message.request_id !== this.currentRequestId) {
+                return;
+            }
+            this.currentRequestId = undefined;
+            this.post({
+                type: "actionCompleted",
+                result: message.result
+            });
+            return;
+        }
+        if (message.type === "action_failed") {
+            if (message.request_id !== this.currentRequestId) {
+                return;
+            }
+            this.currentRequestId = undefined;
+            this.post({
+                type: "runFailed",
+                error: message.error
             });
             return;
         }

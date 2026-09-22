@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Optional, project-local planner QLoRA training.
+peft==0.21.0
+bitsandbytes==0.50.2

@@ -1261,3 +1261,39 @@ button {
 
     line-height: 1.4;
 }
+
+
+.result-actions {
+    margin-top: 9px;
+
+    display: flex;
+    justify-content: flex-end;
+
+    gap: 7px;
+}
+
+
+.result-action {
+    padding: 5px 11px;
+
+    border: 1px solid var(--vscode-button-border, transparent);
+    border-radius: 6px;
+
+    cursor: pointer;
+
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+
+    font-size: 9px;
+}
+
+
+.result-action:hover {
+    background: var(--vscode-button-hoverBackground);
+}
+
+
+.result-action.discard {
+    background: var(--vscode-button-secondaryBackground);
+    color: var(--vscode-button-secondaryForeground);
+}

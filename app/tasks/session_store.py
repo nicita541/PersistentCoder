@@ -204,3 +204,26 @@ class SessionStore:
                 ),
             ).fetchall()
         return [self._row_to_session(row) for row in rows]
+
+    def list_unsettled(self) -> list[AgentSession]:
+        """Sessions whose sandbox must be reopened before starting new work."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM agent_sessions
+                WHERE project_id = ?
+                    AND canonical_source_root = ?
+                    AND status IN (?, ?, ?)
+                ORDER BY created_at ASC, id ASC
+                """,
+                (
+                    self.context.project_id,
+                    self.context.canonical_source_root,
+                    SessionStatus.DIRTY_VERIFIED.value,
+                    SessionStatus.DIRTY_FAILED.value,
+                    SessionStatus.APPLIED.value,
+                ),
+            ).fetchall()
+        return [self._row_to_session(row) for row in rows]

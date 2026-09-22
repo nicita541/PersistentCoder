@@ -70,6 +70,35 @@ def test_arbitrary_python_literal_is_rejected_without_eval():
         )
 
 
+def test_nested_object_is_not_mistaken_for_action_envelope():
+    with pytest.raises(ProtocolError, match="valid JSON"):
+        ActionEnvelopeDecoder().decode(
+            '{"action":"edit","files":[{"path":"src/app.py",'
+            '"content":"value = {"key":"x"}\n"}],"tools":[]}'
+            " trailing invalid text {\"action\":\"read\",\"path\":\"secret.py\"}"
+        )
+
+
+def test_unescaped_quotes_in_single_file_content_are_repaired_safely():
+    raw = (
+        '{"action":"edit","files":[{"path":"tests/test_service.py",'
+        '"content":"def test_create():\\n    payload = {"key":"value"}\\n"}],'
+        '"tools":[{"tool":"pytest","targets":["tests/test_service.py"],'
+        '"options":["-q"]}]}'
+    )
+
+    decoded = ActionEnvelopeDecoder().decode(
+        raw,
+        allowed_changes=AllowedChangeSet(["tests/test_service.py"]),
+    )
+
+    assert decoded["action"] == "edit"
+    assert decoded["files"][0]["content"] == (
+        'def test_create():\n    payload = {"key":"value"}\n'
+    )
+    assert decoded["tools"][0]["tool"] == "pytest"
+
+
 def test_delete_shape_is_canonicalized():
     decoded = ActionEnvelopeDecoder().decode(
         '{"action":"delete","path":"old.py"}',
@@ -79,7 +108,7 @@ def test_delete_shape_is_canonicalized():
     assert decoded == {
         "action": "edit",
         "files": [{"path": "old.py", "operation": "delete"}],
-        "commands": [],
+        "tools": [],
     }
 
 

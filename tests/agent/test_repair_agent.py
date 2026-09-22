@@ -9,6 +9,7 @@ from app.agent.repair.strategies import (
     RepairStrategySelector,
 )
 from app.agent.state import VerificationResult
+from app.agent.state import CommandExecution
 from app.tasks.models import (
     AttemptStatus,
     ReplanTargetType,
@@ -24,6 +25,7 @@ def _agent(
     *,
     max_step_attempts: int = 2,
     max_task_attempts: int = 3,
+    llm=None,
 ):
     replanner = Replanner(
         plan_store=stores.plan_store,
@@ -42,6 +44,7 @@ def _agent(
         replanner=replanner,
         attempt_store=stores.attempt_store,
         replan_store=stores.replan_store,
+        llm=llm,
     )
 
 
@@ -238,4 +241,75 @@ def test_no_repeating_failed_approach(tmp_path):
     assert outcome.action == REPLAN_TASK
     assert outcome.approach is not None
     assert outcome.approach.root_cause == "pytest failed"
+
+
+def test_repeated_observation_gets_specific_low_effort_diagnosis(tmp_path):
+    stores, task_id, step_id = _prepare(tmp_path)
+    agent = _agent(stores)
+
+    outcome = agent.repair(
+        task=stores.plan_store.get_task(task_id),
+        verification=VerificationResult(
+            ok=False,
+            status="FAIL",
+            reason="max tool iterations exceeded",
+            evidence=[
+                "tool_loop_budget",
+                "repeated_observation:read:src/new.py:8",
+            ],
+        ),
+        step=stores.step_store.get_step(step_id),
+    )
+
+    assert outcome.approach is not None
+    assert outcome.approach.failure_class == "REPEATED_OBSERVATION"
+    assert outcome.approach.analysis_effort == "LOW"
+    assert "create it" in outcome.approach.new_approach
+    assert outcome.approach.do_not_repeat == ["the same observation action"]
+
+
+def test_debugger_model_returns_concise_structured_diagnosis(tmp_path):
+    class DebuggerLLM:
+        def __init__(self):
+            self.max_new_tokens = None
+
+        def chat(self, messages, max_new_tokens=512):
+            self.max_new_tokens = max_new_tokens
+            return (
+                '{"root_cause":"test expected the wrong value",'
+                '"do_not_repeat":"do not change production code blindly",'
+                '"next_action":"inspect the failing assertion and update the test fixture"}'
+            )
+
+    stores, task_id, step_id = _prepare(tmp_path)
+    llm = DebuggerLLM()
+    agent = _agent(stores, llm=llm)
+
+    outcome = agent.repair(
+        task=stores.plan_store.get_task(task_id),
+        verification=_failure(),
+        step=stores.step_store.get_step(step_id),
+    )
+
+    assert outcome.approach is not None
+    assert outcome.approach.root_cause == "test expected the wrong value"
+    assert outcome.approach.analysis_effort == "MEDIUM"
+    assert llm.max_new_tokens == 256
+    assert outcome.approach.do_not_repeat == [
+        "do not change production code blindly"
+    ]
+
+
+def test_command_evidence_retains_failure_tail_for_debugger():
+    execution = CommandExecution(
+        command="pytest(tests/test_service.py)",
+        returncode=2,
+        stdout="collection header\n" + ("x" * 1400) + "\nImportError: bad relative import",
+    )
+
+    evidence = execution.as_evidence()
+
+    assert "[output clipped]" in evidence
+    assert "ImportError: bad relative import" in evidence
+    assert len(evidence) < 1400
 

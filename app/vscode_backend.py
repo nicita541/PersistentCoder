@@ -12,7 +12,7 @@ from app.agent.runtime import AgentRuntime
 from app.sandbox.paths import configure_project_env
 
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 4
 
 WORK_MODE_SANDBOX = "sandbox"
 WORK_MODE_AUTO_APPLY = "auto_apply"
@@ -134,6 +134,13 @@ def parse_client_message(
             "work_mode": _require_work_mode(
                 value
             ),
+        }
+
+    if message_type in {"inspect", "apply", "discard"}:
+        return {
+            "type": message_type,
+            "request_id": _require_string(value, "request_id"),
+            "project_root": _require_string(value, "project_root"),
         }
 
     raise ProtocolError(
@@ -385,6 +392,52 @@ def state_to_result(
         )
     )
 
+    preview = None
+    preview_method = getattr(runtime, "patch_preview", None)
+    if callable(preview_method):
+        try:
+            candidate = preview_method()
+            if isinstance(candidate, dict):
+                preview = candidate
+        except Exception:
+            preview = None
+
+    if preview is not None:
+        preview_changed = preview.get("changed_files")
+        if isinstance(preview_changed, list):
+            changed_files = [str(path) for path in preview_changed]
+        patch_path = preview.get("patch") or patch_path
+
+    phase_value = _phase_value(state)
+    manifest_id = preview.get("manifest_id") if preview is not None else None
+    can_apply = preview.get("can_apply") if preview is not None else None
+    if phase_value != "DONE":
+        workflow_status = "failed"
+        workflow_message = "Task did not complete successfully"
+        next_actions = ["discard"]
+    elif verification_data is not None and verification_data.get("ok") is not True:
+        workflow_status = "needs_attention"
+        workflow_message = str(
+            verification_data.get("reason")
+            or "Verification did not pass"
+        )
+        next_actions = ["discard"]
+    elif manifest_id is not None and can_apply is True:
+        workflow_status = "verified"
+        workflow_message = "Verified changes are ready to apply"
+        next_actions = ["apply", "discard"]
+    elif manifest_id is not None:
+        workflow_status = "needs_attention"
+        workflow_message = str(
+            preview.get("manifest_reason")
+            or "Verified result contains blocked changes"
+        )
+        next_actions = ["discard"]
+    else:
+        workflow_status = "verified"
+        workflow_message = "Task completed with no applicable changes"
+        next_actions = []
+
     return {
         "run_id": getattr(
             runtime,
@@ -392,9 +445,13 @@ def state_to_result(
             None,
         ),
 
-        "phase": _phase_value(
-            state
-        ),
+        "phase": phase_value,
+
+        "workflow_status": workflow_status,
+
+        "message": workflow_message,
+
+        "next_actions": next_actions,
 
         "plan_id": getattr(
             state,
@@ -418,6 +475,26 @@ def state_to_result(
             str(patch_path)
             if patch_path
             else None
+        ),
+
+        "manifest_id": (
+            manifest_id
+        ),
+
+        "can_apply": (
+            can_apply
+        ),
+
+        "apply_block_reason": (
+            preview.get("manifest_reason")
+            if preview is not None
+            else None
+        ),
+
+        "change_entries": (
+            preview.get("entries", [])
+            if preview is not None
+            else []
         ),
 
         "read_files": read_files,
@@ -603,11 +680,21 @@ class BackendSession:
 
             return result
 
-        if not result.get(
-            "patch_path"
+        if result.get("can_apply") is False:
+            auto_apply["reason"] = (
+                str(result.get("apply_block_reason") or "manifest is not apply-safe")
+                + "; "
+                "auto-apply blocked"
+            )
+
+            return result
+
+        if (
+            result.get("manifest_id") is None
+            and not result.get("patch_path")
         ):
             auto_apply["reason"] = (
-                "no patch was produced; "
+                "no verified result was produced; "
                 "auto-apply blocked"
             )
 
@@ -671,7 +758,95 @@ class BackendSession:
             or ""
         )
 
+        if auto_apply["applied"]:
+            result["workflow_status"] = "applied"
+            result["message"] = "Verified changes were applied"
+            result["next_actions"] = []
+        else:
+            result["workflow_status"] = "needs_attention"
+            result["message"] = auto_apply["reason"] or "Apply was not completed"
+
         return result
+
+    def apply_verified(self, project_root: str) -> dict[str, object]:
+        runtime = self._get_runtime(project_root)
+        with redirect_stdout(sys.stderr):
+            applied = runtime.apply_patch(confirmed=True)
+        files = [str(path) for path in applied.get("applied", [])]
+        status = str(applied.get("status") or "")
+        return {
+            "action": "apply",
+            "ok": status == "COMMITTED",
+            "workflow_status": (
+                "applied" if status == "COMMITTED" else "needs_attention"
+            ),
+            "message": str(applied.get("reason") or status or "Apply failed"),
+            "files": files,
+        }
+
+    def inspect(self, project_root: str) -> dict[str, object]:
+        runtime = self._get_runtime(project_root)
+        with redirect_stdout(sys.stderr):
+            status = runtime.run_status()
+            preview = runtime.patch_preview()
+
+        session_status = str(status.get("session_status") or "CLEAN")
+        manifest_id = preview.get("manifest_id")
+        can_apply = preview.get("can_apply")
+        reason = preview.get("manifest_reason")
+
+        if session_status == "DIRTY_VERIFIED" and manifest_id is not None:
+            if can_apply is True:
+                workflow_status = "verified"
+                message = "Recovered verified changes are ready to apply"
+                next_actions = ["apply", "discard"]
+            else:
+                workflow_status = "needs_attention"
+                message = str(reason or "Recovered changes cannot be applied")
+                next_actions = ["discard"]
+        elif session_status == "DIRTY_FAILED":
+            workflow_status = "needs_attention"
+            message = "Recovered unsuccessful changes are available to discard"
+            next_actions = ["discard"]
+        else:
+            workflow_status = "idle"
+            message = "Project is ready"
+            next_actions = []
+
+        return {
+            "run_id": status.get("run_id"),
+            "phase": str(status.get("phase") or "UNKNOWN"),
+            "workflow_status": workflow_status,
+            "message": message,
+            "next_actions": next_actions,
+            "plan_id": status.get("plan_id"),
+            "global_goal": None,
+            "completion": None,
+            "patch_path": preview.get("patch"),
+            "manifest_id": manifest_id,
+            "can_apply": can_apply,
+            "apply_block_reason": reason,
+            "change_entries": preview.get("entries", []),
+            "read_files": [],
+            "changed_files": preview.get("changed_files", []),
+            "commands": [],
+            "verification": None,
+            "repair": None,
+            "work_mode": WORK_MODE_SANDBOX,
+            "auto_apply": _empty_auto_apply_result(),
+        }
+
+    def discard(self, project_root: str) -> dict[str, object]:
+        runtime = self._get_runtime(project_root)
+        with redirect_stdout(sys.stderr):
+            runtime.discard_session()
+        return {
+            "action": "discard",
+            "ok": True,
+            "workflow_status": "discarded",
+            "message": "Sandbox changes were discarded",
+            "files": [],
+        }
 
 
 def _send(
@@ -843,6 +1018,73 @@ def serve(
 
                         "result":
                             result,
+                    },
+                )
+
+                continue
+
+            if message_type == "inspect":
+                assert request_id is not None
+                try:
+                    project_state = backend.inspect(
+                        str(message["project_root"])
+                    )
+                except Exception as error:
+                    _send(
+                        stdout,
+                        {
+                            "type": "run_failed",
+                            "request_id": request_id,
+                            "error": str(error),
+                        },
+                    )
+                    continue
+                _send(
+                    stdout,
+                    {
+                        "type": "project_state",
+                        "request_id": request_id,
+                        "result": project_state,
+                    },
+                )
+                continue
+
+            if message_type in {"apply", "discard"}:
+                assert request_id is not None
+                _send(
+                    stdout,
+                    {
+                        "type": "action_started",
+                        "request_id": request_id,
+                        "action": message_type,
+                    },
+                )
+                try:
+                    if message_type == "apply":
+                        action_result = backend.apply_verified(
+                            str(message["project_root"])
+                        )
+                    else:
+                        action_result = backend.discard(
+                            str(message["project_root"])
+                        )
+                except Exception as error:
+                    _send(
+                        stdout,
+                        {
+                            "type": "action_failed",
+                            "request_id": request_id,
+                            "action": message_type,
+                            "error": str(error),
+                        },
+                    )
+                    continue
+                _send(
+                    stdout,
+                    {
+                        "type": "action_completed",
+                        "request_id": request_id,
+                        "result": action_result,
                     },
                 )
 

@@ -284,29 +284,29 @@ def dependencies_response() -> str:
 
 def envelope(
     files=None,
+    tools=None,
     commands=None,
 ) -> str:
-    return json.dumps(
-        {
-            "files": files or [],
-            "commands": commands or [],
-        }
-    )
+    payload = {
+        "files": files or [],
+        "tools": tools or [],
+    }
+    if commands is not None:
+        payload["commands"] = commands
+    return json.dumps(payload)
 
 
 def coder_envelope(
     *,
     path: str = "artifact.txt",
     content: str = "hello",
-    command: str | None = None,
+    tool: dict[str, object] | None = None,
 ) -> str:
-    commands = [command] if command else []
-
     return envelope(
         files=[
             {"path": path, "content": content}
         ],
-        commands=commands,
+        tools=[tool] if tool else [],
     )
 
 

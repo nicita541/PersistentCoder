@@ -42,6 +42,29 @@ class FailureAnalyzer:
             verification.evidence
         )
 
+        repeated = next(
+            (
+                item
+                for item in evidence
+                if item.startswith("repeated_observation:")
+            ),
+            None,
+        )
+        if repeated is not None:
+            parts = repeated.split(":", 3)
+            action = parts[1] if len(parts) > 1 else "observation"
+            target = parts[2] if len(parts) > 2 else "the same target"
+            count = parts[3] if len(parts) > 3 else "multiple"
+            return FailureAnalysis(
+                failure_class="REPEATED_OBSERVATION",
+                scope=ReplanScope.STEP.value,
+                reason=(
+                    f"{action} for {target} was repeated {count} times "
+                    "without producing progress"
+                ),
+                evidence=evidence,
+            )
+
         if verification.status == "BLOCKED":
             return FailureAnalysis(
                 failure_class="DEPENDENCY_BLOCKED",

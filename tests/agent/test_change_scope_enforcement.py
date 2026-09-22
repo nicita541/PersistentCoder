@@ -26,7 +26,7 @@ def _executor(tmp_path, responses):
 
 def _edit(*files):
     return json.dumps(
-        {"action": "edit", "files": list(files), "commands": []}
+        {"action": "edit", "files": list(files), "tools": []}
     )
 
 

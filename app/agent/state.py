@@ -80,8 +80,11 @@ class CommandExecution:
             self.stdout or self.stderr or ""
         ).strip()
 
-        if len(output) > 200:
-            output = output[:200] + "..."
+        # Debugger needs the actual exception, which pytest often prints after
+        # a long collection header. Keep a bounded head and tail instead of
+        # truncating away the root cause.
+        if len(output) > 1200:
+            output = output[:600] + "\n...[output clipped]...\n" + output[-600:]
 
         evidence = (
             f"command '{self.command}' "

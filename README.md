@@ -8,8 +8,73 @@ PersistentCoder — локальный coding-agent с долговременн�
 ## Запуск
 
 ```powershell
-.\.venv\Scripts\python.exe -m app.main
+.\.venv\Scripts\python.exe -m app.main [PROJECT_ROOT]
 ```
+
+Без аргумента используется текущая папка. VS Code frontend передаёт корень
+открытого workspace автоматически. Обычная строка без `/` запускает задачу. После
+успешной проверки доступны:
+
+- `/patch` — показать immutable manifest с операциями `ADD`, `MODIFY`,
+  `DELETE`, а также заблокированные пути и причины;
+- `/apply` — после явного подтверждения транзакционно применить ровно этот
+  verified-manifest;
+- `/discard` — явно удалить неприменённый sandbox-результат и начать с чистого
+  baseline;
+- новый запрос — только после Apply или явного Discard dirty-сессии.
+
+По умолчанию используется `Qwen/Qwen2.5-Coder-1.5B-Instruct`. Для машины с
+достаточной памятью модель можно переопределить перед запуском, например:
+
+```powershell
+$env:PERSISTENTCODER_MODEL_NAME = "Qwen/Qwen2.5-Coder-3B-Instruct"
+```
+
+Для проектного QLoRA-адаптера планировщика:
+
+```powershell
+$env:PERSISTENTCODER_MODEL_NAME = "F:\PersistentCoder\models\manual\Qwen2.5-Coder-3B-Instruct"
+$env:PERSISTENTCODER_MODEL_ADAPTER = "models\adapters\planner-coder-debugger-qwen2.5-3b-v6"
+$env:PERSISTENTCODER_LOAD_IN_4BIT = "1"
+```
+
+Путь адаптера намеренно ограничен каталогом проекта. Воспроизводимый датасет
+и QLoRA-обучение создаются командами:
+
+```powershell
+.\.venv\Scripts\python.exe -m tools.training.build_planner_dataset
+.\.venv\Scripts\python.exe -m tools.training.train_planner_qlora
+```
+
+Кэш остаётся в `models/huggingface`; модель по-прежнему загружается лениво при
+первом реальном запросе, поэтому `/status` и восстановление сессии не требуют
+загрузки весов.
+
+Модель не передаёт произвольные shell-команды. Coding Agent может выбрать только
+типизированные инструменты `py_compile`, сфокусированный `pytest`,
+`python_file` и разрешённый `python_module`; приложение проверяет пути и опции,
+само строит argv и запускает его в Docker без shell. Старое непустое поле
+`commands` отклоняется до записи файлов.
+
+`AgentRuntime` по умолчанию делит один LLM между Planner, Coder и Debugger, чтобы
+не переполнять GPU. Для экспериментов можно передать отдельные `planner_llm`,
+`coder_llm` и `debugger_llm`. Debugger возвращает короткий проверяемый диагноз,
+а не скрытую цепочку рассуждений; объём генерации выбирается по сложности сбоя.
+Отчёт и результаты локального A/B-набора находятся в
+`docs/evaluations/2026-09-22-real-model-miniboard.md`.
+
+В VS Code тот же manifest показывается карточкой с подтверждаемыми кнопками
+Apply/Discard. Пока операция выполняется, кнопка отправки превращается в `■`:
+она останавливает backend, после чего новый процесс восстанавливает durable
+состояние сессии перед следующей операцией.
+
+Исходный проект не меняется во время работы агента. Ручной Apply и Direct mode
+используют один `ApplyService`; при конфликте source/workspace, устаревшем
+manifest или небезопасном пути применяется ноль файлов. Verified-результат
+остаётся доступен для preview и Apply после перезапуска процесса.
+Для проекта на другом диске транзакционный staging автоматически размещается в
+отдельном framework-owned каталоге рядом с проектом, чтобы публикация файлов и
+rollback оставались атомарными на одном томе.
 
 Runtime канонизирует корень открытого проекта и вычисляет `project_id` как
 SHA-256 от нормализованного абсолютного пути. Модель не может выбирать или
@@ -100,6 +165,10 @@ fingerprint; изменение исходника, `pytest.ini`/`pyproject.toml
 FAIL. Dependency manifests читаются целиком как строгий UTF-8: oversized,
 malformed, nested `-r`, unsafe URL/path declarations, `setup.py` и превышение
 числа зависимостей блокируют environment без усечения или fallback в `NONE`.
+Если локальная модель отсутствует или не загружается, CLI/backend завершается с
+сообщением `local model is unavailable`, именем модели и подсказкой проверить
+project-local cache; незавершённый run при следующем запуске восстанавливается
+как явное dirty/failed состояние, а не как успешный результат.
 
 ## Проверка
 
@@ -108,7 +177,12 @@ malformed, nested `-r`, unsafe URL/path declarations, `setup.py` и превыш
 .\.venv\Scripts\python.exe -m pytest -q -m "not real_llm"
 ```
 
-Полный MVP развивается по последовательным планам в
-`docs/superpowers/plans/`. Stage 1 задаёт durable runtime authority. Stage 2
-закрепляет доверенную, revision-bound верификацию и resource boundaries. Stage 3
-добавит immutable apply manifest и журналируемую публикацию в source.
+Короткий end-to-end тест пути `run → manifest → preview → Apply` без сети и
+настоящей модели:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q tests\acceptance\test_verified_project_flow.py
+```
+
+Текущий план доведения продукта до рабочего пользовательского потока находится
+в `docs/plans/2026-09-21-usable-end-to-end-agent.md`.
