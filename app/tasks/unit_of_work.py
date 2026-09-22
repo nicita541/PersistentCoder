@@ -925,6 +925,46 @@ class RuntimeUnitOfWork:
             )
             return int(cursor.lastrowid), session_version + 1
 
+    def get_apply_session(
+        self, session_id: str, manifest_id: str
+    ) -> dict[str, object] | None:
+        """Read the complete owning binding without reserving or changing it."""
+        if self.context is None:
+            raise StateAuthorityError("apply requires a StoreContext")
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """SELECT s.* FROM agent_sessions s JOIN patch_manifests m
+                    ON m.agent_session_id = s.id AND m.project_id = s.project_id
+                    AND m.canonical_source_root = s.canonical_source_root
+                    AND m.session_id = s.sandbox_session_id
+                WHERE s.id = ? AND s.project_id = ? AND s.canonical_source_root = ?
+                    AND s.patch_manifest_id = m.manifest_id AND m.manifest_id = ?""",
+                (session_id, self.context.project_id, self.context.canonical_source_root, manifest_id),
+            ).fetchone()
+            return dict(row) if row is not None else None
+        finally:
+            connection.close()
+
+    def record_apply_recovery_failure(self, journal_id: int, error: str) -> None:
+        """Keep a project reserved even when its session binding is damaged.
+
+        This failure-only edge cannot publish source changes or mark a session
+        applied. Recovery success still requires the normal session/journal CAS.
+        """
+        if self.context is None:
+            raise StateAuthorityError("apply requires a StoreContext")
+        with self.transaction() as connection:
+            result = connection.execute(
+                """UPDATE apply_journal SET state = 'RECOVERY_FAILED', error = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND project_id = ? AND canonical_source_root = ?
+                    AND state IN ('PREPARING', 'APPLYING', 'RECOVERY_FAILED')""",
+                (error[:2000], journal_id, self.context.project_id, self.context.canonical_source_root),
+            )
+            if result.rowcount != 1:
+                raise StateAuthorityError("pending apply journal does not belong to project")
+
     def transition_apply(
         self,
         journal_id: int,
